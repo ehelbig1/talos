@@ -166,14 +166,12 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
             "bg-surface-3/40 backdrop-blur-2xl border-y border-r border-white/5 px-5 py-4 min-w-[220px] shadow-2xl glass",
             dragging && "transition-none",
             "group active:scale-[0.98] hover:-translate-y-2 hover:bg-surface-3/60",
-            systemStyle ? "rounded-[2rem]" : "rounded-2xl",
+            systemStyle ? "rounded-2xl" : "rounded-2xl",
             selected
-              ? "ring-2 ring-primary/40 border-y-primary/20 border-r-primary/20 shadow-[0_0_30px_hsla(var(--primary),0.15)]"
+              ? "ring-2 ring-primary/40 border-y-primary/20 border-r-primary/20"
               : "hover:border-white/10",
-            status === "failed" &&
-              "shadow-[0_0_30px_hsla(var(--destructive),0.1)] ring-1 ring-destructive/20",
-            status === "running" &&
-              "shadow-[0_0_30px_hsla(var(--primary),0.1)]",
+            status === "failed" && " ring-1 ring-destructive/20",
+            status === "running" && "",
             systemStyle ? systemStyle.bg : STATUS_BORDER[status],
           )}
         >
@@ -181,12 +179,9 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           <div
             className={cn(
               "absolute inset-0 rounded-[inherit] opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none",
-              status === "success" &&
-                "bg-success/5 shadow-[inset_0_0_20px_hsla(var(--success),0.1)]",
-              status === "failed" &&
-                "bg-destructive/5 shadow-[inset_0_0_20px_hsla(var(--destructive),0.1)]",
-              status === "running" &&
-                "bg-primary/5 shadow-[inset_0_0_20px_hsla(var(--primary),0.1)]",
+              status === "success" && "bg-success/5",
+              status === "failed" && "bg-destructive/5",
+              status === "running" && "bg-primary/5",
             )}
           />
 
@@ -197,13 +192,13 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               <div className="p-1.5 bg-white/5 rounded-lg border border-white/5 group-hover:bg-white/10 transition-premium">
                 <CategoryIcon
                   className={cn(
-                    "w-3.5 h-3.5 shrink-0 transition-transform group-hover:scale-110",
+                    "w-3.5 h-3.5 shrink-0 transition-transform",
                     categoryColor,
                   )}
                 />
               </div>
             )}
-            <span className="text-sm font-black text-white tracking-tight leading-tight truncate font-outfit">
+            <span className="text-sm font-semibold text-white tracking-tight leading-tight truncate font-outfit">
               {displayName}
             </span>
           </div>
@@ -222,7 +217,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               {nodeStatus?.durationMs != null && (
                 <div className="px-2 py-0.5 rounded-md bg-white/5 border border-white/5 flex items-center gap-1.5">
                   <Timer className="w-2.5 h-2.5 text-muted-foreground/60" />
-                  <span className="text-[9px] font-black font-mono text-muted-foreground/80 uppercase tracking-widest">
+                  <span className="text-2xs font-semibold font-mono text-muted-foreground/80 uppercase tracking-wider">
                     {nodeStatus.durationMs >= 1000
                       ? `${(nodeStatus.durationMs / 1000).toFixed(1)}s`
                       : `${nodeStatus.durationMs}ms`}
@@ -230,10 +225,10 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
                 </div>
               )}
               {status === "success" && (
-                <CheckCircle2 className="w-3.5 h-3.5 text-success drop-shadow-[0_0_8px_hsla(var(--success),0.4)]" />
+                <CheckCircle2 className="w-3.5 h-3.5 text-success" />
               )}
               {status === "failed" && (
-                <XCircle className="w-3.5 h-3.5 text-destructive drop-shadow-[0_0_8px_hsla(var(--destructive),0.4)]" />
+                <XCircle className="w-3.5 h-3.5 text-destructive" />
               )}
               {status === "awaiting_approval" && (
                 <ShieldAlert className="w-3.5 h-3.5 text-warning animate-status-pulse" />
@@ -246,7 +241,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
             <div className="mt-3 px-3 py-2 rounded-xl bg-surface-4/60 border border-white/5 relative z-10 group/preview hover:bg-surface-4 transition-premium overflow-hidden">
               <p
                 className={cn(
-                  "text-[9px] font-mono tracking-tight",
+                  "text-2xs font-mono tracking-tight",
                   status === "running"
                     ? "text-primary/70"
                     : "text-muted-foreground/50 truncate max-w-[180px]",
@@ -268,16 +263,16 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           {/* Running progress bar */}
           {status === "running" && (
             <div className="absolute bottom-0 left-0 right-0 h-1 overflow-hidden rounded-b-[inherit] z-20">
-              <div className="h-full bg-primary animate-progress-bar shadow-[0_0_10px_hsla(var(--primary),0.5)]" />
+              <div className="h-full bg-primary animate-progress-bar" />
             </div>
           )}
 
           {/* Config subtitle */}
           {configCount > 0 && (
             <div className="mt-4 flex items-center gap-2 relative z-10 opacity-60 group-hover:opacity-100 transition-opacity">
-              <div className="w-1.5 h-1.5 rounded-full bg-primary/40 shadow-[0_0_5px_hsla(var(--primary),0.5)]" />
-              <p className="text-[9px] font-black text-muted-foreground uppercase tracking-[0.2em]">
-                {configCount} Protocol Field{configCount !== 1 ? "s" : ""}
+              <div className="w-1.5 h-1.5 rounded-full bg-primary/40" />
+              <p className="text-2xs font-semibold text-muted-foreground uppercase tracking-wider">
+                {configCount} config field{configCount !== 1 ? "s" : ""}
               </p>
             </div>
           )}
@@ -288,7 +283,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               type="button"
               onClick={handleInspectClick}
               aria-label="Inspect node execution data"
-              className="absolute top-3 right-3 p-2 rounded-xl bg-surface-4/80 border border-white/10 text-primary opacity-0 group-hover:opacity-100 transition-premium hover:scale-110 hover:bg-primary hover:text-white shadow-xl z-30"
+              className="absolute top-3 right-3 p-2 rounded-xl bg-surface-4/80 border border-white/10 text-primary opacity-0 group-hover:opacity-100 transition-premium hover:bg-primary hover:text-white shadow-xl z-30"
             >
               <Search className="w-3.5 h-3.5" />
             </button>

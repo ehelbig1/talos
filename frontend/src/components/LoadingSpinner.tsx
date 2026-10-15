@@ -43,11 +43,11 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
       </svg>
     </div>
     <div className="flex flex-col items-center gap-1">
-      <span className="text-[10px] font-black text-white uppercase tracking-[0.4em] animate-pulse">
-        Initializing
+      <span className="text-xs font-semibold text-white animate-pulse">
+        Loading
       </span>
-      <span className="text-[8px] font-bold text-muted-foreground/40 uppercase tracking-[0.2em]">
-        Operational Uplink Pending
+      <span className="text-2xs font-bold text-muted-foreground/70 uppercase tracking-wider">
+        Please wait
       </span>
     </div>
   </div>

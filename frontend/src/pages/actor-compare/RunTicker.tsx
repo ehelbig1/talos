@@ -23,17 +23,17 @@ export function RunTicker({ lanes }: { lanes: LaneState[] }) {
                 "w-4 h-4",
                 l.status === "running"
                   ? "text-primary animate-pulse"
-                  : "text-muted-foreground/20",
+                  : "text-muted-foreground/50",
               )}
             />
           </div>
         ))}
       </div>
-      <div className="flex-1 flex items-center gap-4 text-[10px] font-black uppercase tracking-[0.2em] text-primary">
+      <div className="flex-1 flex items-center gap-4 text-xs font-semibold text-primary">
         <Loader2 className="w-4 h-4 animate-spin" />
-        SYSTEM_BROADCAST: SYNCHRONIZED EXECUTION IN PROGRESS...
+        Running all actors…
         <div className="ml-auto flex gap-6">
-          <span className="text-white/40">
+          <span className="text-white/70">
             PENDING:{" "}
             {
               lanes.filter(

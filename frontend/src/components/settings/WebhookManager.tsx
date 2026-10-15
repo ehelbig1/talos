@@ -90,27 +90,27 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
   if (result) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xl animate-in fade-in duration-500">
-        <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] p-10 w-full max-w-lg shadow-2xl relative overflow-hidden">
+        <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-3xl p-10 w-full max-w-lg shadow-2xl relative overflow-hidden">
           <div className="absolute inset-0 bg-gradient-to-br from-success/10 via-transparent to-transparent opacity-50 pointer-events-none" />
 
           <div className="flex items-center gap-5 mb-10 relative z-10">
-            <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-2xl flex items-center justify-center shadow-[0_0_20px_hsla(var(--success),0.2)]">
+            <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-2xl flex items-center justify-center">
               <CheckCircle2 className="w-7 h-7 text-success" />
             </div>
             <div>
-              <h3 className="text-xl font-black text-white tracking-tight font-outfit uppercase">
-                Webhook Synthesized
+              <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
+                Webhook created
               </h3>
-              <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-widest mt-1">
-                Persist these parameters securely
+              <p className="text-xs text-muted-foreground/70 font-bold mt-1">
+                Save these details now; the secret is shown once
               </p>
             </div>
           </div>
 
           <div className="space-y-6 relative z-10">
             <div className="space-y-2">
-              <p className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-                Uplink URL
+              <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
+                Webhook URL
               </p>
               <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 shadow-inner group">
                 <code className="text-xs font-mono text-primary flex-1 truncate selection:bg-primary/30">
@@ -121,8 +121,8 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             </div>
             {result.verificationToken && (
               <div className="space-y-2">
-                <p className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-                  Verification Token
+                <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
+                  Verification token
                 </p>
                 <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 shadow-inner group">
                   <code className="text-xs font-mono text-warning/80 flex-1 truncate selection:bg-warning/30">
@@ -135,11 +135,11 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
           </div>
 
           <Button
-            className="w-full mt-10 h-14 rounded-2xl font-black text-[10px] uppercase tracking-[0.3em] shadow-xl"
+            className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm shadow-xl"
             onClick={onClose}
             variant="premium"
           >
-            Acknowledge & Close
+            Done
           </Button>
         </div>
       </div>
@@ -148,16 +148,16 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xl animate-in fade-in duration-500">
-      <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] p-10 w-full max-w-md shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-3/90 backdrop-blur-3xl border border-white/10 rounded-3xl p-10 w-full max-w-md shadow-2xl relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none" />
 
         <div className="flex items-center justify-between mb-10 relative z-10">
           <div className="space-y-1">
-            <h3 className="text-xl font-black text-white tracking-tight font-outfit uppercase">
-              Uplink Config
+            <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
+              New webhook
             </h3>
-            <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-[0.2em]">
-              New Webhook Trigger
+            <p className="text-xs text-muted-foreground/70 font-bold">
+              Start a workflow from an HTTP request
             </p>
           </div>
           <button
@@ -172,39 +172,39 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
 
         <div className="space-y-6 relative z-10">
           <div className="space-y-2">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Protocol Alias
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              Name
             </label>
             <input
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="ENTER_TRIGGER_ALIAS..."
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-black uppercase tracking-widest text-white placeholder:text-muted-foreground/20 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
+              placeholder="e.g. GitHub push"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
             />
           </div>
 
           <div className="space-y-2">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
-              Target Workflow
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              Workflow
             </label>
             <select
               value={moduleId}
               onChange={(e) => setModuleId(e.target.value)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-black uppercase tracking-widest text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner appearance-none cursor-pointer"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner appearance-none cursor-pointer"
             >
               <option value="" className="bg-surface-3">
-                SELECT_DESTINATION...
+                Select a workflow…
               </option>
               {workflowsData?.map((w) => (
                 <option key={w.id} value={w.id} className="bg-surface-3">
-                  {w.name.toUpperCase()}
+                  {w.name}
                 </option>
               ))}
             </select>
           </div>
 
           <div className="space-y-2">
-            <label className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 ml-1">
+            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Rate Threshold (Req/Min)
             </label>
             <input
@@ -213,7 +213,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               max={1000}
               value={rateLimit}
               onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-black text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium shadow-inner"
             />
           </div>
 
@@ -228,16 +228,14 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
                 })
               }
             >
-              {createMutation.isPending
-                ? "INITIALIZING..."
-                : "SYNTHESIZE UPLINK"}
+              {createMutation.isPending ? "Creating…" : "Create webhook"}
             </Button>
             <Button
               variant="ghost"
-              className="px-6 h-14 rounded-2xl text-[10px] font-black tracking-widest"
+              className="px-6 h-14 rounded-2xl text-xs font-semibold tracking-wider"
               onClick={onClose}
             >
-              ABORT
+              Cancel
             </Button>
           </div>
         </div>
@@ -257,13 +255,13 @@ export default function WebhookManager() {
 
   if (isLoading) {
     return (
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl animate-pulse">
+      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
             <div
               key={i}
-              className="h-32 bg-white/[0.02] border border-white/5 rounded-[2rem]"
+              className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl"
             />
           ))}
         </div>
@@ -277,21 +275,21 @@ export default function WebhookManager() {
         <CreateWebhookDialog onClose={() => setShowCreate(false)} />
       )}
 
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
 
         {/* Header */}
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-12 relative z-10">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[1.5rem] flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] group-hover:scale-110 transition-premium">
+            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
               <Webhook className="w-8 h-8 text-primary" />
             </div>
             <div>
-              <h3 className="text-2xl md:text-3xl font-black text-white tracking-tighter font-outfit uppercase leading-tight">
-                Webhook Ingress
+              <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
+                Webhooks
               </h3>
-              <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em] mt-2">
-                Real-Time Protocol Bridges
+              <p className="text-xs text-muted-foreground/70 font-semibold mt-2">
+                Start workflows from incoming HTTP requests
               </p>
             </div>
           </div>
@@ -301,20 +299,20 @@ export default function WebhookManager() {
             className="h-14 px-8 rounded-2xl shadow-2xl flex items-center gap-3 w-full md:w-auto"
           >
             <Plus className="w-5 h-5" />
-            ESTABLISH_UPLINK
+            New webhook
           </Button>
         </div>
 
         {triggers.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-[2.5rem] relative group overflow-hidden">
+          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-3xl relative group overflow-hidden">
             <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
-            <Webhook className="w-16 h-16 text-muted-foreground/10 mb-6 mx-auto group-hover:text-primary/20 transition-premium" />
-            <p className="text-sm text-muted-foreground font-black uppercase tracking-[0.2em]">
-              No Active Uplinks
+            <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-premium" />
+            <p className="text-sm text-muted-foreground font-semibold">
+              No webhooks yet
             </p>
-            <p className="text-[10px] text-muted-foreground/30 font-bold uppercase tracking-widest mt-2 max-w-xs mx-auto leading-relaxed">
-              Synthesize a webhook trigger to establish a secure ingress bridge
-              to your logic modules.
+            <p className="text-xs text-muted-foreground/60 mt-2 max-w-xs mx-auto leading-relaxed">
+              Create a webhook to start a workflow from an incoming HTTP
+              request.
             </p>
           </div>
         ) : (
@@ -328,7 +326,7 @@ export default function WebhookManager() {
               return (
                 <div
                   key={t.id}
-                  className="bg-white/[0.02] border border-white/5 rounded-[2rem] p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
+                  className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
                 >
                   <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
 
@@ -343,16 +341,16 @@ export default function WebhookManager() {
                         )}
                       />
                       <div className="min-w-0">
-                        <span className="text-lg font-black text-white tracking-tight font-outfit uppercase truncate group-hover:text-primary transition-premium">
+                        <span className="text-lg font-semibold text-white tracking-tight font-outfit truncate group-hover:text-primary transition-premium">
                           {t.name}
                         </span>
                         <div className="flex items-center gap-3 mt-1">
-                          <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-widest">
+                          <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
                             ID: {t.id.slice(0, 8)}...
                           </span>
                           {!t.enabled && (
-                            <span className="text-[9px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-white/5 text-muted-foreground/60 border border-white/10">
-                              PAUSED
+                            <span className="text-2xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full bg-white/5 text-muted-foreground/60 border border-white/10">
+                              Disabled
                             </span>
                           )}
                         </div>
@@ -370,10 +368,10 @@ export default function WebhookManager() {
                                 : "text-destructive",
                           )}
                         >
-                          <span className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-1">
-                            HEALTH_SCORE
+                          <span className="text-2xs font-semibold uppercase tracking-wider opacity-40 mb-1">
+                            Success rate
                           </span>
-                          <div className="flex items-center gap-1.5 text-sm font-black tracking-tighter">
+                          <div className="flex items-center gap-1.5 text-sm font-semibold tracking-tighter">
                             <TrendingUp className="w-3.5 h-3.5" />
                             {successRate}%
                           </div>
@@ -381,10 +379,10 @@ export default function WebhookManager() {
                       )}
                       {t.lastTriggeredAt && (
                         <div className="flex flex-col items-end text-muted-foreground">
-                          <span className="text-[9px] font-black uppercase tracking-widest opacity-40 mb-1">
-                            LAST_SIGNAL
+                          <span className="text-2xs font-semibold uppercase tracking-wider opacity-40 mb-1">
+                            Last received
                           </span>
-                          <div className="flex items-center gap-1.5 text-[11px] font-black tracking-tighter uppercase">
+                          <div className="flex items-center gap-1.5 text-xs font-semibold tracking-tighter">
                             <Clock className="w-3.5 h-3.5 opacity-30" />
                             {relativeTime(t.lastTriggeredAt)}
                           </div>
@@ -395,23 +393,23 @@ export default function WebhookManager() {
 
                   {/* Stats row */}
                   <div className="flex items-center gap-3 mb-6 relative z-10">
-                    <div className="flex items-center gap-2 text-[9px] text-muted-foreground/60 font-black uppercase tracking-[0.2em] bg-white/5 border border-white/5 px-3 py-1.5 rounded-xl shadow-sm">
+                    <div className="flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider bg-white/5 border border-white/5 px-3 py-1.5 rounded-xl shadow-sm">
                       <Zap className="w-3 h-3 text-primary" />
-                      {t.triggerCount.toLocaleString()} TOTAL_SIGNALS
+                      {t.triggerCount.toLocaleString()} received
                     </div>
-                    <div className="flex items-center gap-2 text-[9px] text-success font-black uppercase tracking-[0.2em] bg-success/5 border border-success/10 px-3 py-1.5 rounded-xl shadow-sm">
+                    <div className="flex items-center gap-2 text-2xs text-success font-semibold uppercase tracking-wider bg-success/5 border border-success/10 px-3 py-1.5 rounded-xl shadow-sm">
                       <CheckCircle2 className="w-3 h-3" />
-                      {t.successCount.toLocaleString()} SUCCESS
+                      {t.successCount.toLocaleString()} succeeded
                     </div>
                     {t.errorCount > 0 && (
-                      <div className="flex items-center gap-2 text-[9px] text-destructive font-black uppercase tracking-[0.2em] bg-destructive/5 border border-destructive/10 px-3 py-1.5 rounded-xl shadow-sm">
+                      <div className="flex items-center gap-2 text-2xs text-destructive font-semibold uppercase tracking-wider bg-destructive/5 border border-destructive/10 px-3 py-1.5 rounded-xl shadow-sm">
                         <XCircle className="w-3 h-3" />
-                        {t.errorCount.toLocaleString()} FAULTS
+                        {t.errorCount.toLocaleString()} failed
                       </div>
                     )}
-                    <div className="flex items-center gap-2 text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em] ml-auto">
+                    <div className="flex items-center gap-2 text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider ml-auto">
                       <Shield className="w-3 h-3" />
-                      {t.maxRequestsPerMinute}_REQ_PER_MIN
+                      {t.maxRequestsPerMinute} requests/min
                     </div>
                   </div>
 
@@ -430,13 +428,13 @@ export default function WebhookManager() {
 
         <div className="mt-10 pt-6 border-t border-white/5 flex items-center justify-between relative z-10">
           <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-success animate-pulse shadow-[0_0_8px_hsla(var(--success),0.5)]" />
-            <span className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em]">
+            <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+            <span className="text-xs text-muted-foreground/70 font-semibold">
               Ingress Monitoring Active &bull; Polling 30s Intervals
             </span>
           </div>
-          <span className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-widest">
-            {triggers.length} Active Protocol Bridge
+          <span className="text-xs text-muted-foreground/50 font-semibold">
+            {triggers.length} webhook
             {triggers.length !== 1 ? "s" : ""}
           </span>
         </div>

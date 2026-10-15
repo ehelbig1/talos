@@ -31,10 +31,10 @@ function mockGraphql(
 describe("SecurityManager", () => {
   it("renders all rotation controls", () => {
     render(<SecurityManager />);
-    expect(screen.getByText("ROTATE_DEK")).toBeInTheDocument();
-    expect(screen.getByText("INITIATE_SWEEP")).toBeInTheDocument();
-    expect(screen.getByText("COMMIT_ROOT_ROTATION")).toBeInTheDocument();
-    expect(screen.getByText("ROTATE_SYMMETRIC")).toBeInTheDocument();
+    expect(screen.getByText("Rotate DEK")).toBeInTheDocument();
+    expect(screen.getByText("Re-encrypt secrets")).toBeInTheDocument();
+    expect(screen.getByText("Rotate master key")).toBeInTheDocument();
+    expect(screen.getByText("Rotate key")).toBeInTheDocument();
   });
 
   it("describes the staged master-key procedure, not an in-memory swap", () => {
@@ -47,31 +47,31 @@ describe("SecurityManager", () => {
 
   it("opens the DEK rotation confirmation gate", async () => {
     render(<SecurityManager />);
-    fireEvent.click(screen.getByText("ROTATE_DEK"));
+    fireEvent.click(screen.getByText("Rotate DEK"));
 
     await waitFor(() =>
       expect(
-        screen.getByText("Rotate Data Encryption Key?"),
+        screen.getByText("Rotate data encryption key?"),
       ).toBeInTheDocument(),
     );
   });
 
   it("opens the re-encrypt-secrets confirmation gate", async () => {
     render(<SecurityManager />);
-    fireEvent.click(screen.getByText("INITIATE_SWEEP"));
+    fireEvent.click(screen.getByText("Re-encrypt secrets"));
 
     await waitFor(() =>
-      expect(screen.getByText("Re-encrypt All Secrets?")).toBeInTheDocument(),
+      expect(screen.getByText("Re-encrypt all secrets?")).toBeInTheDocument(),
     );
   });
 
   it("opens the symmetric-key rotation confirmation gate (destructive)", async () => {
     render(<SecurityManager />);
-    fireEvent.click(screen.getByText("ROTATE_SYMMETRIC"));
+    fireEvent.click(screen.getByText("Rotate key"));
 
     await waitFor(() =>
       expect(
-        screen.getByText("Rotate Secret Encryption Key?"),
+        screen.getByText("Rotate secret encryption key?"),
       ).toBeInTheDocument(),
     );
   });
@@ -86,15 +86,15 @@ describe("SecurityManager", () => {
     });
 
     render(<SecurityManager />);
-    fireEvent.click(screen.getByText("ROTATE_DEK"));
+    fireEvent.click(screen.getByText("Rotate DEK"));
 
     // Confirm inside the dialog (the confirm button reuses the ROTATE_DEK label).
     await waitFor(() =>
       expect(
-        screen.getByText("Rotate Data Encryption Key?"),
+        screen.getByText("Rotate data encryption key?"),
       ).toBeInTheDocument(),
     );
-    const confirmButtons = screen.getAllByText("ROTATE_DEK");
+    const confirmButtons = screen.getAllByText("Rotate DEK");
     // The last "ROTATE_DEK" is the dialog's confirm action.
     fireEvent.click(confirmButtons[confirmButtons.length - 1]);
 
@@ -105,12 +105,12 @@ describe("SecurityManager", () => {
 
   it("keeps the master-key commit gated on a 64-char hex entropy input", () => {
     render(<SecurityManager />);
-    const entropyInput = screen.getByPlaceholderText("ENTER_HEX_ENTROPY...");
+    const entropyInput = screen.getByPlaceholderText("64 hex characters");
     fireEvent.change(entropyInput, { target: { value: "abc" } });
 
     // Too-short entropy surfaces the length error and keeps commit disabled.
-    expect(screen.getByText(/INVALID_ENTROPY_LENGTH/i)).toBeInTheDocument();
-    const commit = screen.getByText("COMMIT_ROOT_ROTATION").closest("button")!;
+    expect(screen.getByText(/must be 64 hex characters/i)).toBeInTheDocument();
+    const commit = screen.getByText("Rotate master key").closest("button")!;
     expect(commit).toBeDisabled();
   });
 });

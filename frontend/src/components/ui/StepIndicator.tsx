@@ -28,7 +28,7 @@ export const StepIndicator: React.FC<StepIndicatorProps> = ({
             <div
               className={cn(
                 "flex-1 h-px max-w-[40px]",
-                isCompleted ? "bg-violet-500" : "bg-white/10",
+                isCompleted ? "bg-primary" : "bg-white/10",
               )}
             />
           )}
@@ -36,21 +36,21 @@ export const StepIndicator: React.FC<StepIndicatorProps> = ({
           <div className="flex items-center gap-1.5">
             <div
               className={cn(
-                "w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold transition-premium",
-                isCompleted && "bg-violet-500 text-white",
+                "w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-premium",
+                isCompleted && "bg-primary text-white",
                 isCurrent &&
-                  "bg-violet-500/20 text-violet-300 border border-violet-500/50 ring-2 ring-violet-500/20",
+                  "bg-primary/20 text-primary border border-primary/50 ring-2 ring-primary/20",
                 !isCompleted &&
                   !isCurrent &&
-                  "bg-white/5 text-muted-foreground/40 border border-white/5",
+                  "bg-white/5 text-muted-foreground/70 border border-white/5",
               )}
             >
               {isCompleted ? <Check className="h-3 w-3" /> : idx + 1}
             </div>
             <span
               className={cn(
-                "text-[10px] uppercase tracking-wider font-medium",
-                isCurrent ? "text-foreground/80" : "text-muted-foreground/40",
+                "text-xs font-medium",
+                isCurrent ? "text-foreground" : "text-muted-foreground",
               )}
             >
               {step.label}

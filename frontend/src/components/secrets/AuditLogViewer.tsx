@@ -73,20 +73,20 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
       <div className="space-y-6">
         <div className="flex items-center gap-5 p-5 bg-card/60 backdrop-blur-xl rounded-2xl border border-border/80 shadow-inner relative overflow-hidden group">
           <div className="absolute top-0 right-0 w-32 h-32 bg-primary/5 blur-3xl -mr-16 -mt-16 pointer-events-none group-hover:bg-primary/10 transition-premium" />
-          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center shadow-inner group-hover:scale-110 transition-transform relative z-10">
+          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center shadow-inner transition-transform relative z-10">
             <Shield className="w-6 h-6 text-primary" />
           </div>
           <div className="relative z-10">
-            <h3 className="text-base font-black text-foreground tracking-tight uppercase">
+            <h3 className="text-base font-semibold text-foreground">
               {secret.name}
             </h3>
             <div className="flex items-center gap-2 mt-1">
-              <code className="text-[10px] text-primary/80 font-mono font-bold tracking-tight bg-primary/5 border border-primary/10 px-2 py-0.5 rounded-md">
+              <code className="text-xs text-primary/80 font-mono font-bold tracking-tight bg-primary/5 border border-primary/10 px-2 py-0.5 rounded-md">
                 {secret.keyPath}
               </code>
               <Badge
                 variant="outline"
-                className="text-[9px] uppercase font-black tracking-widest bg-success/10 text-success border-success/20 px-2 h-5 rounded-md"
+                className="text-2xs uppercase font-semibold tracking-wider bg-success/10 text-success border-success/20 px-2 h-5 rounded-md"
               >
                 Active Audit
               </Badge>
@@ -133,7 +133,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
                       <Badge
                         variant="outline"
                         className={cn(
-                          "px-2 py-0 text-[10px] uppercase font-bold tracking-wider rounded-md",
+                          "px-2 py-0 text-xs font-bold rounded-md",
                           entry.action === "create" &&
                             "bg-success/10 text-success border-success/20",
                           entry.action === "read" &&
@@ -174,14 +174,14 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
                       )}
                       <span
                         className={cn(
-                          "text-[10px] font-bold uppercase tracking-tight",
+                          "text-xs font-bold tracking-tight",
                           entry.success ? "text-success" : "text-destructive",
                         )}
                       >
                         {entry.success ? "Success" : "Denied"}
                       </span>
                     </div>
-                    <p className="text-[10px] text-muted-foreground font-medium tabular-nums">
+                    <p className="text-xs text-muted-foreground font-medium tabular-nums">
                       {formatTimestamp(entry.timestamp)}
                     </p>
                   </div>
@@ -194,7 +194,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
         <div className="pt-6 border-t border-border/50 flex justify-end bg-muted/5 -mx-1 px-1 -mb-1 pb-1">
           <Button
             onClick={onClose}
-            className="bg-accent hover:bg-black/20 text-foreground font-black uppercase tracking-widest text-[10px] h-11 px-8 rounded-xl transition-premium border border-border/60 shadow-sm"
+            className="bg-accent hover:bg-black/20 text-foreground font-semibold text-sm h-11 px-8 rounded-xl transition-premium border border-border/60 shadow-sm"
           >
             Close Audit Trail
           </Button>

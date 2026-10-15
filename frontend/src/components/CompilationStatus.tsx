@@ -105,9 +105,9 @@ export function CompilationStatus() {
         <div
           key={job.jobId}
           className={cn(
-            "p-6 rounded-[2rem] border shadow-2xl glass-dark flex flex-col gap-4 relative overflow-hidden transition-premium",
+            "p-6 rounded-2xl border shadow-2xl glass-dark flex flex-col gap-4 relative overflow-hidden transition-premium",
             job.status === "failed"
-              ? "border-destructive/20 bg-destructive/5 shadow-destructive/10"
+              ? "border-destructive/20 bg-destructive/5"
               : "border-white/5 bg-surface-2/40 shadow-black/40",
           )}
         >
@@ -124,10 +124,10 @@ export function CompilationStatus() {
             className={cn(
               "absolute bottom-0 left-0 h-1 transition-all duration-1000 ease-premium-out",
               job.status === "success"
-                ? "bg-success shadow-[0_0_15px_hsla(var(--success),0.6)]"
+                ? "bg-success"
                 : job.status === "failed"
-                  ? "bg-destructive shadow-[0_0_15px_hsla(var(--destructive),0.6)]"
-                  : "bg-primary shadow-[0_0_15px_hsla(var(--primary),0.6)]",
+                  ? "bg-destructive"
+                  : "bg-primary",
             )}
             style={{ width: `${(job.progress || 0) * 100}%` }}
           />
@@ -136,7 +136,7 @@ export function CompilationStatus() {
             {/* Status Icon Container */}
             <div
               className={cn(
-                "w-12 h-12 rounded-[1.25rem] flex items-center justify-center shrink-0 border relative transition-premium",
+                "w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 border relative transition-premium",
                 job.status === "success"
                   ? "bg-success/10 border-success/20 text-success"
                   : job.status === "failed"
@@ -160,27 +160,27 @@ export function CompilationStatus() {
 
             <div className="flex flex-col gap-1 min-w-0 flex-1">
               <div className="flex items-center justify-between gap-2">
-                <span className="text-[9px] font-black uppercase tracking-[0.25em] text-white/30 truncate">
+                <span className="text-2xs font-semibold uppercase tracking-wider text-white/30 truncate">
                   Build Log :: {job.jobId.slice(0, 8)}
                 </span>
                 {job.status !== "success" && job.status !== "failed" && (
                   <div className="flex items-center gap-1.5">
                     <div className="w-1.5 h-1.5 rounded-full bg-primary animate-ping" />
-                    <span className="text-[8px] font-black text-primary uppercase tracking-tighter">
+                    <span className="text-2xs font-semibold text-primary uppercase tracking-tighter">
                       Live
                     </span>
                   </div>
                 )}
               </div>
 
-              <h4 className="text-xs font-black text-white uppercase tracking-tight truncate font-outfit leading-tight mt-0.5">
-                {job.message || "Synthesizing Module..."}
+              <h4 className="text-xs font-semibold text-white truncate font-outfit leading-tight mt-0.5">
+                {job.message || "Compiling module…"}
               </h4>
 
               <div className="flex items-center gap-2 mt-1.5">
                 <div
                   className={cn(
-                    "px-2 py-0.5 rounded-md text-[8px] font-black uppercase tracking-widest",
+                    "px-2 py-0.5 rounded-md text-2xs font-semibold uppercase tracking-wider",
                     job.status === "success"
                       ? "bg-success/20 text-success"
                       : job.status === "failed"
@@ -191,7 +191,7 @@ export function CompilationStatus() {
                   {job.status}
                 </div>
                 {job.progress !== undefined && (
-                  <span className="text-[10px] font-black text-white/20 tabular-nums">
+                  <span className="text-xs font-semibold text-white/50 tabular-nums">
                     {Math.round(job.progress * 100)}%
                   </span>
                 )}
@@ -202,7 +202,7 @@ export function CompilationStatus() {
             {(job.status === "success" || job.status === "failed") && (
               <button
                 onClick={() => removeJob(job.jobId)}
-                className="text-white/20 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-premium active:scale-90"
+                className="text-white/50 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-premium active:scale-90"
               >
                 <X className="w-4 h-4" />
               </button>

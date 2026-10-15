@@ -76,12 +76,12 @@ export function LogPanel({ actorId }: { actorId: string }) {
         </div>
         <div className="flex items-center gap-2">
           <div className="relative">
-            <Filter className="w-3.5 h-3.5 text-muted-foreground/40 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <Filter className="w-3.5 h-3.5 text-muted-foreground/70 absolute left-2.5 top-1/2 -translate-y-1/2" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search…"
-              className="bg-surface-3/60 border border-white/5 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder-muted-foreground/30 focus:outline-none focus:border-violet-500/40 w-40"
+              className="bg-surface-3/60 border border-white/5 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 w-40"
             />
           </div>
           {entries.length > 0 && (

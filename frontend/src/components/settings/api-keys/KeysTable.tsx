@@ -42,7 +42,7 @@ export function KeysTable({
         {isLoading ? (
           <div className="p-24 flex flex-col items-center justify-center gap-4">
             <LoadingSpinner className="w-8 h-8 text-indigo-500" />
-            <p className="text-xs text-muted-foreground uppercase tracking-widest font-bold animate-pulse">
+            <p className="text-xs text-muted-foreground font-bold animate-pulse">
               Loading Keys...
             </p>
           </div>
@@ -51,19 +51,19 @@ export function KeysTable({
             <table className="w-full text-left border-collapse">
               <thead>
                 <tr className="bg-white/[0.02] border-b border-white/5">
-                  <th className="px-8 py-5 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                  <th className="px-8 py-5 text-sm font-bold text-muted-foreground">
                     Key Name
                   </th>
-                  <th className="px-8 py-5 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                  <th className="px-8 py-5 text-sm font-bold text-muted-foreground">
                     Permissions
                   </th>
-                  <th className="px-8 py-5 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                  <th className="px-8 py-5 text-sm font-bold text-muted-foreground">
                     Created
                   </th>
-                  <th className="px-8 py-5 text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                  <th className="px-8 py-5 text-sm font-bold text-muted-foreground">
                     Status
                   </th>
-                  <th className="px-8 py-5 text-right text-[10px] font-bold uppercase tracking-widest text-muted-foreground">
+                  <th className="px-8 py-5 text-right text-sm font-bold text-muted-foreground">
                     Actions
                   </th>
                 </tr>
@@ -93,7 +93,7 @@ export function KeysTable({
                             {k.scopes.map((s) => (
                               <span
                                 key={s}
-                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-[9px] text-indigo-400 uppercase tracking-widest font-bold"
+                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-2xs text-indigo-400 uppercase tracking-wider font-bold"
                               >
                                 {s.split(":").pop()}
                               </span>
@@ -108,17 +108,17 @@ export function KeysTable({
                         </td>
                         <td className="px-8 py-5">
                           {isExpired ? (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-red-500/10 border border-red-500/20 text-[10px] font-bold text-red-400 rounded-md uppercase tracking-wider">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-red-500/10 border border-red-500/20 text-xs font-bold text-red-400 rounded-md">
                               <Clock className="w-3 h-3" />
                               Expired
                             </span>
                           ) : k.expiresAt ? (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-amber-500/10 border border-amber-500/20 text-[10px] font-bold text-amber-500 rounded-md uppercase tracking-wider">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-amber-500/10 border border-amber-500/20 text-xs font-bold text-amber-500 rounded-md">
                               <Calendar className="w-3.5 h-3.5" />
                               {formatDate(k.expiresAt)}
                             </span>
                           ) : (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-[10px] font-bold text-indigo-400 rounded-md uppercase tracking-wider">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-xs font-bold text-indigo-400 rounded-md">
                               <Shield className="w-3 h-3" />
                               Permanent
                             </span>
@@ -162,7 +162,7 @@ export function KeysTable({
                   <tr>
                     <td colSpan={5} className="px-8 py-20 text-center">
                       <div className="flex flex-col items-center gap-4">
-                        <div className="w-16 h-16 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground/40">
+                        <div className="w-16 h-16 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground/70">
                           <Terminal size={32} />
                         </div>
                         <div className="max-w-xs mx-auto">

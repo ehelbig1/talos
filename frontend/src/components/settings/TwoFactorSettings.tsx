@@ -124,7 +124,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
   };
 
   return (
-    <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
+    <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30 pointer-events-none" />
 
       <div className="relative z-10">
@@ -132,10 +132,10 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           <div className="flex items-center gap-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-[1.5rem] flex items-center justify-center border shadow-2xl transition-premium duration-700",
+                "w-16 h-16 rounded-2xl flex items-center justify-center border shadow-2xl transition-premium duration-700",
                 enabled
-                  ? "bg-primary/10 border-primary/20 text-primary shadow-[0_0_30px_hsla(var(--primary),0.1)]"
-                  : "bg-white/5 border-white/10 text-muted-foreground/20",
+                  ? "bg-primary/10 border-primary/20 text-primary"
+                  : "bg-white/5 border-white/10 text-muted-foreground/50",
               )}
             >
               {enabled ? (
@@ -145,13 +145,11 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
               )}
             </div>
             <div>
-              <h3 className="text-2xl md:text-3xl font-black text-white tracking-tighter uppercase font-outfit leading-tight">
-                Two-Factor Protocol
+              <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
+                Two-factor authentication
               </h3>
-              <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-[0.3em] mt-2">
-                {enabled
-                  ? "ACTIVE_SECURITY_PERIMETER"
-                  : "UNSECURED_IDENTITY_STATE"}
+              <p className="text-xs text-muted-foreground/70 font-semibold mt-2">
+                {enabled ? "Enabled" : "Not enabled"}
               </p>
             </div>
           </div>
@@ -159,35 +157,35 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           {enabled && (
             <Button
               variant="outline"
-              className="h-12 px-6 text-destructive border-destructive/20 hover:bg-destructive/10 hover:border-destructive/40 rounded-xl font-black uppercase text-[10px] tracking-widest transition-premium"
+              className="h-12 px-6 text-destructive border-destructive/20 hover:bg-destructive/10 hover:border-destructive/40 rounded-xl font-semibold text-sm transition-premium"
               onClick={() => setShowDisableConfirm(true)}
             >
-              DEACTIVATE_PROTECTION
+              Turn off
             </Button>
           )}
         </div>
 
         {enabled ? (
-          <div className="bg-success/5 border border-success/20 rounded-[2rem] p-8 flex flex-col md:flex-row items-center justify-between gap-6 animate-in fade-in slide-in-from-top-4 duration-500 shadow-inner">
+          <div className="bg-success/5 border border-success/20 rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6 animate-in fade-in slide-in-from-top-4 duration-500 shadow-inner">
             <div className="flex items-center gap-6">
-              <div className="w-14 h-14 rounded-2xl bg-success/10 flex items-center justify-center text-success shadow-[0_0_20px_hsla(var(--success),0.2)]">
+              <div className="w-14 h-14 rounded-2xl bg-success/10 flex items-center justify-center text-success">
                 <Check className="w-7 h-7" />
               </div>
               <div>
-                <span className="text-lg font-black text-white tracking-tight uppercase font-outfit block">
-                  Identity_Sovereignty_Verified
+                <span className="text-lg font-semibold text-white tracking-tight font-outfit block">
+                  Two-factor authentication is on
                 </span>
-                <span className="text-[10px] text-success/60 font-black uppercase tracking-widest mt-1 block">
-                  Protected by TOTP Protocol V2
+                <span className="text-xs text-success/60 font-semibold mt-1 block">
+                  Protected by a TOTP authenticator app
                 </span>
               </div>
             </div>
 
             <ConfirmDialog
               open={showDisableConfirm}
-              title="Deactivate Protection?"
-              message="Removing two-factor authentication significantly decreases your operational security. This operation will be logged in the permanent audit trail."
-              confirmLabel="Yes, Deactivate"
+              title="Turn off two-factor authentication?"
+              message="Removing two-factor authentication makes your account less secure. This change is recorded in the audit log."
+              confirmLabel="Turn off"
               destructive
               onConfirm={() => {
                 disableMutation.mutate({});
@@ -199,37 +197,37 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
         ) : step === "initial" ? (
           <div className="space-y-10 animate-in fade-in duration-700">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <div className="group p-8 bg-black/40 rounded-[2rem] border border-white/5 hover:border-primary/30 transition-premium shadow-inner relative overflow-hidden">
+              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-premium shadow-inner relative overflow-hidden">
                 <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
-                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 group-hover:scale-110 transition-premium relative z-10">
+                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-premium relative z-10">
                   <Smartphone className="w-6 h-6" />
                 </div>
-                <h4 className="text-sm font-black text-white uppercase tracking-widest mb-3 relative z-10">
-                  Authenticator_App
+                <h4 className="text-sm font-semibold text-white mb-3 relative z-10">
+                  Authenticator app
                 </h4>
-                <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
+                <p className="text-xs text-muted-foreground/70 leading-relaxed relative z-10">
                   Support for Google Authenticator, Authy, and hardware security
                   keys via TOTP.
                 </p>
               </div>
 
-              <div className="group p-8 bg-black/40 rounded-[2rem] border border-white/5 hover:border-primary/30 transition-premium shadow-inner relative overflow-hidden">
+              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-premium shadow-inner relative overflow-hidden">
                 <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
-                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 group-hover:scale-110 transition-premium relative z-10">
+                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-premium relative z-10">
                   <Lock className="w-6 h-6" />
                 </div>
-                <h4 className="text-sm font-black text-white uppercase tracking-widest mb-3 relative z-10">
-                  Login_Shield
+                <h4 className="text-sm font-semibold text-white mb-3 relative z-10">
+                  Sign-in protection
                 </h4>
-                <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
-                  Ensures only verified operatives can access the console, even
-                  if credentials leak.
+                <p className="text-xs text-muted-foreground/70 leading-relaxed relative z-10">
+                  Ensures only verified people can sign in, even if credentials
+                  leak.
                 </p>
               </div>
             </div>
 
             <Button
-              className="w-full h-16 text-base font-black uppercase tracking-[0.3em] rounded-2xl shadow-2xl"
+              className="w-full h-16 text-base font-semibold rounded-2xl shadow-2xl"
               variant="premium"
               onClick={() => setupMutation.mutate({})}
               disabled={setupMutation.isPending}
@@ -238,7 +236,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 <LoadingSpinner />
               ) : (
                 <>
-                  INITIALIZE_SETUP_SEQUENCE
+                  Set up two-factor authentication
                   <ArrowRight className="w-5 h-5 ml-4" />
                 </>
               )}
@@ -247,7 +245,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
         ) : step === "setup" && setupData ? (
           <div className="space-y-10 animate-in fade-in slide-in-from-right-8 duration-700">
             <div className="flex flex-col lg:flex-row items-stretch gap-10">
-              <div className="bg-white p-6 rounded-[2rem] shadow-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
+              <div className="bg-white p-6 rounded-2xl shadow-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
                 <img
                   src={qrCodeImageSrc(setupData.qrCodePng)}
                   alt="2FA QR Code"
@@ -258,35 +256,34 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
               <div className="flex-1 space-y-8">
                 <div className="space-y-4">
                   <div className="flex items-center gap-4">
-                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-xs font-black text-primary border border-primary/20">
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-xs font-semibold text-primary border border-primary/20">
                       01
                     </div>
-                    <h4 className="text-sm font-black text-white uppercase tracking-widest">
-                      Scan_Protocol_Code
+                    <h4 className="text-sm font-semibold text-white">
+                      Scan the QR code
                     </h4>
                   </div>
-                  <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest pl-12">
-                    Open your security application and capture the visual key.
-                    It will begin synthesizing 6-digit verification bursts.
+                  <p className="text-xs text-muted-foreground/70 leading-relaxed pl-12">
+                    Open your authenticator app and scan this code. It will
+                    start generating 6-digit verification codes.
                   </p>
                 </div>
 
                 <div className="space-y-4">
                   <div className="flex items-center gap-4">
-                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-xs font-black text-primary border border-primary/20">
+                    <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-xs font-semibold text-primary border border-primary/20">
                       02
                     </div>
-                    <h4 className="text-sm font-black text-white uppercase tracking-widest">
-                      Manual_Cipher_Key
+                    <h4 className="text-sm font-semibold text-white">
+                      Manual setup key
                     </h4>
                   </div>
-                  <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest pl-12 mb-4">
-                    If the visual scan fails, enter the following alphanumeric
-                    secret manually:
+                  <p className="text-xs text-muted-foreground/70 leading-relaxed pl-12 mb-4">
+                    If you cannot scan the code, enter this key manually:
                   </p>
                   <div className="pl-12">
                     <div className="bg-black/40 border border-white/5 rounded-2xl px-6 py-4 flex items-center justify-between group shadow-inner">
-                      <code className="text-sm font-mono text-primary font-black tracking-[0.2em] selection:bg-primary/30">
+                      <code className="text-sm font-mono text-primary font-semibold tracking-wider selection:bg-primary/30">
                         {setupData.secret}
                       </code>
                       <Button
@@ -310,34 +307,33 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             <div className="pt-8 flex items-center justify-between border-t border-white/5">
               <Button
                 variant="ghost"
-                className="text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium"
+                className="text-xs font-semibold text-muted-foreground/70 hover:text-white transition-premium"
                 onClick={() => setStep("initial")}
               >
                 <ArrowLeft className="w-4 h-4 mr-3" />
-                ABORT_SEQUENCE
+                Cancel
               </Button>
               <Button
                 variant="premium"
                 className="px-12 h-14 rounded-xl shadow-2xl"
                 onClick={() => setStep("verify")}
               >
-                VERIFICATION_STEP <ArrowRight className="w-4 h-4 ml-3" />
+                Next <ArrowRight className="w-4 h-4 ml-3" />
               </Button>
             </div>
           </div>
         ) : step === "verify" ? (
           <div className="space-y-10 animate-in fade-in zoom-in-95 duration-700 max-w-md mx-auto py-4">
             <div className="text-center space-y-6">
-              <div className="w-24 h-24 bg-primary/10 rounded-[2rem] flex items-center justify-center mx-auto mb-8 shadow-inner border border-primary/20 relative group">
-                <div className="absolute inset-0 bg-primary/5 rounded-full blur-2xl group-hover:scale-150 transition-premium" />
+              <div className="w-24 h-24 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-8 shadow-inner border border-primary/20 relative group">
+                <div className="absolute inset-0 bg-primary/5 rounded-full blur-2xl transition-premium" />
                 <QrCode className="w-12 h-12 text-primary relative z-10" />
               </div>
-              <h4 className="text-2xl font-black text-white tracking-tighter uppercase font-outfit">
-                Verify_Protocol
+              <h4 className="text-2xl font-semibold text-white tracking-tight font-outfit">
+                Verify
               </h4>
-              <p className="text-[10px] text-muted-foreground/40 font-bold uppercase tracking-[0.2em] leading-relaxed">
-                Enter the 6-digit burst from your device to secure your identity
-                perimeter.
+              <p className="text-xs text-muted-foreground/70 leading-relaxed">
+                Enter the 6-digit code from your authenticator app.
               </p>
             </div>
 
@@ -347,7 +343,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   type="text"
                   placeholder="000000"
                   maxLength={6}
-                  className="text-center text-4xl tracking-[0.8em] font-black h-24 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-[2rem] shadow-inner transition-premium text-white placeholder:text-white/5"
+                  className="text-center text-4xl tracking-[0.8em] font-semibold h-24 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-2xl shadow-inner transition-premium text-white placeholder:text-white/5"
                   value={verificationCode}
                   onChange={(e) =>
                     setVerificationCode(e.target.value.replace(/\D/g, ""))
@@ -359,10 +355,10 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
               <div className="flex gap-4">
                 <Button
                   variant="outline"
-                  className="flex-1 h-14 rounded-2xl border-white/10 hover:bg-white/5 text-[10px] font-black uppercase tracking-widest"
+                  className="flex-1 h-14 rounded-2xl border-white/10 hover:bg-white/5 text-sm font-semibold"
                   onClick={() => setStep("setup")}
                 >
-                  RETURN_TO_STEP_02
+                  Back
                 </Button>
                 <Button
                   variant="premium"
@@ -381,25 +377,21 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                     }
                   }}
                 >
-                  {enableMutation.isPending ? (
-                    <LoadingSpinner />
-                  ) : (
-                    "ACTIVATE_SHIELD"
-                  )}
+                  {enableMutation.isPending ? <LoadingSpinner /> : "Turn on"}
                 </Button>
               </div>
             </div>
 
             <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl mt-10 relative overflow-hidden group">
               <div className="absolute inset-0 bg-warning/5 opacity-0 group-hover:opacity-100 transition-premium blur-xl pointer-events-none" />
-              <div className="flex items-center gap-3 text-warning font-black text-[10px] uppercase tracking-[0.3em] mb-3 relative z-10">
+              <div className="flex items-center gap-3 text-warning font-semibold text-xs mb-3 relative z-10">
                 <AlertTriangle className="w-4 h-4" />
-                CRITICAL_SECURITY_NOTICE
+                Keep your backup codes safe
               </div>
-              <p className="text-[11px] text-muted-foreground/40 leading-relaxed font-bold uppercase tracking-widest relative z-10">
-                Activation binds this account to your hardware authenticator.
-                Ensure backup keys are stored in a non-digital vault for
-                emergency recovery.
+              <p className="text-xs text-muted-foreground/70 leading-relaxed relative z-10">
+                Turning this on ties sign-in to your authenticator app. Store
+                your backup codes somewhere safe, offline, for emergency
+                recovery.
               </p>
             </div>
           </div>

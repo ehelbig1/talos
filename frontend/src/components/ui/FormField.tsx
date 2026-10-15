@@ -28,7 +28,7 @@ export const FormField = ({
         {label}
       </Label>
       {description && (
-        <p className="text-[11px] text-muted-foreground font-medium leading-relaxed">
+        <p className="text-xs text-muted-foreground font-medium leading-relaxed">
           {description}
         </p>
       )}

@@ -33,7 +33,7 @@ describe("SlackAppSelector", () => {
 
   it("renders loading state initially", async () => {
     render(<SlackAppSelector onSelect={mockOnSelect} />);
-    expect(screen.getByText(/Syncing Slack Grid Vectors/i)).toBeInTheDocument();
+    expect(screen.getByText(/Loading Slack workspaces/i)).toBeInTheDocument();
   });
 
   it("renders integrations after loading", async () => {
@@ -41,7 +41,7 @@ describe("SlackAppSelector", () => {
 
     await waitFor(() => {
       expect(
-        screen.queryByText(/Syncing Slack Grid Vectors/i),
+        screen.queryByText(/Loading Slack workspaces/i),
       ).not.toBeInTheDocument();
     });
 
@@ -82,7 +82,7 @@ describe("SlackAppSelector", () => {
     await waitFor(
       () => {
         expect(
-          screen.getAllByText(/No Slack Workspaces Bridged/i).length,
+          screen.getAllByText(/No Slack workspace connected/i).length,
         ).toBeGreaterThan(0);
       },
       { timeout: 2000 },

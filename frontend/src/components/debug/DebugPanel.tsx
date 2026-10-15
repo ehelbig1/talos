@@ -125,7 +125,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
             <h3 className="text-xs font-bold text-white tracking-tight">
               Debug Inspector
             </h3>
-            <p className="text-[9px] text-muted-foreground font-mono truncate max-w-[260px]">
+            <p className="text-2xs text-muted-foreground font-mono truncate max-w-[260px]">
               {nodeId}
             </p>
           </div>
@@ -141,21 +141,21 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
         <TabsList className="w-full justify-start rounded-none border-b border-border/5 bg-transparent px-2 gap-1 shrink-0">
           <TabsTrigger
             value="input"
-            className="text-[10px] font-bold uppercase tracking-widest data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
+            className="text-xs font-bold data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
           >
             <ArrowDownToLine className="w-3 h-3 mr-1.5" />
             Input
           </TabsTrigger>
           <TabsTrigger
             value="output"
-            className="text-[10px] font-bold uppercase tracking-widest data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
+            className="text-xs font-bold data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
           >
             <ArrowUpFromLine className="w-3 h-3 mr-1.5" />
             Output
           </TabsTrigger>
           <TabsTrigger
             value="metadata"
-            className="text-[10px] font-bold uppercase tracking-widest data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
+            className="text-xs font-bold data-[state=active]:text-cyan-400 data-[state=active]:bg-secondary/5 text-muted-foreground rounded-md py-2 px-3"
           >
             <Info className="w-3 h-3 mr-1.5" />
             Metadata
@@ -168,7 +168,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">
+            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
               Node Input
             </label>
             <CopyButton
@@ -176,7 +176,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
               onClick={() => handleCopy("input", nodeInput)}
             />
           </div>
-          <div className="p-3 bg-black/40 border border-white/5 rounded-xl font-mono text-[10px] leading-relaxed overflow-auto max-h-[400px]">
+          <div className="p-3 bg-black/40 border border-white/5 rounded-xl font-mono text-xs leading-relaxed overflow-auto max-h-[400px]">
             {nodeInput ? (
               <NodeDataViewer data={nodeInput} />
             ) : (
@@ -194,7 +194,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">
+            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
               Node Output
             </label>
             <CopyButton
@@ -202,7 +202,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
               onClick={() => handleCopy("output", nodeResult)}
             />
           </div>
-          <div className="p-3 bg-black/40 border border-white/5 rounded-xl font-mono text-[10px] leading-relaxed overflow-auto max-h-[400px]">
+          <div className="p-3 bg-black/40 border border-white/5 rounded-xl font-mono text-xs leading-relaxed overflow-auto max-h-[400px]">
             {nodeResult != null ? (
               <NodeDataViewer data={nodeResult} />
             ) : (
@@ -220,7 +220,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
           className="flex-1 min-h-0 overflow-auto p-4 space-y-3"
         >
           <div className="flex items-center justify-between">
-            <label className="text-[9px] font-bold text-cyan-400 uppercase tracking-widest">
+            <label className="text-2xs font-bold text-cyan-400 uppercase tracking-wider">
               Execution Metadata
             </label>
             <CopyButton
@@ -233,7 +233,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
             <MetadataRow label="Status">
               <span
                 className={cn(
-                  "font-bold uppercase text-[10px] tracking-wider",
+                  "font-bold text-xs",
                   STATUS_COLOR[metadata.status] ?? "text-muted-foreground",
                 )}
               >
@@ -262,17 +262,17 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
             </MetadataRow>
 
             <MetadataRow label="Execution ID">
-              <span className="text-muted-foreground font-mono text-[9px] truncate max-w-[200px] block">
+              <span className="text-muted-foreground font-mono text-2xs truncate max-w-[200px] block">
                 {metadata.executionId}
               </span>
             </MetadataRow>
 
             {metadata.error && (
               <div className="mt-3 p-3 rounded-lg bg-red-500/5 border border-red-500/10">
-                <p className="text-[9px] font-bold text-red-400 uppercase tracking-widest mb-1">
+                <p className="text-2xs font-bold text-red-400 uppercase tracking-wider mb-1">
                   Error
                 </p>
-                <p className="text-[10px] text-red-300 leading-relaxed font-mono break-words">
+                <p className="text-xs text-red-300 leading-relaxed font-mono break-words">
                   {metadata.error}
                 </p>
               </div>
@@ -310,7 +310,7 @@ const MetadataRow: React.FC<{
   children: React.ReactNode;
 }> = ({ label, children }) => (
   <div className="flex items-center justify-between p-2.5 rounded-lg bg-secondary/5 border border-border/10">
-    <span className="text-[9px] font-bold text-muted-foreground uppercase tracking-widest">
+    <span className="text-2xs font-bold text-muted-foreground uppercase tracking-wider">
       {label}
     </span>
     {children}

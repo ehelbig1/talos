@@ -212,7 +212,7 @@ function CreateGmailWatchDialog({
             ))}
           </select>
           {integrationAlreadyWatched && (
-            <p className="text-[11px] text-warning mt-2">
+            <p className="text-xs text-warning mt-2">
               This account already has an active watch. Stop the existing one
               first if you want to re-create.
             </p>
@@ -231,7 +231,7 @@ function CreateGmailWatchDialog({
             placeholder="INBOX, IMPORTANT"
             className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
           />
-          <p className="text-[11px] text-muted-foreground mt-1.5">
+          <p className="text-xs text-muted-foreground mt-1.5">
             Gmail only publishes pushes for messages matching these labels.
             Leave as <code>INBOX</code> for standard inbox-arrives-trigger
             behavior. Use <code>STARRED</code> / <code>IMPORTANT</code> for
@@ -549,7 +549,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
               ? "None active — create one to receive push notifications on new email"
               : `${watches.length} active · rotated automatically every 7 days`}
             {watchesQuery.isFetching && !watchesQuery.isLoading && (
-              <span className="ml-2 inline-flex items-center gap-1 text-[10px] text-muted-foreground/70">
+              <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground/70">
                 <span className="w-2 h-2 bg-primary/50 rounded-full animate-pulse" />
                 refreshing
               </span>
@@ -680,7 +680,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                       <div className="font-medium text-foreground">
                         {w.email_address}
                       </div>
-                      <div className="text-[10px] text-muted-foreground font-mono mt-0.5">
+                      <div className="text-xs text-muted-foreground font-mono mt-0.5">
                         historyId {w.history_id}
                       </div>
                     </td>
@@ -702,7 +702,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                         </span>
                       )}
                       {w.module_name && w.workflow_id && (
-                        <div className="text-[10px] text-muted-foreground mt-0.5">
+                        <div className="text-xs text-muted-foreground mt-0.5">
                           not run while a workflow is bound
                         </div>
                       )}
@@ -726,12 +726,12 @@ export function GmailWatchChannels(): React.ReactElement | null {
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex flex-col gap-1 items-start">
-                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
+                        <span className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
                           active
                         </span>
                         {w.recent_failure && (
                           <span
-                            className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20"
+                            className="inline-flex items-center gap-1 text-xs font-semibold px-2 py-0.5 rounded-full bg-destructive/10 text-destructive border border-destructive/20"
                             title={`${w.recent_failure.error_message}\n\nFailed at: ${new Date(w.recent_failure.failed_at).toLocaleString()}`}
                           >
                             <AlertTriangle size={10} />

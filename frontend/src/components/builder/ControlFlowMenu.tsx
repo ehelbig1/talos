@@ -149,14 +149,14 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         aria-expanded={isOpen}
         aria-haspopup="true"
         className={cn(
-          "h-8 px-3 flex items-center gap-1.5 text-xs font-medium rounded-md transition-premium active:scale-95 border shadow-sm",
+          "h-8 px-3 flex items-center gap-2 text-xs font-semibold rounded-xl transition-premium active:scale-[0.98] border whitespace-nowrap",
           isOpen
-            ? "bg-cyan-500/25 text-cyan-200 border-cyan-500/50 shadow-cyan-500/20"
-            : "bg-cyan-500/15 hover:bg-cyan-500/25 text-cyan-300 border-cyan-500/30 shadow-cyan-500/10",
+            ? "bg-white/10 text-white border-white/20"
+            : "bg-white/5 hover:bg-white/10 text-foreground border-white/10",
         )}
       >
         <Code2 className="w-3.5 h-3.5" />
-        Control Flow
+        Control flow
       </button>
 
       {isOpen && (
@@ -167,7 +167,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         >
           <div className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 via-transparent to-transparent opacity-30 pointer-events-none" />
           <div className="relative z-10 px-3 py-1.5 mb-1.5 border-b border-white/5">
-            <span className="text-[9px] font-black text-muted-foreground/40 uppercase tracking-[0.2em]">
+            <span className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider">
               Logic Primitives
             </span>
           </div>
@@ -185,7 +185,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
             >
               <div
                 className={cn(
-                  "text-xs font-black uppercase tracking-widest",
+                  "text-xs font-semibold",
                   activeIndex === idx
                     ? "text-cyan-400"
                     : "text-white group-hover:text-cyan-400",
@@ -195,7 +195,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
               </div>
               <div
                 className={cn(
-                  "text-[9px] font-medium leading-relaxed",
+                  "text-2xs font-medium leading-relaxed",
                   activeIndex === idx
                     ? "text-muted-foreground"
                     : "text-muted-foreground/60 group-hover:text-muted-foreground",

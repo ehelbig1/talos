@@ -31,7 +31,7 @@ export function NewKeyDialog({
               <h3 className="text-lg font-bold text-amber-500 tracking-tight">
                 Key Generated
               </h3>
-              <p className="text-[10px] text-amber-600 font-bold uppercase tracking-widest leading-none mt-1">
+              <p className="text-xs text-amber-600 font-bold leading-none mt-1">
                 One-time security display
               </p>
             </div>
@@ -44,14 +44,14 @@ export function NewKeyDialog({
               <Info className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
               <p className="text-xs text-amber-200/60 leading-relaxed font-medium">
                 This secret key will{" "}
-                <span className="text-amber-400 font-bold uppercase italic px-1">
+                <span className="text-amber-400 font-bold italic px-1">
                   never be shown again
                 </span>
                 . If you lose it, you must revoke this key and create a new one.
               </p>
             </div>
             <div className="relative group">
-              <div className="absolute top-3 left-4 text-[9px] font-bold uppercase tracking-[0.2em] text-muted-foreground pointer-events-none">
+              <div className="absolute top-3 left-4 text-2xs font-bold uppercase tracking-wider text-muted-foreground pointer-events-none">
                 Talos Secret Credential
               </div>
               <pre className="bg-black border border-white/5 text-amber-500 p-6 pt-10 rounded-xl text-[14px] font-mono break-all whitespace-pre-wrap leading-relaxed shadow-inner">
@@ -59,7 +59,7 @@ export function NewKeyDialog({
               </pre>
               <Button
                 size="sm"
-                className="absolute top-3 right-3 h-8 px-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs rounded-lg transition-transform hover:scale-105 active:scale-95"
+                className="absolute top-3 right-3 h-8 px-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs rounded-lg transition-transform active:scale-95"
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(newKey);

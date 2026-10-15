@@ -128,7 +128,7 @@ export default function Toolbox({ onAddNode }: ToolboxProps) {
       )}
 
       <div className="border-t border-border pt-2 mt-auto">
-        <p className="text-[10px] text-muted-foreground italic leading-relaxed">
+        <p className="text-xs text-muted-foreground italic leading-relaxed">
           💡 Use the "Create Node" button above to compile and add nodes from
           templates
         </p>

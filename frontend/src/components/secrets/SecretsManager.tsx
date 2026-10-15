@@ -130,13 +130,13 @@ function SecretsManager() {
     <div className="space-y-12 max-w-6xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-1000">
       <ConfirmDialog
         open={secretToDelete !== null}
-        title="PROTOCOL_DELETION_AUTHORIZATION"
+        title="Delete secret"
         message={
           secretToDelete
-            ? `Are you certain you wish to purge secret "${secretToDelete.name}"? This action is irreversible across all protocol layers.`
+            ? `Delete secret "${secretToDelete.name}"? Any module that reads it will stop working. This cannot be undone.`
             : ""
         }
-        confirmLabel="Purge_Secret"
+        confirmLabel="Delete secret"
         destructive
         isLoading={deleteSecretMutation.isPending}
         onConfirm={() => {
@@ -150,9 +150,9 @@ function SecretsManager() {
 
       <ConfirmDialog
         open={confirmRotateKey}
-        title="MASTER_KEY_ROTATION_INTENT"
-        message="Initiate master encryption key rotation? All future protocol encryption will leverage the new key version. Legacy access remains valid for 30 cycles."
-        confirmLabel="Initiate_Rotation"
+        title="Rotate master key?"
+        message="Rotate the master encryption key? New writes use the new key. The old key stays readable for 30 days."
+        confirmLabel="Rotate key"
         destructive
         isLoading={rotateKeyMutation.isPending}
         onConfirm={() => {
@@ -165,19 +165,19 @@ function SecretsManager() {
       {/* Edit secret value dialog */}
       {secretToEdit && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md animate-in fade-in duration-300">
-          <div className="bg-surface-3/60 border border-white/5 rounded-[2.5rem] p-10 w-full max-w-lg shadow-[0_0_100px_rgba(0,0,0,0.5)] glass relative overflow-hidden group">
+          <div className="bg-surface-3/60 border border-white/5 rounded-3xl p-10 w-full max-w-lg shadow-[0_0_100px_rgba(0,0,0,0.5)] glass relative overflow-hidden group">
             <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
 
             <div className="flex items-center justify-between mb-8 relative z-10">
               <div className="flex items-center gap-5">
-                <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shadow-[0_0_15px_hsla(var(--primary),0.1)]">
+                <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
                   <Pencil size={20} />
                 </div>
                 <div>
-                  <h3 className="text-xl font-black text-white uppercase tracking-tighter">
+                  <h3 className="text-xl font-semibold text-white tracking-tight">
                     Update Secret
                   </h3>
-                  <p className="text-[10px] text-primary font-black uppercase tracking-widest mt-0.5">
+                  <p className="text-xs text-primary font-semibold mt-0.5">
                     {secretToEdit.name}
                   </p>
                 </div>
@@ -188,7 +188,7 @@ function SecretsManager() {
                   setSecretToEdit(null);
                   setEditValue("");
                 }}
-                className="p-2.5 hover:bg-white/5 rounded-xl transition-premium active:scale-90 text-muted-foreground/40 hover:text-white"
+                className="p-2.5 hover:bg-white/5 rounded-xl transition-premium active:scale-90 text-muted-foreground/70 hover:text-white"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -196,8 +196,8 @@ function SecretsManager() {
 
             <div className="space-y-8 relative z-10">
               <div className="space-y-3">
-                <label className="text-[9px] font-black uppercase tracking-[0.3em] text-muted-foreground/30 ml-1">
-                  NEW_PROTOCOL_VALUE
+                <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
+                  New value
                 </label>
                 <div className="relative group/input">
                   <div className="absolute -inset-0.5 bg-primary/10 rounded-2xl blur opacity-0 group-hover/input:opacity-100 transition-premium" />
@@ -206,15 +206,15 @@ function SecretsManager() {
                     autoFocus
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
-                    placeholder="ENTER_SECURE_PAYLOAD..."
-                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/10"
+                    placeholder="Enter the new secret value"
+                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/50"
                   />
                 </div>
               </div>
 
               <div className="flex gap-4">
                 <button
-                  className="flex-1 bg-primary text-black font-black py-4 rounded-2xl text-[10px] uppercase tracking-[0.2em] transition-premium active:scale-95 shadow-2xl shadow-primary/20 disabled:opacity-50 disabled:grayscale"
+                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-premium active:scale-95 shadow-2xl disabled:opacity-50 disabled:grayscale"
                   disabled={!editValue.trim() || updateSecretMutation.isPending}
                   onClick={() =>
                     updateSecretMutation.mutate({
@@ -225,18 +225,16 @@ function SecretsManager() {
                     })
                   }
                 >
-                  {updateSecretMutation.isPending
-                    ? "SYNCHRONIZING..."
-                    : "COMMIT_UPDATE"}
+                  {updateSecretMutation.isPending ? "Saving…" : "Save"}
                 </button>
                 <button
-                  className="px-8 py-4 rounded-2xl text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 hover:text-white hover:bg-white/5 transition-premium active:scale-95"
+                  className="px-8 py-4 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-premium active:scale-95"
                   onClick={() => {
                     setSecretToEdit(null);
                     setEditValue("");
                   }}
                 >
-                  CANCEL
+                  Cancel
                 </button>
               </div>
             </div>
@@ -245,44 +243,33 @@ function SecretsManager() {
       )}
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
-        <div className="absolute -inset-8 bg-primary/5 rounded-[4rem] blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
+        <div className="absolute -inset-8 bg-primary/5 rounded-3xl blur-[80px] opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
 
         <div className="flex items-center gap-6 relative z-10">
-          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[1.5rem] flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] group-hover:scale-110 group-hover:rotate-3 transition-premium">
+          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
             <Key className="w-8 h-8 text-primary" />
           </div>
           <div className="flex flex-col">
-            <h2 className="text-4xl font-black text-white tracking-tighter uppercase">
-              Secure Registry
+            <h2 className="text-4xl font-semibold text-white tracking-tight">
+              Secrets
             </h2>
-            <div className="flex items-center gap-3 mt-1.5">
-              <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
-                <span className="text-[9px] text-primary font-black uppercase tracking-widest leading-none">
-                  Hardware_Encrypted
-                </span>
-              </div>
-              <div className="w-1 h-1 rounded-full bg-white/10" />
-              <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.2em] leading-none">
-                Envelope Protocol V4.2
-              </span>
-            </div>
+            <p className="text-sm text-muted-foreground mt-1">
+              API keys and tokens, encrypted at rest. Modules read them without
+              seeing the value.
+            </p>
           </div>
         </div>
 
         <button
           onClick={() => setShowCreate(true)}
-          className="relative z-10 bg-primary text-black font-black px-10 h-16 rounded-2xl shadow-2xl shadow-primary/20 flex items-center gap-4 transition-premium active:scale-95 group/btn overflow-hidden"
+          className="relative z-10 bg-primary text-white font-semibold px-5 h-11 rounded-xl flex items-center gap-2 transition-premium active:scale-[0.98] hover:bg-primary/90 whitespace-nowrap"
         >
-          <div className="absolute inset-0 bg-white/20 translate-y-full group-hover/btn:translate-y-0 transition-transform duration-300" />
-          <Plus className="w-6 h-6 group-hover/btn:rotate-90 transition-transform relative z-10" />
-          <span className="uppercase tracking-[0.2em] text-[10px] relative z-10">
-            Provision_Secret
-          </span>
+          <Plus className="w-4 h-4" />
+          <span className="text-sm">New secret</span>
         </button>
       </div>
 
-      <div className="bg-surface-3/30 border border-white/5 rounded-[3rem] shadow-2xl overflow-hidden min-h-[500px] glass relative group/registry">
+      <div className="bg-surface-3/30 border border-white/5 rounded-3xl shadow-2xl overflow-hidden min-h-[500px] glass relative group/registry">
         <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-20 pointer-events-none" />
 
         {isLoading ? (
@@ -291,36 +278,34 @@ function SecretsManager() {
               <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
               <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
             </div>
-            <p className="text-[10px] text-primary/60 font-black uppercase tracking-[0.4em] animate-status-pulse">
+            <p className="text-xs text-primary/60 font-semibold animate-status-pulse">
               Deciphering Registry...
             </p>
           </div>
         ) : error ? (
           <div className="p-12 text-center text-destructive bg-destructive/5 flex flex-col items-center gap-4">
             <AlertTriangle className="w-8 h-8" />
-            <p className="font-black uppercase tracking-widest text-[11px]">
-              CRITICAL_UPLINK_FAILURE: REGISTRY_ACCESS_DENIED
-            </p>
+            <p className="font-semibold text-xs">Could not load secrets</p>
           </div>
         ) : secrets && secrets.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-48 text-center px-10 space-y-8">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-[2rem] flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-premium group-hover/registry:scale-110 duration-700">
+            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-premium duration-700">
               <LockIcon size={40} />
             </div>
             <div className="space-y-3">
-              <h3 className="text-2xl font-black text-white/60 tracking-tight uppercase">
-                Registry_Void
+              <h3 className="text-2xl font-semibold text-white/60 tracking-tight">
+                No secrets yet
               </h3>
-              <p className="text-xs text-muted-foreground/40 max-w-sm mx-auto font-medium leading-relaxed">
-                No secure entities detected in current workspace scope.
-                Provision a new payload to begin protocol integration.
+              <p className="text-xs text-muted-foreground/70 max-w-sm mx-auto font-medium leading-relaxed">
+                Store API keys and tokens here so modules can use them without
+                seeing them in plain text.
               </p>
             </div>
             <button
               onClick={() => setShowCreate(true)}
-              className="px-8 py-4 border border-primary/20 text-primary text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl hover:bg-primary/10 transition-premium active:scale-95"
+              className="px-8 py-4 border border-primary/20 text-primary text-sm font-semibold rounded-2xl hover:bg-primary/10 transition-premium active:scale-95"
             >
-              Initialize_Registry_Entry
+              Add secret
             </button>
           </div>
         ) : (
@@ -328,17 +313,17 @@ function SecretsManager() {
             <table className="w-full border-collapse">
               <thead>
                 <tr className="bg-white/5 border-b border-white/5">
-                  <th className="px-10 py-6 text-left text-[9px] font-black uppercase tracking-[0.3em] text-muted-foreground/30">
-                    ENTITY_IDENTIFIER
+                  <th className="px-10 py-6 text-left text-2xs font-semibold text-muted-foreground/60">
+                    Name
                   </th>
-                  <th className="px-10 py-6 text-left text-[9px] font-black uppercase tracking-[0.3em] text-muted-foreground/30">
-                    SECURE_UPLINK_PATH
+                  <th className="px-10 py-6 text-left text-2xs font-semibold text-muted-foreground/60">
+                    Path
                   </th>
-                  <th className="px-10 py-6 text-left text-[9px] font-black uppercase tracking-[0.3em] text-muted-foreground/30">
-                    TELEMETRY
+                  <th className="px-10 py-6 text-left text-2xs font-semibold text-muted-foreground/60">
+                    Last used
                   </th>
-                  <th className="px-10 py-6 text-right text-[9px] font-black uppercase tracking-[0.3em] text-muted-foreground/30">
-                    PROTOCOL_ACTIONS
+                  <th className="px-10 py-6 text-right text-2xs font-semibold text-muted-foreground/60">
+                    Actions
                   </th>
                 </tr>
               </thead>
@@ -350,11 +335,11 @@ function SecretsManager() {
                   >
                     <td className="px-10 py-8">
                       <div className="flex flex-col gap-1.5">
-                        <span className="font-black text-white tracking-tight uppercase text-sm">
+                        <span className="font-semibold text-white tracking-tight text-sm">
                           {secret.name}
                         </span>
                         {secret.description && (
-                          <span className="text-[10px] text-muted-foreground/40 font-medium line-clamp-1">
+                          <span className="text-xs text-muted-foreground/70 font-medium line-clamp-1">
                             {secret.description}
                           </span>
                         )}
@@ -364,7 +349,7 @@ function SecretsManager() {
                       <div className="flex items-center gap-4 group/reveal">
                         <div className="relative group/code">
                           <div className="absolute -inset-2 bg-primary/10 rounded-xl blur opacity-0 group-hover/code:opacity-100 transition-premium" />
-                          <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-[11px] font-mono text-primary/80 shadow-inner block min-w-[140px] text-center">
+                          <code className="relative px-4 py-2 bg-black/40 border border-white/5 rounded-xl text-xs font-mono text-primary/80 shadow-inner block min-w-[140px] text-center">
                             {revealedSecretId === secret.id
                               ? secret.keyPath
                               : "••••••••••••"}
@@ -373,25 +358,25 @@ function SecretsManager() {
                         {revealedSecretId === secret.id ? (
                           <button
                             onClick={() => setRevealedSecretId(null)}
-                            className="p-2.5 text-muted-foreground/40 hover:text-white transition-premium rounded-xl hover:bg-white/5 active:scale-90"
+                            className="p-2.5 text-muted-foreground/70 hover:text-white transition-premium rounded-xl hover:bg-white/5 active:scale-90"
                             title="Obscure Payload"
                           >
                             <EyeOff size={16} />
                           </button>
                         ) : confirmReveal === secret.id ? (
                           <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/20 px-4 py-2 rounded-2xl animate-in zoom-in-95">
-                            <span className="text-[9px] font-black text-amber-500 uppercase tracking-widest">
-                              CONFIRM_REVEAL?
+                            <span className="text-2xs font-semibold text-amber-500 uppercase tracking-wider">
+                              Reveal value?
                             </span>
                             <button
                               onClick={() => revealSecret(secret.id)}
-                              className="text-[9px] font-black text-amber-400 hover:text-white transition-premium underline underline-offset-4 uppercase"
+                              className="text-2xs font-semibold text-amber-400 hover:text-white transition-premium underline underline-offset-4 uppercase"
                             >
                               YES
                             </button>
                             <button
                               onClick={() => setConfirmReveal(null)}
-                              className="p-1 text-muted-foreground/40 hover:text-white transition-premium"
+                              className="p-1 text-muted-foreground/70 hover:text-white transition-premium"
                             >
                               <X size={14} />
                             </button>
@@ -409,16 +394,17 @@ function SecretsManager() {
                     </td>
                     <td className="px-10 py-8">
                       <div className="flex flex-col gap-2">
-                        <div className="flex items-center gap-2.5 text-[10px] text-white/40 font-bold uppercase tracking-widest">
-                          <History size={14} className="text-primary/40" />
+                        <div className="flex items-center gap-2.5 text-xs text-white/70 font-bold">
+                          <History size={14} className="text-primary/70" />
                           {secret.lastAccessedAt
                             ? formatDate(secret.lastAccessedAt)
-                            : "UNTOUCHED"}
+                            : "Never"}
                         </div>
                         <div className="flex items-center gap-2.5">
                           <Activity size={12} className="text-success/40" />
-                          <span className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em]">
-                            {secret.accessCount} INTERROGATIONS
+                          <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
+                            {secret.accessCount} read
+                            {secret.accessCount !== 1 ? "s" : ""}
                           </span>
                         </div>
                       </div>
@@ -430,8 +416,8 @@ function SecretsManager() {
                             setSelectedSecret(secret);
                             setShowAuditLog(true);
                           }}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/40 hover:text-white hover:bg-white/5 border border-white/5 transition-premium rounded-xl active:scale-90"
-                          title="Audit Telemetry"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/5 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          title="Audit log"
                         >
                           <History size={18} />
                         </button>
@@ -440,14 +426,14 @@ function SecretsManager() {
                             setSecretToEdit(secret);
                             setEditValue("");
                           }}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/40 hover:text-primary hover:bg-primary/10 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-primary hover:bg-primary/10 border border-white/5 transition-premium rounded-xl active:scale-90"
                           title="Reconfigure Payload"
                         >
                           <Pencil size={18} />
                         </button>
                         <button
                           onClick={() => handleDelete(secret)}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/40 hover:text-destructive hover:bg-destructive/10 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-white/5 transition-premium rounded-xl active:scale-90"
                           title="Purge Entity"
                         >
                           <Trash2 size={18} />
@@ -463,47 +449,45 @@ function SecretsManager() {
       </div>
 
       {/* Advanced Security Section */}
-      <div className="bg-amber-500/5 border border-amber-500/20 rounded-[3rem] p-12 shadow-2xl backdrop-blur-xl group relative overflow-hidden transition-premium hover:border-amber-500/40">
+      <div className="bg-amber-500/5 border border-amber-500/20 rounded-3xl p-12 shadow-2xl backdrop-blur-xl group relative overflow-hidden transition-premium hover:border-amber-500/40">
         <div className="absolute top-0 right-0 w-96 h-96 bg-amber-500/10 rounded-full blur-[120px] -mr-48 -mt-48 pointer-events-none group-hover:bg-amber-500/20 transition-premium duration-1000" />
 
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-12 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-6">
-              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center shadow-inner group-hover:scale-110 group-hover:rotate-6 transition-premium duration-500">
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center shadow-inner group-hover:rotate-6 transition-premium duration-500">
                 <ShieldCheck className="w-8 h-8 text-amber-500" />
               </div>
               <div className="flex flex-col">
-                <h4 className="text-2xl font-black text-white uppercase tracking-tighter">
-                  Master Entropy Protocol
+                <h4 className="text-2xl font-semibold text-white tracking-tight">
+                  Master encryption key
                 </h4>
                 <div className="flex items-center gap-3 mt-1.5">
                   <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full">
                     <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
-                    <span className="text-[9px] text-amber-500 font-black uppercase tracking-widest leading-none">
-                      Critical_Security
+                    <span className="text-2xs text-amber-500 font-semibold uppercase tracking-wider leading-none">
+                      High impact
                     </span>
                   </div>
                   <div className="w-1 h-1 rounded-full bg-amber-500/30" />
-                  <span className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-widest leading-none">
-                    Hardware_Secured
+                  <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider leading-none">
+                    Rotation re-encrypts every secret
                   </span>
                 </div>
               </div>
             </div>
             <p className="text-sm text-muted-foreground/60 leading-relaxed max-w-3xl font-medium">
-              Rotate the root encryption vector to re-seed the cryptographic
-              foundation of the entire workspace.
-              <span className="text-amber-500/80 font-black ml-1 uppercase text-[11px]">
-                Autonomous re-encryption will activate upon the next
-                interrogation of each entity.
+              Rotate the key that protects every secret in this workspace.
+              <span className="text-amber-500/80 font-semibold ml-1 text-xs">
+                Each secret is re-encrypted the next time it is read.
               </span>
-              Legacy entropy states are archived for a 30-cycle grace period to
-              ensure protocol continuity.
+              The old key stays readable for 30 days so nothing breaks in the
+              meantime.
             </p>
           </div>
 
           <button
-            className="bg-amber-500 text-black font-black uppercase tracking-[0.2em] text-[11px] px-12 h-20 rounded-[2rem] transition-premium active:scale-95 flex items-center gap-4 shadow-2xl shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
+            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-premium active:scale-95 flex items-center gap-4 shadow-2xl shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
             onClick={() => {
               setConfirmRotateKey(true);
             }}
@@ -516,9 +500,7 @@ function SecretsManager() {
               )}
             />
             <span className="relative z-10">
-              {rotateKeyMutation.isPending
-                ? "ROTATING..."
-                : "ROTATE_MASTER_ENTROPY"}
+              {rotateKeyMutation.isPending ? "Rotating…" : "Rotate master key"}
             </span>
           </button>
         </div>

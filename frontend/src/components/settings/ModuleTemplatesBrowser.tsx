@@ -61,14 +61,14 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-full flex items-center justify-center mx-auto mb-4">
             <CheckCircle2 className="w-7 h-7 text-success" />
           </div>
-          <h3 className="text-sm font-bold text-foreground uppercase tracking-widest mb-1">
-            Module Installed
+          <h3 className="text-sm font-bold text-foreground mb-1">
+            Module installed
           </h3>
           <p className="text-xs text-muted-foreground mb-6">
             "{name}" is now available in your workflow editor.
           </p>
           <Button
-            className="w-full rounded-xl font-bold text-xs uppercase tracking-widest"
+            className="w-full rounded-xl font-bold text-xs"
             onClick={onClose}
           >
             Done
@@ -90,10 +90,10 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
       <div className="bg-card border border-border/80 rounded-2xl p-6 w-full max-w-md shadow-2xl">
         <div className="flex items-center justify-between mb-5">
           <div>
-            <h3 className="text-sm font-bold text-foreground uppercase tracking-widest">
-              Install Module
+            <h3 className="text-sm font-bold text-foreground">
+              Install module
             </h3>
-            <p className="text-[11px] text-muted-foreground mt-0.5">
+            <p className="text-xs text-muted-foreground mt-0.5">
               {template.name}
             </p>
           </div>
@@ -109,8 +109,8 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
         <div className="space-y-4">
           <div>
-            <label className="text-[10px] font-black uppercase tracking-widest text-muted-foreground block mb-1.5">
-              Module Name
+            <label className="text-xs font-semibold text-muted-foreground block mb-1.5">
+              Module name
             </label>
             <input
               value={name}
@@ -120,7 +120,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           </div>
 
           <div>
-            <label className="text-[10px] font-black uppercase tracking-widest text-muted-foreground block mb-1.5">
+            <label className="text-xs font-semibold text-muted-foreground block mb-1.5">
               Config (JSON)
             </label>
             <textarea
@@ -135,20 +135,20 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
               )}
             />
             {configError && (
-              <p className="text-[10px] text-destructive mt-1">{configError}</p>
+              <p className="text-xs text-destructive mt-1">{configError}</p>
             )}
           </div>
 
           {template.allowedHosts.length > 0 && (
             <div className="bg-warning/5 border border-warning/15 rounded-xl p-3">
-              <p className="text-[10px] font-black uppercase tracking-widest text-warning mb-1.5">
-                Required Host Access
+              <p className="text-xs font-semibold text-warning mb-1.5">
+                Required host access
               </p>
               <div className="flex flex-wrap gap-1.5">
                 {template.allowedHosts.map((host) => (
                   <span
                     key={host}
-                    className="text-[10px] font-mono bg-background border border-border/60 px-2 py-0.5 rounded text-foreground/80"
+                    className="text-xs font-mono bg-background border border-border/60 px-2 py-0.5 rounded text-foreground/80"
                   >
                     {host}
                   </span>
@@ -159,7 +159,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
           <div className="flex gap-2 pt-1">
             <Button
-              className="flex-1 bg-primary hover:bg-primary/90 text-primary-foreground font-bold rounded-xl h-10 text-xs uppercase tracking-widest"
+              className="flex-1 bg-primary hover:bg-primary/90 text-primary-foreground font-bold rounded-xl h-10 text-sm"
               disabled={
                 !name.trim() || !!configError || createMutation.isPending
               }
@@ -233,25 +233,25 @@ export default function ModuleTemplatesBrowser() {
         />
       )}
 
-      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] p-10 shadow-2xl relative overflow-hidden group">
+      <div className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl p-10 shadow-2xl relative overflow-hidden group">
         <div className="absolute inset-0 bg-gradient-to-br from-violet-500/10 via-transparent to-transparent opacity-30 pointer-events-none transition-premium group-hover:opacity-100" />
 
         {/* Header */}
         <div className="flex flex-col md:flex-row items-center justify-between gap-8 mb-10 relative z-10">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-violet-500/10 border border-violet-500/20 rounded-[1.5rem] flex items-center justify-center text-violet-400 shadow-[0_0_30px_hsla(var(--violet-500),0.1)] group-hover:scale-110 transition-premium">
+            <div className="w-16 h-16 bg-violet-500/10 border border-violet-500/20 rounded-2xl flex items-center justify-center text-violet-400 transition-premium">
               <Package className="w-8 h-8" />
             </div>
             <div>
-              <h3 className="text-2xl md:text-3xl font-black text-white tracking-tighter uppercase font-outfit leading-tight">
-                Blueprint Registry
+              <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
+                Module templates
               </h3>
               <div className="flex items-center gap-3 mt-2">
-                <span className="text-[10px] font-black text-violet-400 uppercase tracking-widest bg-violet-500/5 px-3 py-1 rounded-full border border-violet-500/20">
-                  {templates.length}_TEMPLATES_LOADED
+                <span className="text-xs font-semibold text-violet-400 bg-violet-500/5 px-3 py-1 rounded-full border border-violet-500/20">
+                  {templates.length} template{templates.length !== 1 ? "s" : ""}
                 </span>
-                <span className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-widest">
-                  Validated_Compute_Units
+                <span className="text-xs text-muted-foreground/70 font-semibold">
+                  Ready to install
                 </span>
               </div>
             </div>
@@ -261,13 +261,13 @@ export default function ModuleTemplatesBrowser() {
         {/* Search + category filter */}
         <div className="flex flex-col md:flex-row gap-4 mb-10 relative z-10">
           <div className="relative flex-1">
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/40" />
+            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70" />
             <input
-              aria-label="Search blueprints"
+              aria-label="Search templates"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="SEARCH_BLUEPRINTS..."
-              className="w-full bg-black/40 border border-white/5 rounded-2xl pl-12 pr-6 py-4 text-sm font-black text-white focus:outline-none focus:border-violet-500/40 focus:ring-4 focus:ring-violet-500/10 transition-premium placeholder:text-white/5 shadow-inner"
+              placeholder="Search templates…"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl pl-12 pr-6 py-4 text-sm font-semibold text-white focus:outline-none focus:border-violet-500/40 focus:ring-4 focus:ring-violet-500/10 transition-premium placeholder:text-white/5 shadow-inner"
             />
           </div>
           <div className="flex gap-2 p-2 bg-black/20 border border-white/5 rounded-2xl backdrop-blur-xl">
@@ -275,13 +275,13 @@ export default function ModuleTemplatesBrowser() {
               type="button"
               onClick={() => setSelectedCategory(null)}
               className={cn(
-                "px-6 py-2 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium",
+                "px-6 py-2 text-sm font-semibold rounded-xl transition-premium",
                 !selectedCategory
                   ? "bg-white text-black shadow-xl"
-                  : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
+                  : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
               )}
             >
-              All_UNITS
+              All
             </button>
             {categories.map((cat) => (
               <button
@@ -291,10 +291,10 @@ export default function ModuleTemplatesBrowser() {
                   setSelectedCategory(cat === selectedCategory ? null : cat)
                 }
                 className={cn(
-                  "px-6 py-2 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium",
+                  "px-6 py-2 text-sm font-semibold rounded-xl transition-premium",
                   selectedCategory === cat
                     ? "bg-violet-500 text-white shadow-xl"
-                    : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
+                    : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
                 )}
               >
                 {cat.toUpperCase()}
@@ -304,12 +304,10 @@ export default function ModuleTemplatesBrowser() {
         </div>
 
         {filtered.length === 0 ? (
-          <div className="text-center py-24 bg-black/20 border border-dashed border-white/5 rounded-[2.5rem] relative z-10">
-            <Package className="w-16 h-16 text-muted-foreground/10 mb-6 mx-auto" />
-            <p className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.4em]">
-              {search
-                ? `NO_MATCHES_FOR_${search.toUpperCase()}`
-                : "NO_BLUEPRINTS_DETECTED"}
+          <div className="text-center py-24 bg-black/20 border border-dashed border-white/5 rounded-3xl relative z-10">
+            <Package className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
+            <p className="text-xs text-muted-foreground/50 font-semibold">
+              {search ? `No templates match "${search}"` : "No templates yet"}
             </p>
           </div>
         ) : (
@@ -321,7 +319,7 @@ export default function ModuleTemplatesBrowser() {
               return (
                 <div
                   key={template.id}
-                  className="bg-black/40 border border-white/5 rounded-[2rem] p-8 hover:border-white/10 hover:bg-black/60 transition-premium group/item flex flex-col gap-6 shadow-inner relative overflow-hidden"
+                  className="bg-black/40 border border-white/5 rounded-2xl p-8 hover:border-white/10 hover:bg-black/60 transition-premium group/item flex flex-col gap-6 shadow-inner relative overflow-hidden"
                 >
                   <div className="absolute inset-0 bg-gradient-to-br from-violet-500/5 via-transparent to-transparent opacity-0 group-hover/item:opacity-100 transition-premium pointer-events-none" />
 
@@ -329,7 +327,7 @@ export default function ModuleTemplatesBrowser() {
                     <div className="flex items-center gap-4 min-w-0">
                       <div
                         className={cn(
-                          "p-3 rounded-xl border shrink-0 group-hover/item:scale-110 transition-premium",
+                          "p-3 rounded-xl border shrink-0 transition-premium",
                           colorClass,
                         )}
                       >
@@ -338,23 +336,23 @@ export default function ModuleTemplatesBrowser() {
                         )}
                       </div>
                       <div className="min-w-0">
-                        <p className="text-lg font-black text-white tracking-tight font-outfit truncate">
+                        <p className="text-lg font-semibold text-white tracking-tight font-outfit truncate">
                           {template.name}
                         </p>
                         <span
                           className={cn(
-                            "text-[9px] font-black uppercase tracking-widest mt-1 block",
+                            "text-2xs font-semibold uppercase tracking-wider mt-1 block",
                             colorClass.split(" ")[0],
                           )}
                         >
-                          {template.category}_PROTOCOL
+                          {template.category}
                         </span>
                       </div>
                     </div>
                   </div>
 
                   {template.description && (
-                    <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed line-clamp-3 relative z-10">
+                    <p className="text-xs text-muted-foreground/70 font-bold leading-relaxed line-clamp-3 relative z-10">
                       {template.description}
                     </p>
                   )}
@@ -364,13 +362,13 @@ export default function ModuleTemplatesBrowser() {
                       {template.allowedHosts.slice(0, 2).map((h) => (
                         <span
                           key={h}
-                          className="text-[8px] font-black uppercase tracking-widest bg-black/40 border border-white/5 px-2 py-1 rounded-lg text-white/40"
+                          className="text-2xs font-semibold uppercase tracking-wider bg-black/40 border border-white/5 px-2 py-1 rounded-lg text-white/70"
                         >
                           {h.split(".")[0]}
                         </span>
                       ))}
                       {template.allowedHosts.length > 2 && (
-                        <span className="text-[8px] font-black text-muted-foreground/20">
+                        <span className="text-2xs font-semibold text-muted-foreground/50">
                           +{template.allowedHosts.length - 2}
                         </span>
                       )}
@@ -378,10 +376,10 @@ export default function ModuleTemplatesBrowser() {
 
                     <button
                       onClick={() => setInstalling(template)}
-                      className="h-10 px-6 bg-violet-500 text-white rounded-xl text-[10px] font-black uppercase tracking-widest transition-premium hover:shadow-[0_0_20px_hsla(var(--violet-500),0.3)] active:scale-95 flex items-center gap-2 group/btn"
+                      className="h-10 px-6 bg-violet-500 text-white rounded-xl text-sm font-semibold transition-premium active:scale-95 flex items-center gap-2 group/btn"
                     >
                       <Plus className="w-3.5 h-3.5" />
-                      INSTANTIATE
+                      Install
                       <ChevronRight className="w-3.5 h-3.5 opacity-0 group-hover/btn:translate-x-1 group-hover/btn:opacity-100 transition-premium" />
                     </button>
                   </div>

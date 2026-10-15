@@ -81,7 +81,7 @@ export function CreateKeyDialog({
               <h3 className="text-lg font-bold text-foreground tracking-tight">
                 Create API Key
               </h3>
-              <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-widest leading-none mt-1">
+              <p className="text-xs text-muted-foreground font-bold leading-none mt-1">
                 New access credential
               </p>
             </div>
@@ -97,8 +97,8 @@ export function CreateKeyDialog({
 
         <div className="p-8 space-y-8">
           <div className="space-y-3">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground ml-1">
-              Key Identity
+            <label className="text-xs font-bold text-muted-foreground ml-1">
+              Key name
             </label>
             <div className="relative group">
               <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-premium">
@@ -116,7 +116,7 @@ export function CreateKeyDialog({
           </div>
 
           <div className="space-y-3">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground ml-1">
+            <label className="text-xs font-bold text-muted-foreground ml-1">
               Expiration Policy
             </label>
             <div className="relative group">
@@ -136,7 +136,7 @@ export function CreateKeyDialog({
           </div>
 
           <div className="space-y-4">
-            <label className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground ml-1">
+            <label className="text-xs font-bold text-muted-foreground ml-1">
               Scope configuration
             </label>
             <div className="grid grid-cols-2 gap-3">
@@ -154,7 +154,7 @@ export function CreateKeyDialog({
                   <div className="flex items-center justify-between w-full mb-1.5">
                     <span
                       className={cn(
-                        "text-[9px] font-bold uppercase tracking-widest",
+                        "text-2xs font-bold uppercase tracking-wider",
                         selectedScopes.includes(s.value)
                           ? "text-indigo-400"
                           : "text-muted-foreground",
@@ -181,7 +181,7 @@ export function CreateKeyDialog({
                   <div className="text-xs font-bold leading-tight mb-1">
                     {s.label}
                   </div>
-                  <div className="text-[10px] text-muted-foreground font-medium leading-tight group-hover/scope:text-muted-foreground transition-premium">
+                  <div className="text-xs text-muted-foreground font-medium leading-tight group-hover/scope:text-muted-foreground transition-premium">
                     {s.desc}
                   </div>
                 </button>

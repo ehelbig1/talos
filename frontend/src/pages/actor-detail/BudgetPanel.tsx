@@ -122,7 +122,7 @@ export function BudgetPanel({
         <p className="text-2xl font-bold text-white tabular-nums">
           {actor.rateLimit != null ? `${actor.rateLimit}/min` : "Unlimited"}
         </p>
-        <p className="text-muted-foreground/40 text-xs mt-2">
+        <p className="text-muted-foreground/70 text-xs mt-2">
           Rate limits and budget policies are configured via MCP tools.
         </p>
       </div>
@@ -182,7 +182,7 @@ export function BudgetPanel({
                   />
                 </div>
               ) : (
-                <p className="text-muted-foreground/40 text-xs">
+                <p className="text-muted-foreground/70 text-xs">
                   No daily ceiling set — unlimited.
                 </p>
               )}
@@ -190,7 +190,7 @@ export function BudgetPanel({
 
             {usage.byModel.length > 0 && (
               <div>
-                <p className="text-muted-foreground/60 text-[11px] font-medium uppercase tracking-wide mb-2">
+                <p className="text-muted-foreground/60 text-xs font-medium mb-2">
                   By provider/model · last 7 days
                 </p>
                 <div className="space-y-1.5">
@@ -217,7 +217,7 @@ export function BudgetPanel({
             No usage data available.
           </p>
         )}
-        <p className="text-muted-foreground/40 text-xs mt-3">
+        <p className="text-muted-foreground/70 text-xs mt-3">
           The daily ceiling is configured via MCP tools.
         </p>
       </div>

@@ -145,13 +145,13 @@ function Inspector() {
           <TabsList className="w-full justify-start rounded-none border-b border-white/5 bg-surface-2/40 px-4 gap-2 shrink-0 relative z-10">
             <TabsTrigger
               value="inspector"
-              className="text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-primary data-[state=active]:bg-primary/5 text-muted-foreground/40 rounded-xl py-2 px-6 transition-premium"
+              className="text-sm font-semibold data-[state=active]:text-primary data-[state=active]:bg-primary/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-premium"
             >
               Inspector
             </TabsTrigger>
             <TabsTrigger
               value="debug"
-              className="text-[10px] font-black uppercase tracking-[0.2em] data-[state=active]:text-warning data-[state=active]:bg-warning/5 text-muted-foreground/40 rounded-xl py-2 px-6 transition-premium"
+              className="text-sm font-semibold data-[state=active]:text-warning data-[state=active]:bg-warning/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-premium"
             >
               Debug
             </TabsTrigger>
@@ -181,9 +181,9 @@ function Inspector() {
       )}
       <ConfirmDialog
         open={!!deleteConfirmId}
-        title="Terminate & Remove Node"
-        message={`Are you sure you want to terminate and remove node "${selectedNode?.data.label || "this node"}"?`}
-        confirmLabel="Terminate & Remove"
+        title="Delete node"
+        message={`Delete node "${selectedNode?.data.label || "this node"}"?`}
+        confirmLabel="Delete"
         destructive={true}
         onConfirm={confirmDelete}
         onCancel={() => setDeleteConfirmId(null)}

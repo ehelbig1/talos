@@ -120,7 +120,7 @@ function CategoryBadge({ category }: { category: string }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold border",
+        "inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold border",
         meta.textColor,
         meta.bgColor,
         meta.borderColor,
@@ -148,12 +148,12 @@ function TemplateCard({
   const meta = getCategoryMeta(template.category);
 
   return (
-    <div className="group flex flex-col bg-surface-3/40 backdrop-blur-md border border-white/5 rounded-[2rem] p-8 hover:border-primary/30 transition-premium shadow-2xl glass relative overflow-hidden h-full">
+    <div className="group flex flex-col bg-surface-3/40 backdrop-blur-md border border-white/5 rounded-2xl p-8 hover:border-primary/30 transition-premium shadow-2xl glass relative overflow-hidden h-full">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
 
       {/* Header */}
       <div className="flex items-start justify-between gap-4 mb-6 relative z-10">
-        <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shrink-0 shadow-2xl transition-premium group-hover:scale-110 group-hover:border-primary/30 relative">
+        <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shrink-0 shadow-2xl transition-premium group-hover:border-primary/30 relative">
           <div className="absolute -inset-2 bg-primary/10 rounded-full blur-xl opacity-0 group-hover:opacity-50 transition-premium" />
           <div
             className={cn("relative z-10 transition-colors", meta.textColor)}
@@ -165,29 +165,28 @@ function TemplateCard({
       </div>
 
       <div className="mb-6 relative z-10">
-        <h3 className="text-xl font-black text-white tracking-tighter font-outfit uppercase group-hover:text-primary transition-premium leading-tight">
+        <h3 className="text-xl font-semibold text-white tracking-tight font-outfit group-hover:text-primary transition-premium leading-tight">
           {template.name}
         </h3>
-        <p className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] mt-1.5">
-          {template.id.split(":").pop()} Protocol
+        <p className="text-xs font-semibold text-muted-foreground/60 mt-1.5">
+          {template.id.split(":").pop()}
         </p>
       </div>
 
       {/* Description */}
       <p className="text-xs text-muted-foreground/50 font-bold leading-relaxed line-clamp-2 flex-1 mb-8 relative z-10">
-        {template.description ??
-          "Standard execution protocol for distributed operations."}
+        {template.description ?? "No description yet."}
       </p>
 
       {/* Meta chips */}
       <div className="flex flex-wrap gap-3 mb-8 relative z-10">
         {fieldCount > 0 && (
-          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40 bg-surface-4/60 border border-white/5 shadow-sm">
+          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold uppercase tracking-wider text-muted-foreground/70 bg-surface-4/60 border border-white/5 shadow-sm">
             {fieldCount} Schema Field{fieldCount === 1 ? "" : "s"}
           </span>
         )}
         {hasNetworkAccess && (
-          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-[9px] font-black uppercase tracking-[0.2em] text-primary/60 bg-primary/5 border border-primary/20 shadow-sm">
+          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold uppercase tracking-wider text-primary/60 bg-primary/5 border border-primary/20 shadow-sm">
             <Globe className="w-3 h-3 opacity-60" />
             Egress Authorized
           </span>
@@ -198,9 +197,9 @@ function TemplateCard({
       <Button
         onClick={onUse}
         variant="outline"
-        className="w-full bg-surface-4/40 border-white/10 hover:border-primary/40 hover:bg-primary hover:text-white group-hover:shadow-2xl transition-premium relative z-10 rounded-2xl py-6 text-[10px] font-black uppercase tracking-[0.3em]"
+        className="w-full bg-surface-4/40 border-white/10 hover:border-primary/40 hover:bg-primary hover:text-white group-hover:shadow-2xl transition-premium relative z-10 rounded-2xl py-6 text-xs font-semibold"
       >
-        Synthesize Module
+        Create module
       </Button>
     </div>
   );
@@ -249,7 +248,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
       JSON.parse(v);
       setConfigError(null);
     } catch {
-      setConfigError("INVALID JSON STRUCTURE");
+      setConfigError("Invalid JSON");
     }
   };
 
@@ -257,14 +256,14 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
     return (
       <Dialog open={true} onClose={onClose} title="Module Initialized">
         <div className="text-center p-6">
-          <div className="w-20 h-20 rounded-[2rem] bg-success/10 border border-success/20 flex items-center justify-center mx-auto mb-8 relative z-10 shadow-2xl">
-            <CheckCircle2 className="w-10 h-10 text-success drop-shadow-[0_0_15px_hsla(var(--success),0.5)]" />
+          <div className="w-20 h-20 rounded-2xl bg-success/10 border border-success/20 flex items-center justify-center mx-auto mb-8 relative z-10 shadow-2xl">
+            <CheckCircle2 className="w-10 h-10 text-success" />
           </div>
 
           <div className="relative z-10 mb-10">
-            <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed">
-              <span className="text-white">{name}</span> HAS BEEN SYNTHESIZED
-              AND ADDED TO YOUR ACTIVE LIBRARY.
+            <p className="text-sm text-muted-foreground/70 leading-relaxed">
+              <span className="text-white">{name}</span> was created and added
+              to your module library.
             </p>
           </div>
 
@@ -277,10 +276,10 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
               variant="premium"
               className="w-full py-7"
             >
-              ACCESS LIBRARY
+              Open library
             </Button>
             <Button onClick={onClose} variant="ghost" className="w-full">
-              DISMISS
+              Close
             </Button>
           </div>
         </div>
@@ -289,17 +288,17 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
   }
 
   return (
-    <Dialog open={true} onClose={onClose} title="Initialize Protocol">
+    <Dialog open={true} onClose={onClose} title="Create module">
       <div className="space-y-10 relative z-10 p-2">
         <div className="relative z-10 -mt-6 mb-4">
-          <p className="text-[10px] font-black text-primary/60 uppercase tracking-[0.4em] leading-none">
+          <p className="text-xs font-semibold text-primary/60 leading-none">
             {template.name}
           </p>
         </div>
 
         {/* Name */}
         <div className="space-y-4">
-          <label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/30 block">
+          <label className="text-xs font-semibold text-muted-foreground/60 block">
             Deployment Identifier
           </label>
           <Input
@@ -308,15 +307,15 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
               setName(e.target.value)
             }
-            placeholder="ENTER UNIQUE IDENTIFIER..."
-            className="bg-surface-4/40 backdrop-blur-xl border-white/5 focus:border-primary/40 focus:ring-primary/20 h-14 px-6 text-[11px] font-black tracking-widest uppercase"
+            placeholder="e.g. notify-dispatcher"
+            className="bg-surface-4/40 backdrop-blur-xl border-white/5 focus:border-primary/40 focus:ring-primary/20 h-14 px-6 text-sm font-semibold"
           />
         </div>
 
         {/* Config */}
         <div className="space-y-4">
-          <label className="text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/30 block">
-            Operational Configuration (JSON)
+          <label className="text-xs font-semibold text-muted-foreground/60 block">
+            Configuration (JSON)
           </label>
           <textarea
             value={config}
@@ -324,14 +323,14 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             rows={6}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-4/40 backdrop-blur-xl border focus:outline-none rounded-2xl px-6 py-5 text-[11px] font-black font-mono text-white resize-none transition-premium shadow-inner uppercase tracking-widest",
+              "w-full bg-surface-4/40 backdrop-blur-xl border focus:outline-none rounded-2xl px-6 py-5 text-sm font-semibold font-mono text-white resize-none transition-premium shadow-inner",
               configError
                 ? "border-destructive/40 focus:border-destructive/60 focus:ring-4 focus:ring-destructive/10 text-destructive"
                 : "border-white/5 focus:border-primary/40 focus:ring-4 focus:ring-primary/10",
             )}
           />
           {configError && (
-            <p className="text-[9px] font-black text-destructive mt-3 uppercase tracking-[0.2em]">
+            <p className="text-2xs font-semibold text-destructive mt-3 uppercase tracking-wider">
               {configError}
             </p>
           )}
@@ -339,14 +338,14 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
         {/* Network access warning */}
         {template.allowedHosts.length > 0 && (
-          <div className="bg-warning/5 border border-warning/20 rounded-[1.5rem] px-6 py-5 shadow-2xl relative overflow-hidden group">
+          <div className="bg-warning/5 border border-warning/20 rounded-2xl px-6 py-5 shadow-2xl relative overflow-hidden group">
             <div className="absolute inset-0 bg-warning/5 opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
-            <p className="text-[10px] font-black text-warning uppercase tracking-[0.3em] mb-2 flex items-center gap-3">
+            <p className="text-xs font-semibold text-warning mb-2 flex items-center gap-3">
               <Globe className="w-4 h-4 opacity-60" /> Security Policy: Network
-              Egress Authorized
+              Network access
             </p>
-            <p className="text-[11px] text-warning/60 font-bold leading-relaxed uppercase tracking-widest">
-              THIS PROTOCOL IS AUTHORIZED TO INITIATE OUTBOUND CONNECTIONS TO:{" "}
+            <p className="text-xs text-warning/60 leading-relaxed">
+              This module may make requests to:{" "}
               <span className="font-mono text-white/80 underline decoration-warning/30 underline-offset-4">
                 {template.allowedHosts.join(", ")}
               </span>
@@ -359,9 +358,9 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           <Button
             variant="ghost"
             onClick={onClose}
-            className="text-[10px] font-black tracking-[0.3em]"
+            className="text-xs font-semibold tracking-wider"
           >
-            ABORT SYNTHESIS
+            Cancel
           </Button>
           <Button
             variant="premium"
@@ -376,10 +375,10 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             {mutation.isPending ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin mr-3" />
-                ORCHESTRATING...
+                Creating…
               </>
             ) : (
-              "INITIALIZE MODULE"
+              "Create module"
             )}
           </Button>
         </div>
@@ -394,18 +393,18 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
 function EmptyState({ query }: { query: string }) {
   return (
-    <div className="col-span-full flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-[4rem] backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700">
-      <div className="w-24 h-24 rounded-[3rem] bg-surface-4/60 border border-white/10 flex items-center justify-center mb-10 shadow-2xl relative">
+    <div className="col-span-full flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-3xl backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700">
+      <div className="w-24 h-24 rounded-3xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-10 shadow-2xl relative">
         <div className="absolute -inset-4 bg-primary/5 rounded-full blur-3xl opacity-50" />
-        <BookOpen className="w-12 h-12 text-muted-foreground/20 relative z-10" />
+        <BookOpen className="w-12 h-12 text-muted-foreground/50 relative z-10" />
       </div>
-      <h2 className="text-3xl font-black text-white tracking-tighter font-outfit uppercase mb-4">
-        {query ? "No results found" : "Registry offline"}
+      <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
+        {query ? "No results found" : "No templates available"}
       </h2>
-      <p className="text-muted-foreground/40 text-sm max-w-sm font-bold uppercase tracking-widest leading-relaxed">
+      <p className="text-muted-foreground/70 text-sm max-w-sm leading-relaxed">
         {query
-          ? `The protocol identifier "${query.toUpperCase()}" did not return any matches from the synchronized registry.`
-          : "Protocol templates are registered at controller initialization. Contact system administrator if registry is unavailable."}
+          ? `No templates match "${query}".`
+          : "Templates are loaded when the controller starts. Contact your administrator if none appear."}
       </p>
     </div>
   );
@@ -484,32 +483,32 @@ export default function Catalog() {
         {/* Header / Toolbar */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-12">
           <div className="flex items-center gap-6">
-            <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] relative">
+            <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative">
               <div className="absolute inset-0 bg-primary/5 rounded-full blur-xl animate-pulse" />
               <Layers className="w-6 h-6 text-primary relative z-10" />
             </div>
             <div>
-              <h1 className="text-3xl font-black text-white tracking-tighter font-outfit uppercase leading-none mb-1.5">
-                Registry Catalog
+              <h1 className="text-3xl font-semibold text-white tracking-tight font-outfit leading-none mb-1.5">
+                Templates
               </h1>
               <div className="flex items-center gap-3">
-                <span className="text-[10px] font-black text-primary/60 uppercase tracking-[0.3em]">
+                <span className="text-xs font-semibold text-primary/60">
                   {isLoading
-                    ? "Synchronizing Registry..."
-                    : `${templates.length} Protocol Template${templates.length !== 1 ? "s" : ""} Available`}
+                    ? "Loading…"
+                    : `${templates.length} template${templates.length !== 1 ? "s" : ""}`}
                 </span>
-                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
+                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
               </div>
             </div>
           </div>
 
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">
-            <div className="absolute -inset-0.5 bg-primary/20 rounded-[1.5rem] blur opacity-0 group-focus-within/search:opacity-100 transition-premium pointer-events-none" />
-            <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/30 pointer-events-none group-focus-within/search:text-primary transition-premium z-10" />
+            <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/search:opacity-100 transition-premium pointer-events-none" />
+            <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 pointer-events-none group-focus-within/search:text-primary transition-premium z-10" />
             <DarkInput
               type="text"
-              placeholder="SEARCH PROTOCOL REGISTRY..."
+              placeholder="Search templates…"
               value={search}
               onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                 setSearch(e.target.value)
@@ -525,10 +524,10 @@ export default function Catalog() {
             <button
               onClick={() => setActiveCategory(null)}
               className={cn(
-                "px-6 py-3 text-[9px] font-black uppercase tracking-[0.3em] rounded-xl border transition-premium active:scale-95 shadow-xl glass",
+                "px-6 py-3 text-2xs font-semibold rounded-xl border transition-premium active:scale-95 shadow-xl glass",
                 activeCategory === null
                   ? "bg-white/10 text-white border-white/30"
-                  : "text-muted-foreground/40 border-white/5 hover:text-white hover:bg-white/5",
+                  : "text-muted-foreground/70 border-white/5 hover:text-white hover:bg-white/5",
               )}
             >
               All Categories ({templates.length})
@@ -542,11 +541,11 @@ export default function Catalog() {
                   key={cat}
                   onClick={() => setActiveCategory(isActive ? null : cat)}
                   className={cn(
-                    "inline-flex items-center gap-3 px-6 py-3 text-[9px] font-black uppercase tracking-[0.3em] rounded-xl border transition-premium active:scale-95 shadow-xl glass",
+                    "inline-flex items-center gap-3 px-6 py-3 text-2xs font-semibold rounded-xl border transition-premium active:scale-95 shadow-xl glass",
                     isActive
                       ? cn(meta.textColor, meta.bgColor, meta.borderColor) +
                           " text-white"
-                      : "text-muted-foreground/40 border-white/5 hover:text-white hover:bg-white/5",
+                      : "text-muted-foreground/70 border-white/5 hover:text-white hover:bg-white/5",
                   )}
                 >
                   <span className={isActive ? "text-white" : meta.textColor}>
@@ -573,7 +572,7 @@ export default function Catalog() {
             {Array.from({ length: 8 }).map((_, i) => (
               <div
                 key={i}
-                className="h-64 bg-surface-3/20 border border-white/5 rounded-[2rem] animate-pulse"
+                className="h-64 bg-surface-3/20 border border-white/5 rounded-2xl animate-pulse"
               />
             ))}
           </div>
@@ -607,7 +606,7 @@ export default function Catalog() {
                       <div className="flex items-center gap-6 mb-10 relative group">
                         <div
                           className={cn(
-                            "w-12 h-12 rounded-2xl flex items-center justify-center shadow-2xl transition-premium group-hover:scale-110",
+                            "w-12 h-12 rounded-2xl flex items-center justify-center shadow-2xl transition-premium",
                             meta.bgColor,
                             meta.textColor,
                           )}
@@ -615,12 +614,12 @@ export default function Catalog() {
                           {meta.icon}
                         </div>
                         <div>
-                          <h2 className="text-2xl font-black text-white tracking-tighter font-outfit uppercase leading-none mb-1.5">
+                          <h2 className="text-2xl font-semibold text-white tracking-tight font-outfit leading-none mb-1.5">
                             {cat}
                           </h2>
-                          <p className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] leading-none">
-                            {items.length} Sequence Protocol
-                            {items.length !== 1 ? "s" : ""} Synchronized
+                          <p className="text-xs font-semibold text-muted-foreground/60 leading-none">
+                            {items.length} template
+                            {items.length !== 1 ? "s" : ""}
                           </p>
                         </div>
                         <div className="flex-1 h-px bg-white/5 ml-8" />

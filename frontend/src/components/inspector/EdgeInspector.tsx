@@ -43,15 +43,15 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
 
       <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-surface-2/40 relative z-10">
         <div className="flex items-center gap-4">
-          <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_15px_hsla(var(--primary),0.1)]">
+          <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
             <GitBranch className="w-5 h-5 text-primary" />
           </div>
           <div>
-            <h3 className="text-sm font-black text-white tracking-tight font-outfit">
-              Link Properties
+            <h3 className="text-sm font-semibold text-white tracking-tight font-outfit">
+              Edge
             </h3>
-            <p className="text-[9px] text-muted-foreground/40 font-black uppercase tracking-[0.2em]">
-              Data Transition Vector
+            <p className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
+              How data flows between these nodes
             </p>
           </div>
         </div>
@@ -59,7 +59,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
           type="button"
           onClick={onClose}
           aria-label="Close edge properties"
-          className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/40 hover:text-white transition-premium"
+          className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/70 hover:text-white transition-premium"
         >
           <X className="h-4 w-4" />
         </button>
@@ -68,8 +68,8 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
       <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar relative z-10">
         <div className="p-6 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
           <div className="space-y-4">
-            <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
-              Transition Protocol
+            <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
+              Edge type
             </label>
             <div className="grid grid-cols-2 gap-3 mt-2">
               {[
@@ -78,28 +78,28 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                   label: "Success",
                   icon: CheckCircle2,
                   color: "text-success",
-                  glow: "shadow-[0_0_15px_hsla(var(--success),0.1)]",
+                  glow: "",
                 },
                 {
                   value: "error",
                   label: "Fault",
                   icon: AlertCircle,
                   color: "text-destructive",
-                  glow: "shadow-[0_0_15px_hsla(var(--destructive),0.1)]",
+                  glow: "",
                 },
                 {
                   value: "conditional",
                   label: "Router",
                   icon: GitBranch,
                   color: "text-primary",
-                  glow: "shadow-[0_0_15px_hsla(var(--primary),0.1)]",
+                  glow: "",
                 },
                 {
                   value: "OnFailure",
                   label: "Fail-Safe",
                   icon: ShieldAlert,
                   color: "text-warning",
-                  glow: "shadow-[0_0_15px_hsla(var(--warning),0.1)]",
+                  glow: "",
                 },
               ].map((type) => (
                 <button
@@ -118,17 +118,14 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                   )}
                 >
                   <type.icon
-                    className={cn(
-                      "w-5 h-5 transition-premium group-hover:scale-110",
-                      type.color,
-                    )}
+                    className={cn("w-5 h-5 transition-premium", type.color)}
                   />
                   <span
                     className={cn(
-                      "text-[10px] font-black uppercase tracking-widest",
+                      "text-xs font-semibold",
                       edge.data?.edgeType === type.value
                         ? "text-white"
-                        : "text-muted-foreground/40",
+                        : "text-muted-foreground/70",
                     )}
                   >
                     {type.label}
@@ -148,17 +145,17 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
 
           {edge.data?.edgeType === "conditional" && (
             <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl space-y-5 shadow-2xl glass-dark optimize-blur">
-              <h4 className="text-[11px] font-black text-white flex items-center gap-3 uppercase tracking-[0.2em] font-outfit">
-                <div className="p-2 rounded-xl bg-primary/10 border border-primary/20 shadow-[0_0_15px_hsla(var(--primary),0.1)]">
+              <h4 className="text-xs font-semibold text-white flex items-center gap-3 font-outfit">
+                <div className="p-2 rounded-xl bg-primary/10 border border-primary/20">
                   <Sparkles className="w-4 h-4 text-primary" />
                 </div>
                 Logic Routing
               </h4>
-              <FormField label="Routing Directive (Rhai)">
+              <FormField label="Condition (Rhai)">
                 <Textarea
                   placeholder="ctx.result.score > 0.8"
                   className={cn(
-                    "bg-surface-4/40 border-white/5 focus:border-primary/50 font-mono text-[11px] min-h-[120px] rounded-xl transition-premium selection:bg-primary/30 leading-relaxed",
+                    "bg-surface-4/40 border-white/5 focus:border-primary/50 font-mono text-xs min-h-[120px] rounded-xl transition-premium selection:bg-primary/30 leading-relaxed",
                     syntaxError &&
                       "border-destructive/50 focus:border-destructive",
                   )}
@@ -171,7 +168,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
               {syntaxError && (
                 <div className="flex items-center gap-3 px-4 py-2 bg-destructive/10 border border-destructive/20 rounded-xl animate-in slide-in-from-top-2">
                   <ShieldAlert className="w-4 h-4 text-destructive shrink-0" />
-                  <span className="text-[10px] font-black text-destructive uppercase tracking-widest">
+                  <span className="text-xs font-semibold text-destructive">
                     {syntaxError}
                   </span>
                 </div>
@@ -180,22 +177,22 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
           )}
 
           <div className="space-y-5 pt-8 border-t border-white/5">
-            <label className="text-[10px] text-muted-foreground/40 uppercase tracking-[0.2em] font-black ml-1">
+            <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
               Data Mapping Architecture
             </label>
             <div className="bg-surface-4/20 p-6 rounded-2xl border border-white/5 shadow-2xl relative overflow-hidden">
               <div className="absolute inset-0 bg-gradient-to-br from-primary/5 to-transparent opacity-30 pointer-events-none" />
               <Textarea
                 placeholder="ctx.input.query = ctx.result.original_query"
-                className="bg-transparent border-0 focus:ring-0 p-0 font-mono text-[11px] min-h-[80px] selection:bg-primary/30 leading-relaxed text-white/80"
+                className="bg-transparent border-0 focus:ring-0 p-0 font-mono text-xs min-h-[80px] selection:bg-primary/30 leading-relaxed text-white/80"
                 value={(edge.data?.mapping as string) ?? ""}
                 onChange={(e) =>
                   updateEdgeData(edge.id, { mapping: e.target.value })
                 }
               />
             </div>
-            <p className="text-[10px] text-muted-foreground/20 font-bold uppercase tracking-widest leading-relaxed ml-1">
-              ADVANCED: RESTRUCTURE TELEMETRY VECTORS BETWEEN PROTOCOL NODES.
+            <p className="text-xs text-muted-foreground/50 leading-relaxed ml-1">
+              Advanced: reshape the data passed from one node to the next.
             </p>
           </div>
         </div>

@@ -122,17 +122,17 @@ export function ConditionEdge({
               <div className="bg-background/95 backdrop-blur-2xl border border-primary/30 rounded-xl p-3 shadow-[0_12px_40px_rgba(0,0,0,0.6)] max-w-sm overflow-hidden animate-in fade-in zoom-in duration-200">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse shadow-[0_0_10px_hsla(var(--primary),0.8)]" />
-                    <span className="text-[10px] font-bold text-primary uppercase tracking-widest">
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                    <span className="text-xs font-bold text-primary">
                       Output Data
                     </span>
                   </div>
-                  <span className="text-[9px] text-muted-foreground font-mono bg-muted/50 px-1.5 py-0.5 rounded border border-border/50">
+                  <span className="text-2xs text-muted-foreground font-mono bg-muted/50 px-1.5 py-0.5 rounded border border-border/50">
                     {source.slice(0, 8)}
                   </span>
                 </div>
                 <div className="relative group">
-                  <pre className="text-[10px] text-foreground/80 font-mono overflow-x-auto max-h-48 thin-scrollbar leading-relaxed bg-muted/40 rounded-lg p-2 border border-border shadow-inner">
+                  <pre className="text-xs text-foreground/80 font-mono overflow-x-auto max-h-48 thin-scrollbar leading-relaxed bg-muted/40 rounded-lg p-2 border border-border shadow-inner">
                     {JSON.stringify(result, null, 2)}
                   </pre>
                 </div>
@@ -140,9 +140,9 @@ export function ConditionEdge({
             ) : isOnFailure ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-[10px] font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
+                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
                   selected
-                    ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110 shadow-destructive/20"
+                    ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110"
                     : "bg-background/80 border-destructive/40 text-destructive hover:border-destructive",
                 )}
               >
@@ -157,9 +157,9 @@ export function ConditionEdge({
             ) : isErrorEdge ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-[10px] font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
+                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
                   selected
-                    ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110 shadow-destructive/20"
+                    ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110"
                     : "bg-background/80 border-destructive/40 text-destructive hover:border-destructive",
                 )}
               >
@@ -169,9 +169,9 @@ export function ConditionEdge({
             ) : hasCondition ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-[10px] font-bold shadow-lg transition-premium duration-300 backdrop-blur-md group cursor-help",
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md group cursor-help",
                   selected || isHovered
-                    ? "bg-primary border-primary-foreground text-primary-foreground scale-110 shadow-[0_0_20px_hsla(var(--primary),0.4)]"
+                    ? "bg-primary border-primary-foreground text-primary-foreground scale-110"
                     : "bg-background/80 border-warning/40 text-warning hover:border-warning",
                 )}
               >
@@ -183,7 +183,7 @@ export function ConditionEdge({
                 />
                 IF
                 {data?.condition && isHovered && (
-                  <span className="ml-1 pl-1.5 border-l border-white/20 text-[10px] text-white/90 font-mono font-medium hidden group-hover:block transition-premium max-w-[150px] truncate drop-shadow-sm">
+                  <span className="ml-1 pl-1.5 border-l border-white/20 text-xs text-white/90 font-mono font-medium hidden group-hover:block transition-premium max-w-[150px] truncate drop-shadow-sm">
                     {data.condition}
                   </span>
                 )}

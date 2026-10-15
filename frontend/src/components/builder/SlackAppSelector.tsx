@@ -161,15 +161,15 @@ export function SlackAppSelector({
     return (
       <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4 animate-pulse">
         <Loader2 className="h-5 w-5 animate-spin text-[#4A154B]" />
-        <p className="m-0 text-[10px] font-black uppercase tracking-[0.3em] text-muted-foreground/40">
-          Syncing Slack Grid Vectors...
+        <p className="m-0 text-xs font-semibold text-muted-foreground/70">
+          Loading Slack workspaces…
         </p>
       </div>
     );
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-[2.5rem] space-y-8 shadow-2xl">
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-3xl space-y-8 shadow-2xl">
       <div className="absolute inset-0 bg-gradient-to-br from-[#4A154B]/5 via-transparent to-transparent opacity-50 pointer-events-none" />
 
       {showCreator && (
@@ -197,11 +197,11 @@ export function SlackAppSelector({
             <MessageSquare className="h-5 w-5 text-[#4A154B]" />
           </div>
           <div>
-            <h4 className="text-[11px] font-black text-white uppercase tracking-[0.2em]">
+            <h4 className="text-xs font-semibold text-white">
               Slack Workspace Integration
             </h4>
-            <p className="text-[9px] font-black text-muted-foreground/20 uppercase tracking-widest">
-              Distributed Communication Vector
+            <p className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider">
+              Send and receive Slack messages
             </p>
           </div>
         </div>
@@ -211,7 +211,7 @@ export function SlackAppSelector({
             <Button
               onClick={() => setShowCreator(true)}
               variant="outline"
-              className="h-9 px-4 bg-purple-500/5 hover:bg-purple-500/10 text-purple-400 border-purple-500/20 text-[9px] font-black uppercase tracking-widest rounded-xl transition-premium"
+              className="h-9 px-4 bg-purple-500/5 hover:bg-purple-500/10 text-purple-400 border-purple-500/20 text-2xs font-semibold rounded-xl transition-premium"
             >
               <Rocket className="w-3.5 h-3.5 mr-2" /> Manifest App
             </Button>
@@ -219,7 +219,7 @@ export function SlackAppSelector({
               onClick={handleConnect}
               disabled={connecting}
               variant="ghost"
-              className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-[9px] font-black uppercase tracking-widest rounded-xl border border-white/5 transition-premium"
+              className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-2xs font-semibold rounded-xl border border-white/5 transition-premium"
             >
               {connecting ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
@@ -235,46 +235,43 @@ export function SlackAppSelector({
       {displayError && (
         <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
           <AlertTriangle className="h-5 w-5 shrink-0" />
-          <p className="m-0 text-[10px] font-black uppercase tracking-widest">
-            {displayError}
-          </p>
+          <p className="m-0 text-xs font-semibold">{displayError}</p>
         </div>
       )}
 
       {integrations.length === 0 ? (
-        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-[2rem] text-center flex flex-col items-center animate-in fade-in duration-700">
+        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center animate-in fade-in duration-700">
           <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-6 border border-white/10">
-            <Hash className="h-8 w-8 text-muted-foreground/20" />
+            <Hash className="h-8 w-8 text-muted-foreground/50" />
           </div>
-          <h5 className="mb-2 text-sm font-black text-white uppercase tracking-tight font-outfit">
-            No Slack Workspaces Bridged
+          <h5 className="mb-2 text-sm font-semibold text-white tracking-tight font-outfit">
+            No Slack workspace connected
           </h5>
-          <p className="mb-8 text-[11px] font-bold text-muted-foreground/40 uppercase tracking-widest leading-relaxed max-w-xs mx-auto">
-            Synchronize your Slack grid to enable distributed communication
-            vectors for your automated workflows.
+          <p className="mb-8 text-xs text-muted-foreground/70 leading-relaxed max-w-xs mx-auto">
+            Connect a Slack workspace so your workflows can post and read
+            messages.
           </p>
           <Button
             onClick={handleConnect}
             disabled={connecting}
-            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-[10px] font-black uppercase tracking-widest rounded-xl shadow-xl shadow-[#4A154B]/20 active:scale-95 transition-premium"
+            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-sm font-semibold rounded-xl shadow-xl shadow-[#4A154B]/20 active:scale-95 transition-premium"
           >
             {connecting ? (
               <div className="flex items-center gap-3">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>Establishing Bridge...</span>
+                <span>Connecting…</span>
               </div>
             ) : (
               <>
-                🔗 Initialize Connection{" "}
-                <ArrowRight className="ml-2 w-3.5 h-3.5" />
+                Connect Slack <ArrowRight className="ml-2 w-3.5 h-3.5" />
               </>
             )}
           </Button>
         </div>
       ) : (
         <div className="space-y-6 relative z-10">
-          <p className="px-1 text-[9px] font-black text-white/40 uppercase tracking-[0.3em]">
-            ACTIVE COMMUNICATIONS GRID
+          <p className="px-1 text-2xs font-semibold text-white/70 uppercase tracking-wider">
+            Connected workspaces
           </p>
           <div className="grid gap-3">
             {integrations.map((integration) => {
@@ -296,7 +293,7 @@ export function SlackAppSelector({
                         "w-10 h-10 rounded-xl flex items-center justify-center border transition-premium",
                         isSelected
                           ? "bg-[#4A154B] text-white border-[#4A154B]"
-                          : "bg-white/5 text-muted-foreground/40 border-white/10",
+                          : "bg-white/5 text-muted-foreground/70 border-white/10",
                       )}
                     >
                       {isSelected ? (
@@ -308,13 +305,13 @@ export function SlackAppSelector({
                     <div className="flex-1 min-w-0">
                       <span
                         className={cn(
-                          "block text-xs font-black uppercase tracking-widest truncate transition-premium",
+                          "block text-xs font-semibold truncate transition-premium",
                           isSelected ? "text-white" : "text-white/60",
                         )}
                       >
                         {integration.team_name}
                       </span>
-                      <span className="block text-[9px] font-black text-muted-foreground/20 uppercase tracking-tighter mt-0.5">
+                      <span className="block text-2xs font-semibold text-muted-foreground/50 uppercase tracking-tighter mt-0.5">
                         ID: {integration.team_id}{" "}
                         {integration.last_used_at &&
                           `• Active: ${new Date(integration.last_used_at).toLocaleDateString()}`}
@@ -331,13 +328,13 @@ export function SlackAppSelector({
             })}
           </div>
 
-          <div className="p-6 bg-primary/5 border border-primary/10 rounded-[2rem] flex items-start gap-4">
+          <div className="p-6 bg-primary/5 border border-primary/10 rounded-2xl flex items-start gap-4">
             <div className="shrink-0 p-2 rounded-xl bg-primary/10 border border-primary/20">
               <Zap className="w-4 h-4 text-primary" />
             </div>
-            <p className="text-[10px] text-primary/60 font-bold uppercase tracking-widest leading-relaxed">
-              Strategic Insight: Use "Manifest App" to quickly synthesize a new
-              Slack vector with pre-configured operational permissions.
+            <p className="text-xs text-primary/60 leading-relaxed">
+              Tip: use "Manifest App" to create a new Slack app with the right
+              permissions already set.
             </p>
           </div>
         </div>

@@ -77,11 +77,11 @@ interface SmartClassifierConfigProps {
 }
 
 const labelStyle =
-  "text-[9px] text-muted-foreground/30 uppercase tracking-[0.3em] font-black ml-1";
+  "text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1";
 const inputBase =
-  "w-full px-5 py-3 text-[11px] font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium placeholder:text-muted-foreground/20";
+  "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium placeholder:text-muted-foreground/50";
 const textareaBase =
-  "w-full px-5 py-4 text-[11px] font-mono bg-black/40 border border-white/5 rounded-[2rem] text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed custom-scrollbar";
+  "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed custom-scrollbar";
 
 /**
  * First-class configuration surface for a `smart-classifier` module node.
@@ -239,7 +239,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
       toast.success(
         out.alreadyExisted
           ? `Reused existing model "${out.modelName}" (${out.lifecycleState})`
-          : `Classifier "${out.modelName}" provisioned — starts LLM-only, distills as it runs`,
+          : `Classifier "${out.modelName}" created — starts LLM-only, distills as it runs`,
       );
       // The local-only contract is only enforced at runtime by the actor's
       // tier ceiling — when the server says the two disagree, tell the user.
@@ -247,7 +247,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
         toast.warning(out.localityWarning, { duration: 12_000 });
       }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Provisioning failed");
+      toast.error(e instanceof Error ? e.message : "Setup failed");
     }
   };
 
@@ -259,10 +259,8 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <Sparkles className="w-4 h-4" />
         </div>
         <div>
-          <p className="text-[11px] font-black text-white uppercase tracking-widest">
-            Smart Classifier
-          </p>
-          <p className="text-[9px] text-muted-foreground/50 font-medium">
+          <p className="text-xs font-semibold text-white">Smart Classifier</p>
+          <p className="text-2xs text-muted-foreground/50 font-medium">
             Starts as an LLM · distills into a fast model over time
           </p>
         </div>
@@ -274,13 +272,13 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2 min-w-0">
               <CheckCircle2 className="w-4 h-4 text-success shrink-0" />
-              <span className="text-[11px] font-mono font-bold text-foreground/80 truncate">
+              <span className="text-xs font-mono font-bold text-foreground/80 truncate">
                 {modelName}
               </span>
             </div>
             <span
               className={cn(
-                "text-[9px] font-black px-2 py-0.5 rounded-md border uppercase tracking-wider shrink-0",
+                "text-2xs font-semibold px-2 py-0.5 rounded-md border uppercase tracking-wider shrink-0",
                 lifecycleStyle(liveModel?.lifecycleState),
               )}
             >
@@ -290,7 +288,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           {!!liveModel && liveModel.pendingDisagreements > 0 && (
             <Link
               to="/models"
-              className="flex items-center gap-1.5 text-[10px] font-bold text-warning hover:text-warning/80 transition-premium"
+              className="flex items-center gap-1.5 text-xs font-bold text-warning hover:text-warning/80 transition-premium"
             >
               <AlertTriangle className="w-3 h-3" />
               {liveModel.pendingDisagreements} to review
@@ -306,13 +304,13 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               updateNodeData(nodeId, { config: rest });
               setName("");
             }}
-            className="text-[9px] font-bold text-muted-foreground/40 hover:text-muted-foreground uppercase tracking-widest transition-premium"
+            className="text-2xs font-bold text-muted-foreground/70 hover:text-muted-foreground uppercase tracking-wider transition-premium"
           >
             Re-configure classifier…
           </button>
         </div>
       ) : (
-        <div className="space-y-4 px-5 py-5 bg-primary/[0.03] border border-primary/10 rounded-[1.5rem]">
+        <div className="space-y-4 px-5 py-5 bg-primary/[0.03] border border-primary/10 rounded-2xl">
           <div className="space-y-3">
             <label className={labelStyle}>Classifier Name</label>
             <Input
@@ -336,7 +334,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                 </option>
               ))}
             </DarkSelect>
-            <p className="text-[9px] text-muted-foreground/40 font-medium px-1 leading-relaxed">
+            <p className="text-2xs text-muted-foreground/70 font-medium px-1 leading-relaxed">
               The actor owns the model and receives the disagreement digest.
               Serving and learning run under its tenancy.
             </p>
@@ -344,7 +342,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <Button
             onClick={handleProvision}
             disabled={!canProvision}
-            className="w-full h-11 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 disabled:opacity-40 disabled:cursor-not-allowed transition-premium"
+            className="w-full h-11 text-sm font-semibold rounded-2xl bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 disabled:opacity-40 disabled:cursor-not-allowed transition-premium"
           >
             {isProvisioning ? (
               <>
@@ -356,7 +354,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
             )}
           </Button>
           {provisionReason && (
-            <p className="text-[9px] text-muted-foreground/40 font-medium text-center">
+            <p className="text-2xs text-muted-foreground/70 font-medium text-center">
               {provisionReason}
             </p>
           )}
@@ -373,7 +371,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           placeholder="Classify this support email by urgency."
           className={textareaBase}
         />
-        <p className="text-[9px] text-muted-foreground/40 font-medium px-1">
+        <p className="text-2xs text-muted-foreground/70 font-medium px-1">
           The allowed labels and JSON response format are appended
           automatically.
         </p>
@@ -386,13 +384,13 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           {labels.map((l) => (
             <span
               key={l}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[10px] font-bold bg-surface-4/60 border border-white/10 rounded-xl text-foreground/80"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-bold bg-surface-4/60 border border-white/10 rounded-xl text-foreground/80"
             >
               {l}
               <button
                 onClick={() => removeLabel(l)}
                 aria-label={`Remove ${l}`}
-                className="text-muted-foreground/40 hover:text-destructive transition-premium"
+                className="text-muted-foreground/70 hover:text-destructive transition-premium"
               >
                 <X className="w-3 h-3" />
               </button>
@@ -421,9 +419,9 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           </Button>
         </div>
         {!!modelName && (
-          <p className="text-[9px] text-warning/60 font-medium px-1 leading-relaxed">
+          <p className="text-2xs text-warning/60 font-medium px-1 leading-relaxed">
             Changing labels after setup does not re-train the model — its label
-            set was fixed at provisioning.
+            set was fixed at setup.
           </p>
         )}
       </div>
@@ -432,7 +430,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
       <div className="space-y-3">
         <button
           onClick={() => setAdvancedOpen((v) => !v)}
-          className="flex items-center gap-2 text-[9px] font-black text-muted-foreground/40 uppercase tracking-[0.3em] hover:text-white transition-premium"
+          className="flex items-center gap-2 text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider hover:text-white transition-premium"
         >
           <ChevronDown
             className={cn(
@@ -466,7 +464,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                     className="mt-0.5 accent-amber-500"
                     aria-label="Acknowledge external provider data egress"
                   />
-                  <span className="text-[9px] text-warning/70 font-medium leading-relaxed">
+                  <span className="text-2xs text-warning/70 font-medium leading-relaxed">
                     <AlertTriangle className="w-3 h-3 shrink-0 inline mr-1" />I
                     understand every classified input will be sent to this
                     external provider. Use ollama to keep classification local
@@ -495,7 +493,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                 }}
                 className={inputBase}
               />
-              <p className="text-[9px] text-muted-foreground/40 font-medium px-1">
+              <p className="text-2xs text-muted-foreground/70 font-medium px-1">
                 Cap for the LLM classification response (one label is small).
               </p>
             </div>

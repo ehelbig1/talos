@@ -155,7 +155,7 @@ export default function OAuthManager() {
     return (
       <div className="py-12 flex flex-col items-center justify-center gap-4">
         <LoadingSpinner />
-        <p className="text-[10px] text-muted-foreground font-bold uppercase tracking-widest animate-pulse">
+        <p className="text-xs text-muted-foreground font-bold animate-pulse">
           Synchronizing connected accounts...
         </p>
       </div>
@@ -165,22 +165,22 @@ export default function OAuthManager() {
   return (
     <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
       <div className="flex items-center gap-6">
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-[2rem] flex items-center justify-center shadow-[0_0_30px_hsla(var(--primary),0.1)] group">
-          <Shield className="w-8 h-8 text-primary group-hover:scale-110 transition-premium" />
+        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center group">
+          <Shield className="w-8 h-8 text-primary transition-premium" />
         </div>
         <div>
           <SectionHeader
             level="h2"
-            className="text-2xl md:text-3xl font-black text-white tracking-tighter font-outfit uppercase mb-1"
+            className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1"
           >
-            Identity Protocols
+            Sign-in providers
           </SectionHeader>
           <div className="flex items-center gap-3">
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
-              Federated_Security
+            <span className="text-xs font-semibold text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
+              Single sign-on
             </span>
-            <span className="text-[10px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
-              OAuth_2.0_Standard
+            <span className="text-xs font-semibold text-muted-foreground/70">
+              OAuth 2.0
             </span>
           </div>
         </div>
@@ -196,7 +196,7 @@ export default function OAuthManager() {
           return (
             <div
               key={provider.id}
-              className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 p-8 rounded-[2.5rem] group hover:border-white/10 hover:bg-surface-3/60 transition-premium relative overflow-hidden shadow-2xl"
+              className="bg-surface-3/40 backdrop-blur-3xl border border-white/5 p-8 rounded-3xl group hover:border-white/10 hover:bg-surface-3/60 transition-premium relative overflow-hidden shadow-2xl"
             >
               <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-0 group-hover:opacity-100 transition-premium pointer-events-none" />
 
@@ -204,11 +204,11 @@ export default function OAuthManager() {
                 <div className="flex items-start gap-6">
                   <div
                     className={cn(
-                      "w-16 h-16 rounded-2xl flex items-center justify-center border shadow-2xl shrink-0 transition-premium group-hover:scale-110 group-hover:rotate-3",
+                      "w-16 h-16 rounded-2xl flex items-center justify-center border shadow-2xl shrink-0 transition-premium group-hover:rotate-3",
                       provider.bg,
                       provider.border,
                       linkedAccount
-                        ? "shadow-primary/5"
+                        ? ""
                         : "grayscale opacity-20 group-hover:grayscale-0 group-hover:opacity-100",
                     )}
                   >
@@ -216,31 +216,31 @@ export default function OAuthManager() {
                   </div>
                   <div className="space-y-2">
                     <div className="flex items-center gap-3">
-                      <h5 className="text-xl font-black text-white tracking-tight uppercase font-outfit">
+                      <h5 className="text-xl font-semibold text-white tracking-tight font-outfit">
                         {provider.name}
                       </h5>
                       {linkedAccount && (
-                        <div className="flex items-center gap-2 bg-success/10 px-3 py-1 rounded-full border border-success/20 shadow-[0_0_15px_hsla(var(--success),0.1)]">
+                        <div className="flex items-center gap-2 bg-success/10 px-3 py-1 rounded-full border border-success/20">
                           <Check className="w-3 h-3 text-success" />
-                          <span className="text-[9px] font-black text-success uppercase tracking-widest">
-                            SYNCHRONIZED
+                          <span className="text-2xs font-semibold text-success uppercase tracking-wider">
+                            Connected
                           </span>
                         </div>
                       )}
                     </div>
                     {linkedAccount ? (
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-10 gap-y-2 text-[11px]">
-                        <div className="flex items-center gap-3 text-white/60 font-bold uppercase tracking-widest">
-                          <Mail className="w-3.5 h-3.5 text-primary/40" />
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-10 gap-y-2 text-xs">
+                        <div className="flex items-center gap-3 text-white/60 font-bold">
+                          <Mail className="w-3.5 h-3.5 text-primary/70" />
                           {linkedAccount.email}
                         </div>
                         {linkedAccount.name && (
-                          <div className="flex items-center gap-3 text-white/60 font-bold uppercase tracking-widest">
-                            <UserIcon className="w-3.5 h-3.5 text-primary/40" />
+                          <div className="flex items-center gap-3 text-white/60 font-bold">
+                            <UserIcon className="w-3.5 h-3.5 text-primary/70" />
                             {linkedAccount.name}
                           </div>
                         )}
-                        <div className="flex items-center gap-3 text-muted-foreground/30 font-black uppercase tracking-widest">
+                        <div className="flex items-center gap-3 text-muted-foreground/60 font-semibold">
                           <Clock className="w-3.5 h-3.5" />
                           Linked_
                           {new Date(linkedAccount.linkedAt)
@@ -253,7 +253,7 @@ export default function OAuthManager() {
                         </div>
                       </div>
                     ) : (
-                      <p className="text-[11px] text-muted-foreground/30 font-bold uppercase tracking-[0.2em]">
+                      <p className="text-xs text-muted-foreground/60 font-bold">
                         No active credential link for {provider.name}
                       </p>
                     )}
@@ -264,7 +264,7 @@ export default function OAuthManager() {
                   {linkedAccount ? (
                     <Button
                       variant="outline"
-                      className="h-12 px-6 border-white/10 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/30 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium active:scale-95 shadow-xl"
+                      className="h-12 px-6 border-white/10 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/30 text-sm font-semibold rounded-xl transition-premium active:scale-95 shadow-xl"
                       onClick={() => handleUnlink(provider.id)}
                       disabled={unlinkMutation.isPending}
                     >
@@ -274,7 +274,7 @@ export default function OAuthManager() {
                       ) : (
                         <Unlink className="w-4 h-4 mr-3 opacity-40" />
                       )}
-                      Disconnect_Protocol
+                      Disconnect
                     </Button>
                   ) : (
                     <Button
@@ -288,13 +288,13 @@ export default function OAuthManager() {
                       ) : (
                         <LinkIcon className="w-4 h-4 mr-3" />
                       )}
-                      ESTABLISH_LINK
+                      Connect
                     </Button>
                   )}
                   {linkedAccount && (
                     <button
                       type="button"
-                      className="h-12 w-12 flex items-center justify-center text-muted-foreground/20 hover:text-primary hover:bg-primary/10 rounded-xl transition-premium border border-white/5 hover:border-primary/20 shadow-xl"
+                      className="h-12 w-12 flex items-center justify-center text-muted-foreground/50 hover:text-primary hover:bg-primary/10 rounded-xl transition-premium border border-white/5 hover:border-primary/20 shadow-xl"
                       title="Access provider dashboard"
                     >
                       <ExternalLink className="w-5 h-5" />
@@ -307,29 +307,27 @@ export default function OAuthManager() {
         })}
       </div>
 
-      <div className="bg-primary/5 border border-white/5 rounded-[2.5rem] p-8 flex items-start gap-8 hover:border-white/10 transition-premium group relative overflow-hidden">
+      <div className="bg-primary/5 border border-white/5 rounded-3xl p-8 flex items-start gap-8 hover:border-white/10 transition-premium group relative overflow-hidden">
         <div className="absolute inset-0 bg-primary/5 opacity-0 group-hover:opacity-100 transition-premium blur-3xl pointer-events-none" />
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 group-hover:scale-105 transition-premium shadow-inner relative z-10">
+        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 transition-premium shadow-inner relative z-10">
           <Shield className="w-8 h-8 text-primary" />
         </div>
         <div className="space-y-2 relative z-10">
-          <h4 className="text-lg font-black text-white uppercase tracking-tight font-outfit">
-            Redundant_Authentication_Shield
+          <h4 className="text-lg font-semibold text-white tracking-tight font-outfit">
+            A second way to sign in
           </h4>
-          <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-3xl">
-            Linking multiple identity providers strengthens your account
-            recovery perimeter. In the event of primary provider downtime, you
-            can maintain operational continuity using any secondary verified
-            protocol.
+          <p className="text-xs text-muted-foreground/70 leading-relaxed max-w-3xl">
+            Linking more than one provider gives you a fallback. If one provider
+            is down, you can still sign in with another.
           </p>
         </div>
       </div>
 
       <ConfirmDialog
         open={providerToUnlink !== null}
-        title="Sever Protocol Link?"
+        title="Disconnect provider?"
         message={`Are you sure you want to unlink your ${providerToUnlink} account? This will remove it as a fallback authentication method.`}
-        confirmLabel="Sever Link"
+        confirmLabel="Disconnect"
         destructive
         onConfirm={() => {
           if (providerToUnlink)

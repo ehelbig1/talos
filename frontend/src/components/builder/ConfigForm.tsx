@@ -89,8 +89,8 @@ export const ConfigForm = React.memo(function ConfigForm({
 
   if (!schema.properties) {
     return (
-      <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-xl text-destructive text-[10px] font-black uppercase tracking-widest">
-        Invalid Blueprint Schema
+      <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-xl text-destructive text-xs font-semibold">
+        This template's config schema is invalid
       </div>
     );
   }
@@ -176,7 +176,7 @@ export const ConfigForm = React.memo(function ConfigForm({
               <div className="flex items-center justify-between px-1">
                 <label
                   htmlFor={`field-${field}`}
-                  className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]"
+                  className="text-xs font-semibold text-white/70"
                 >
                   {fieldSchema.title || field}
                   {schema.required?.includes(field) && (
@@ -185,9 +185,9 @@ export const ConfigForm = React.memo(function ConfigForm({
                 </label>
                 {fieldSchema.description && (
                   <div className="group/info relative">
-                    <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/20 cursor-help hover:text-primary transition-premium" />
+                    <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/50 cursor-help hover:text-primary transition-premium" />
                     <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl shadow-2xl opacity-0 group-hover/info:opacity-100 transition-premium pointer-events-none z-50">
-                      <p className="text-[10px] font-bold text-white/60 leading-relaxed uppercase tracking-widest">
+                      <p className="text-xs font-bold text-white/60 leading-relaxed">
                         {fieldSchema.description}
                       </p>
                     </div>
@@ -208,7 +208,7 @@ export const ConfigForm = React.memo(function ConfigForm({
               )}
 
               {validationErrors[field] && (
-                <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-[9px] font-black text-destructive uppercase tracking-widest flex items-center gap-2 animate-in slide-in-from-top-1">
+                <p className="px-2 py-2 bg-destructive/5 border border-destructive/10 rounded-lg text-2xs font-semibold text-destructive uppercase tracking-wider flex items-center gap-2 animate-in slide-in-from-top-1">
                   <AlertTriangle className="h-3.5 w-3.5" />
                   {validationErrors[field]}
                 </p>
@@ -224,14 +224,14 @@ export const ConfigForm = React.memo(function ConfigForm({
                         <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
                           <CheckCircle className="h-4 w-4" />
                         </div>
-                        <span className="text-[10px] font-black text-white/40 uppercase tracking-[0.2em]">
-                          Protocol Endpoint Authenticated
+                        <span className="text-xs font-semibold text-white/70">
+                          Endpoint connected
                         </span>
                       </div>
                       {suggestions.length > 0 && !showSuggestions && (
                         <button
                           onClick={() => setShowSuggestions(true)}
-                          className="text-[9px] font-black text-primary uppercase tracking-widest animate-pulse"
+                          className="text-2xs font-semibold text-primary uppercase tracking-wider animate-pulse"
                         >
                           {suggestions.length} Optimizations Ready
                         </button>
@@ -240,7 +240,7 @@ export const ConfigForm = React.memo(function ConfigForm({
 
                     {category === "http" && (
                       <div className="space-y-4 relative z-10 pt-4 border-t border-white/5">
-                        <p className="text-[9px] font-black text-white/20 uppercase tracking-[0.3em] flex items-center gap-2">
+                        <p className="text-2xs font-semibold text-white/50 uppercase tracking-wider flex items-center gap-2">
                           <Target className="h-3.5 w-3.5 text-primary" />
                           Deep Ingress Configuration
                         </p>
@@ -270,10 +270,10 @@ export const ConfigForm = React.memo(function ConfigForm({
           .length > 0 && (
           <Accordion type="single" collapsible className="w-full">
             <AccordionItem value="advanced" className="border-white/5">
-              <AccordionTrigger className="text-[10px] font-black text-white/40 uppercase tracking-[0.3em] hover:text-white hover:no-underline px-1 transition-premium">
+              <AccordionTrigger className="text-xs font-semibold text-white/70 hover:text-white hover:no-underline px-1 transition-premium">
                 <div className="flex items-center gap-3">
                   <Settings className="h-3.5 w-3.5" />
-                  Extended Configuration Vector
+                  More settings
                 </div>
               </AccordionTrigger>
               <AccordionContent className="pt-8 pb-4 space-y-8 animate-in fade-in slide-in-from-top-4">
@@ -284,7 +284,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                   )
                   .map(([field, fieldSchema]) => (
                     <div key={field} className="space-y-3">
-                      <label className="text-[10px] font-black text-white/20 uppercase tracking-[0.2em] px-1">
+                      <label className="text-xs font-semibold text-white/50 px-1">
                         {fieldSchema.title || field}
                       </label>
                       {renderField(
@@ -295,7 +295,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                         validationErrors[field] ? false : undefined,
                       )}
                       {validationErrors[field] && (
-                        <p className="text-[9px] font-black text-destructive uppercase tracking-widest px-2">
+                        <p className="text-2xs font-semibold text-destructive uppercase tracking-wider px-2">
                           {validationErrors[field]}
                         </p>
                       )}

@@ -17,12 +17,12 @@ export const NodeErrorOverlay: React.FC<NodeErrorOverlayProps> = ({
     <div className="mt-3 pt-2.5 border-t border-border/50 space-y-1.5 group/error">
       <div className="flex items-start gap-2">
         <AlertCircle className="w-3.5 h-3.5 text-destructive shrink-0 mt-0.5" />
-        <p className="text-[11px] text-destructive/90 leading-relaxed line-clamp-2">
+        <p className="text-xs text-destructive/90 leading-relaxed line-clamp-2">
           {sanitizeErrorMessage(error).slice(0, 120)}
         </p>
       </div>
       {fixSuggestion && (
-        <p className="text-[11px] text-warning font-bold tracking-tight pl-5">
+        <p className="text-xs text-warning font-bold tracking-tight pl-5">
           PROPOSAL: {fixSuggestion}
         </p>
       )}

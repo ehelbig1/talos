@@ -254,18 +254,18 @@ export default function ExecutionPanel() {
           {executionId && (
             <div className="px-6 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-4">
-                <span className="text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/30">
+                <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
                   Active Session
                 </span>
                 <div className="flex items-center gap-2 group">
-                  <code className="text-[10px] text-primary font-mono bg-primary/10 px-2 py-1 rounded-lg border border-primary/20 shadow-[0_0_10px_hsla(var(--primary),0.1)]">
+                  <code className="text-xs text-primary font-mono bg-primary/10 px-2 py-1 rounded-lg border border-primary/20">
                     {executionId.slice(0, 16)}...
                   </code>
                   <Button
                     variant="ghost"
                     size="icon"
                     onClick={() => copyId(executionId)}
-                    className="h-7 w-7 text-muted-foreground/40 hover:text-primary hover:bg-primary/10 transition-premium rounded-lg"
+                    className="h-7 w-7 text-muted-foreground/70 hover:text-primary hover:bg-primary/10 transition-premium rounded-lg"
                   >
                     <Copy className="h-3.5 w-3.5" />
                   </Button>
@@ -274,7 +274,7 @@ export default function ExecutionPanel() {
               {error && (
                 <div className="flex items-center gap-3 px-3 py-1 bg-destructive/10 border border-destructive/20 rounded-full">
                   <AlertCircle className="h-3.5 w-3.5 text-destructive" />
-                  <span className="text-[10px] text-destructive font-black uppercase tracking-tight truncate max-w-[250px]">
+                  <span className="text-xs text-destructive font-semibold truncate max-w-[250px]">
                     {error}
                   </span>
                 </div>
@@ -286,7 +286,7 @@ export default function ExecutionPanel() {
           <div className="px-6 py-2 flex gap-4 items-center border-b border-white/[0.03]">
             {events.length > 1 && (
               <div className="flex items-center gap-4 mr-4">
-                <Clock className="h-4 w-4 text-muted-foreground/30" />
+                <Clock className="h-4 w-4 text-muted-foreground/60" />
                 <input
                   type="range"
                   min={0}
@@ -307,7 +307,7 @@ export default function ExecutionPanel() {
                     }
                   }}
                 />
-                <span className="text-[10px] font-black text-muted-foreground/30 tabular-nums min-w-[3ch]">
+                <span className="text-xs font-semibold text-muted-foreground/60 tabular-nums min-w-[3ch]">
                   {events.length} EVENTS
                 </span>
               </div>
@@ -318,10 +318,10 @@ export default function ExecutionPanel() {
                   key={mode}
                   onClick={() => setViewMode(mode)}
                   className={cn(
-                    "px-4 py-1.5 text-[9px] font-black uppercase tracking-widest rounded-lg transition-premium",
+                    "px-4 py-1.5 text-2xs font-semibold uppercase tracking-wider rounded-lg transition-premium",
                     viewMode === mode
-                      ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20"
-                      : "text-muted-foreground/40 hover:text-white",
+                      ? "bg-primary text-primary-foreground shadow-lg"
+                      : "text-muted-foreground/70 hover:text-white",
                   )}
                 >
                   {mode.charAt(0).toUpperCase() + mode.slice(1)}
@@ -335,17 +335,17 @@ export default function ExecutionPanel() {
             {events.length === 0 ? (
               <div className="py-20 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
-                  <div className="absolute -inset-10 bg-primary/5 rounded-full blur-[60px] opacity-0 group-hover:opacity-100 transition-premium animate-pulse" />
-                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 shadow-2xl transition-premium group-hover:scale-105 group-hover:border-primary/20">
-                    <Activity className="h-16 w-16 text-muted-foreground/20 group-hover:text-primary transition-premium stroke-[1px]" />
+                  <div className="absolute -inset-10 bg-primary/5 rounded-full blur-[60px] opacity-0 group-hover:opacity-100 transition-premium" />
+                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 shadow-2xl transition-premium group-hover:border-primary/20">
+                    <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-premium stroke-[1px]" />
                   </div>
                 </div>
                 <div className="space-y-3 max-w-[280px]">
-                  <h3 className="text-xl font-black tracking-tighter text-white font-outfit uppercase opacity-40">
-                    Telemetry Core
+                  <h3 className="text-xl font-semibold tracking-tight text-white font-outfit opacity-40">
+                    No run selected
                   </h3>
-                  <p className="text-[9px] text-muted-foreground/30 font-black uppercase tracking-[0.2em] leading-relaxed">
-                    Initialize protocol to synchronize data streams.
+                  <p className="text-2xs text-muted-foreground/60 leading-relaxed">
+                    Run the workflow to see its output here.
                   </p>
                 </div>
               </div>

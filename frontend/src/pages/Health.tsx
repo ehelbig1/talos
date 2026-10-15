@@ -12,6 +12,7 @@ import {
   type MySchedulesQuery,
 } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
+import { PageHeader } from "@/components/ui";
 import { futureTime, formatDurationSecs } from "@/lib/formatTime";
 import {
   Activity,
@@ -21,7 +22,6 @@ import {
   Clock,
   Layers,
   Lock,
-  TrendingUp,
   XCircle,
   Zap,
 } from "lucide-react";
@@ -65,7 +65,7 @@ function StatCard({
 }: StatCardProps) {
   const Icon = icon as React.ReactElement<{ size?: number }>;
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-[2rem] p-6 glass transition-premium hover-elevation relative overflow-hidden group">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 glass transition-premium hover-elevation relative overflow-hidden group">
       <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
         {React.cloneElement(Icon, { size: 48 })}
       </div>
@@ -80,7 +80,7 @@ function StatCard({
           >
             {icon}
           </div>
-          <span className="text-[10px] font-black text-muted-foreground uppercase tracking-widest">
+          <span className="text-2xs font-semibold text-muted-foreground uppercase tracking-wider">
             {label}
           </span>
         </div>
@@ -91,16 +91,14 @@ function StatCard({
           <div className="mt-auto">
             <div
               className={cn(
-                "text-3xl font-black tabular-nums tracking-tighter",
+                "text-3xl font-semibold tabular-nums tracking-tight",
                 accent,
               )}
             >
               {value}
             </div>
             {sub && (
-              <div className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5">
-                {sub}
-              </div>
+              <div className="text-xs text-muted-foreground mt-1">{sub}</div>
             )}
           </div>
         )}
@@ -116,12 +114,7 @@ function StatCard({
 function RateBar({ rate }: { rate: number }) {
   const color =
     rate >= 95 ? "bg-success" : rate >= 80 ? "bg-warning" : "bg-destructive";
-  const glow =
-    rate >= 95
-      ? "shadow-[0_0_10px_hsla(var(--success),0.5)]"
-      : rate >= 80
-        ? "shadow-[0_0_10px_hsla(var(--warning),0.5)]"
-        : "shadow-[0_0_10px_hsla(var(--destructive),0.5)]";
+  const glow = rate >= 95 ? "" : rate >= 80 ? "" : "";
 
   return (
     <div className="flex items-center gap-3 min-w-0">
@@ -137,7 +130,7 @@ function RateBar({ rate }: { rate: number }) {
       </div>
       <span
         className={cn(
-          "text-[10px] font-black tabular-nums w-10 text-right shrink-0 tracking-widest",
+          "text-xs font-semibold tabular-nums w-10 text-right shrink-0 tracking-wider",
           rate >= 95
             ? "text-success"
             : rate >= 80
@@ -170,13 +163,11 @@ function SectionHeader({
         <div className="w-8 h-8 rounded-xl bg-surface-4/60 border border-white/5 flex items-center justify-center text-primary">
           {icon}
         </div>
-        <h2 className="text-[11px] font-black text-white uppercase tracking-widest">
-          {title}
-        </h2>
+        <h2 className="text-sm font-semibold text-white">{title}</h2>
       </div>
       {count !== undefined && (
-        <span className="text-[10px] font-black text-muted-foreground/40 bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
-          {count} TOTAL
+        <span className="text-xs text-muted-foreground bg-white/5 px-2.5 py-1 rounded-full tabular-nums">
+          {count} total
         </span>
       )}
     </div>
@@ -206,33 +197,33 @@ function ActorBreakdown() {
 
   const rows = [
     {
-      label: "Active Nodes",
+      label: "Active",
       count: counts.active,
-      dot: "bg-success shadow-[0_0_8px_hsla(var(--success),0.5)]",
+      dot: "bg-success",
       text: "text-success",
       bg: "bg-success/5 border-success/10",
     },
     {
       label: "Suspended",
       count: counts.suspended,
-      dot: "bg-warning shadow-[0_0_8px_hsla(var(--warning),0.5)]",
+      dot: "bg-warning",
       text: "text-warning",
       bg: "bg-warning/5 border-warning/10",
     },
     {
-      label: "Terminated",
+      label: "Stopped",
       count: counts.terminated,
-      dot: "bg-destructive shadow-[0_0_8px_hsla(var(--destructive),0.5)]",
+      dot: "bg-destructive",
       text: "text-destructive",
       bg: "bg-destructive/5 border-destructive/10",
     },
   ];
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-[2.5rem] p-8 glass h-full">
+    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
       <SectionHeader
         icon={<Bot size={16} />}
-        title="Identity Distribution"
+        title="Actors by status"
         count={actors.length}
       />
       {isLoading ? (
@@ -246,10 +237,8 @@ function ActorBreakdown() {
         </div>
       ) : actors.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center">
-          <Bot className="w-10 h-10 text-muted-foreground/10 mb-4" />
-          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
-            No identities registered
-          </p>
+          <Bot className="w-10 h-10 text-muted-foreground/30 mb-4" />
+          <p className="text-sm text-muted-foreground">No actors yet</p>
         </div>
       ) : (
         <div className="space-y-3">
@@ -267,11 +256,11 @@ function ActorBreakdown() {
                   <span
                     className={cn("w-2 h-2 rounded-full shrink-0", r.dot)}
                   />
-                  <span className="text-[10px] font-black text-muted-foreground/80 uppercase tracking-widest flex-1 text-left group-hover:text-foreground transition-colors">
+                  <span className="text-sm text-muted-foreground flex-1 text-left group-hover:text-foreground transition-colors">
                     {r.label}
                   </span>
                   <span
-                    className={cn("text-lg font-black tabular-nums", r.text)}
+                    className={cn("text-lg font-semibold tabular-nums", r.text)}
                   >
                     {r.count}
                   </span>
@@ -335,10 +324,10 @@ function UpcomingSchedules() {
   const enabledCount = schedules.filter((s) => s.isEnabled).length;
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-[2.5rem] p-8 glass h-full">
+    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
       <SectionHeader
         icon={<Calendar size={16} />}
-        title="Trigger Queue"
+        title="Upcoming schedules"
         count={enabledCount}
       />
       {isLoading ? (
@@ -352,10 +341,8 @@ function UpcomingSchedules() {
         </div>
       ) : upcoming.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center">
-          <Calendar className="w-10 h-10 text-muted-foreground/10 mb-4" />
-          <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
-            No triggers scheduled
-          </p>
+          <Calendar className="w-10 h-10 text-muted-foreground/30 mb-4" />
+          <p className="text-sm text-muted-foreground">No schedules enabled</p>
         </div>
       ) : (
         <div className="space-y-2">
@@ -376,16 +363,16 @@ function UpcomingSchedules() {
                   <Clock size={18} />
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="text-[11px] font-black text-white truncate uppercase tracking-tight">
+                  <div className="text-sm font-medium text-white truncate">
                     {s.workflowName ?? s.workflowId.slice(0, 8) + "…"}
                   </div>
-                  <div className="text-[9px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1">
+                  <div className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider mt-1">
                     {s.cronExpression}
                   </div>
                 </div>
                 <span
                   className={cn(
-                    "text-[10px] font-black uppercase tracking-widest shrink-0",
+                    "text-xs font-semibold shrink-0",
                     isOverdue
                       ? "text-destructive animate-status-pulse"
                       : "text-primary",
@@ -431,25 +418,25 @@ function WorkflowHealth() {
   );
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-[3rem] p-8 glass relative overflow-hidden group">
+    <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass relative overflow-hidden group">
       <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-30" />
 
       <div className="relative z-10">
         <div className="flex items-center justify-between mb-8">
           <SectionHeader
             icon={<Activity size={18} />}
-            title="Logic Performance"
+            title="Workflow health"
             count={sorted.length}
           />
-          <div className="flex items-center gap-4 text-[10px] font-black uppercase tracking-widest">
+          <div className="flex items-center gap-4 text-xs font-semibold">
             <span className="flex items-center gap-2 bg-primary/10 text-primary px-3 py-1.5 rounded-full border border-primary/20">
               <Zap size={12} fill="currentColor" />
-              {totalExecs} CYCLES
+              {totalExecs} runs
             </span>
             {totalFailed > 0 && (
-              <span className="flex items-center gap-2 bg-destructive/10 text-destructive px-3 py-1.5 rounded-full border border-destructive/20 animate-status-pulse">
+              <span className="flex items-center gap-2 bg-destructive/10 text-destructive px-3 py-1.5 rounded-full border border-destructive/20">
                 <XCircle size={12} />
-                {totalFailed} ERRORS
+                {totalFailed} failed
               </span>
             )}
           </div>
@@ -466,9 +453,9 @@ function WorkflowHealth() {
           </div>
         ) : sorted.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-24 text-center">
-            <Activity className="w-16 h-16 text-muted-foreground/10 mb-6" />
-            <p className="text-sm font-black text-muted-foreground/40 uppercase tracking-widest">
-              No telemetry data recorded in the last 7 days
+            <Activity className="w-16 h-16 text-muted-foreground/30 mb-6" />
+            <p className="text-sm text-muted-foreground">
+              No runs in the last 7 days
             </p>
           </div>
         ) : (
@@ -476,19 +463,19 @@ function WorkflowHealth() {
             <table className="w-full">
               <thead>
                 <tr className="border-b border-white/5">
-                  <th className="text-left text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest pb-4 pl-4">
-                    Logic Protocol
+                  <th className="text-left text-xs font-semibold text-muted-foreground/70 pb-4 pl-4">
+                    Workflow
                   </th>
-                  <th className="text-right text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest pb-4 pr-6 w-24">
-                    Cycles
+                  <th className="text-right text-xs font-semibold text-muted-foreground/70 pb-4 pr-6 w-24">
+                    Runs
                   </th>
-                  <th className="text-right text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest pb-4 pr-6 w-24">
-                    Fails
+                  <th className="text-right text-xs font-semibold text-muted-foreground/70 pb-4 pr-6 w-24">
+                    Failed
                   </th>
-                  <th className="text-right text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest pb-4 pr-6 w-24">
+                  <th className="text-right text-xs font-semibold text-muted-foreground/70 pb-4 pr-6 w-24">
                     Latency
                   </th>
-                  <th className="text-left text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest pb-4 w-48">
+                  <th className="text-left text-xs font-semibold text-muted-foreground/70 pb-4 w-48">
                     Reliability
                   </th>
                 </tr>
@@ -506,35 +493,33 @@ function WorkflowHealth() {
                           <div
                             className={cn(
                               "w-2 h-2 rounded-full",
-                              s.failed > 0
-                                ? "bg-destructive shadow-[0_0_8px_hsla(var(--destructive),0.5)]"
-                                : "bg-success shadow-[0_0_8px_hsla(var(--success),0.5)]",
+                              s.failed > 0 ? "bg-destructive" : "bg-success",
                             )}
                           />
                           <span
-                            className="text-sm font-black text-white truncate max-w-[240px] tracking-tight group-hover/row:text-primary transition-colors"
+                            className="text-sm font-semibold text-white truncate max-w-[240px] tracking-tight group-hover/row:text-primary transition-colors"
                             title={s.name}
                           >
                             {s.name}
                           </span>
                         </div>
                       </td>
-                      <td className="py-4 pr-6 text-right tabular-nums text-foreground font-black text-xs">
+                      <td className="py-4 pr-6 text-right tabular-nums text-foreground font-semibold text-xs">
                         {s.total}
                       </td>
                       <td className="py-4 pr-6 text-right tabular-nums">
                         <span
                           className={cn(
-                            "text-xs font-black",
+                            "text-xs font-semibold",
                             s.failed > 0
                               ? "text-destructive"
-                              : "text-muted-foreground/20",
+                              : "text-muted-foreground/50",
                           )}
                         >
                           {s.failed}
                         </span>
                       </td>
-                      <td className="py-4 pr-6 text-right tabular-nums text-muted-foreground font-black text-[10px] uppercase tracking-widest">
+                      <td className="py-4 pr-6 text-right tabular-nums text-muted-foreground text-xs">
                         {formatDurationSecs(s.avgDurationSecs)}
                       </td>
                       <td className="py-4 pr-4">
@@ -620,71 +605,52 @@ export default function Health() {
       {/* Dynamic Glow Background */}
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
 
-      <div className="max-w-7xl mx-auto px-8 py-12 relative z-10">
+      <div className="max-w-7xl mx-auto px-8 py-10 relative z-10">
         {/* Page header */}
-        <header className="mb-12">
-          <div className="flex items-center gap-4 mb-2">
-            <div className="w-12 h-12 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center shadow-lg shadow-primary/10">
-              <TrendingUp className="w-6 h-6 text-primary" />
-            </div>
-            <div>
-              <h1 className="text-4xl font-black text-white tracking-tighter drop-shadow-sm">
-                System Intelligence
-              </h1>
-              <p className="text-[11px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1.5 flex items-center gap-2">
-                Mission Control &bull; Operational Telemetry &bull; 7-Day Matrix
-              </p>
-            </div>
-          </div>
-        </header>
+        <PageHeader
+          title="System health"
+          description="Workflows, actors and runs over the last 7 days."
+        />
 
         {/* Stat cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-12">
           <StatCard
-            label="Logical Protocols"
+            label="Workflows"
             value={workflows?.length ?? "—"}
             icon={<Layers size={18} />}
             accent="text-primary"
             loading={!workflows}
           />
           <StatCard
-            label="Active Entities"
+            label="Active actors"
             value={activeActors}
-            sub={
-              actors.length > 0
-                ? `${actors.length} Identity Registry`
-                : undefined
-            }
+            sub={actors.length > 0 ? `${actors.length} in total` : undefined}
             icon={<Bot size={18} />}
             accent="text-success"
             loading={actorsLoading}
           />
           <StatCard
-            label="Total Cycles"
+            label="Runs today"
             value={totalExecsToday}
-            sub={
-              failedToday > 0
-                ? `${failedToday} System Faults`
-                : "Clean execution"
-            }
+            sub={failedToday > 0 ? `${failedToday} failed` : "None failed"}
             icon={<Activity size={18} />}
             accent={failedToday > 0 ? "text-warning" : "text-success"}
             loading={statsLoading}
           />
           <StatCard
-            label="Platform Integrity"
+            label="Success rate"
             value={`${overallHealthPct}%`}
-            sub="Stability coefficient"
+            sub="Last 7 days"
             icon={<CheckCircle2 size={18} />}
             accent={healthColor}
             loading={statsLoading}
           />
           <StatCard
-            label="Vault Security"
+            label="Secrets"
             value={secrets.length}
             sub={
               enabledSchedules > 0
-                ? `${enabledSchedules} Trigger Hooks`
+                ? `${enabledSchedules} active schedule${enabledSchedules === 1 ? "" : "s"}`
                 : undefined
             }
             icon={<Lock size={18} />}
@@ -709,10 +675,8 @@ export default function Health() {
 
         {/* Footer note */}
         <footer className="pt-8 border-t border-white/5">
-          <p className="text-[10px] font-black text-muted-foreground/20 text-center uppercase tracking-widest leading-relaxed max-w-2xl mx-auto">
-            Operational intelligence reflects a rolling 168-hour temporal
-            window. Entity memory and cross-world permissions are enforced via
-            persistent MCP protocols.
+          <p className="text-xs text-muted-foreground/70 text-center leading-relaxed max-w-2xl mx-auto">
+            Counts cover the last 7 days and refresh every minute.
           </p>
         </footer>
       </div>

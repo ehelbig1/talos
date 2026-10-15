@@ -32,7 +32,7 @@ describe("WorkflowToolbar Component", () => {
 
     render(<WorkflowToolbar />);
 
-    expect(screen.getByText(/uncommitted/i)).toBeInTheDocument();
+    expect(screen.getByText(/unsaved/i)).toBeInTheDocument();
   });
 
   it("handles saving a new workflow", async () => {
@@ -60,14 +60,12 @@ describe("WorkflowToolbar Component", () => {
     fireEvent.click(saveBtn);
 
     // Should show the name-assignment dialog
-    expect(screen.getAllByText(/identity assignment/i).length).toBeGreaterThan(
-      0,
-    );
+    expect(screen.getAllByText(/rename workflow/i).length).toBeGreaterThan(0);
 
     const input = screen.getByPlaceholderText(/workflow identifier/i);
     fireEvent.change(input, { target: { value: "My New Workflow" } });
 
-    const confirmBtn = screen.getByRole("button", { name: /commit identity/i });
+    const confirmBtn = screen.getByRole("button", { name: /save name/i });
     fireEvent.click(confirmBtn);
 
     await waitFor(() => {
@@ -82,12 +80,12 @@ describe("WorkflowToolbar Component", () => {
   it("toggles inspector visibility", () => {
     render(<WorkflowToolbar />);
 
-    const toggleBtn = screen.getByRole("button", { name: /diagnostics/i });
+    const toggleBtn = screen.getByRole("button", { name: /inspector/i });
     fireEvent.click(toggleBtn);
 
     expect(useUIStore.getState().showInspector).toBe(true);
 
-    fireEvent.click(screen.getByRole("button", { name: /diagnostics/i }));
+    fireEvent.click(screen.getByRole("button", { name: /inspector/i }));
     expect(useUIStore.getState().showInspector).toBe(false);
   });
 
@@ -125,7 +123,7 @@ describe("WorkflowToolbar Component", () => {
 
     render(<WorkflowToolbar />);
 
-    // A "success" run status renders as the "Operational" health pill.
-    expect(screen.getByText(/operational/i)).toBeInTheDocument();
+    // A "success" run status renders as the "Succeeded" health pill.
+    expect(screen.getByText(/succeeded/i)).toBeInTheDocument();
   });
 });

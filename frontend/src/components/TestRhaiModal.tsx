@@ -66,17 +66,17 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
     <Dialog
       open={open}
       onClose={handleClose}
-      title="Protocol Evaluation"
+      title="Test expression"
       className="max-w-2xl"
     >
       <div className="space-y-8 relative z-10 p-2 -mt-4">
         <div className="flex items-center justify-between mb-2">
-          <p className="text-[11px] text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
-            Validate Rhai logic against synthetic telemetry context
+          <p className="text-xs text-muted-foreground/60 leading-relaxed">
+            Run a Rhai expression against sample input
           </p>
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-primary/40 shadow-[0_0_8px_hsla(var(--primary),0.5)]" />
-            <span className="text-[9px] font-black text-primary/40 uppercase tracking-[0.2em]">
+            <div className="w-1.5 h-1.5 rounded-full bg-primary/40" />
+            <span className="text-2xs font-semibold text-primary/70 uppercase tracking-wider">
               Rhai Runtime v1.0
             </span>
           </div>
@@ -87,14 +87,14 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
             <div className="flex items-center gap-3">
               <Code2 className="w-4 h-4 text-primary" />
               <label style={labelStyle} className="mb-0">
-                Operational Expression
+                Expression
               </label>
             </div>
-            <div className="bg-surface-4/60 p-6 rounded-[2rem] border border-white/5 font-mono text-[11px] text-primary/80 break-all leading-relaxed shadow-inner glass-light relative overflow-hidden">
+            <div className="bg-surface-4/60 p-6 rounded-2xl border border-white/5 font-mono text-xs text-primary/80 break-all leading-relaxed shadow-inner glass-light relative overflow-hidden">
               <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
               <div className="relative z-10">
                 {script || (
-                  <span className="text-muted-foreground/20 italic font-black uppercase tracking-widest">
+                  <span className="text-muted-foreground/50 italic font-semibold">
                     Awaiting Instruction...
                   </span>
                 )}
@@ -107,16 +107,16 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
               <div className="flex items-center gap-3">
                 <Terminal className="w-4 h-4 text-primary" />
                 <label style={labelStyle} className="mb-0">
-                  Synthetic Telemetry Context (JSON)
+                  Sample context (JSON)
                 </label>
               </div>
               <div className="relative group">
-                <div className="absolute -inset-0.5 bg-primary/20 rounded-[2rem] blur opacity-0 group-focus-within:opacity-100 transition-premium" />
+                <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within:opacity-100 transition-premium" />
                 <Textarea
                   value={mockContext}
                   onChange={(e) => setMockContext(e.target.value)}
                   rows={6}
-                  className="font-mono text-[11px] bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-[2rem] p-6 text-white shadow-inner resize-none uppercase tracking-widest relative z-10"
+                  className="font-mono text-sm bg-surface-4/60 border-white/5 focus:ring-primary/20 focus:border-primary/40 rounded-2xl p-6 text-white shadow-inner resize-none relative z-10"
                   placeholder='{ "items": [1, 2, 3] }'
                 />
               </div>
@@ -126,21 +126,17 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
               onClick={handleTest}
               disabled={loading || !script}
               variant="premium"
-              className="w-full h-16 rounded-2xl shadow-2xl shadow-primary/20"
+              className="w-full h-16 rounded-2xl shadow-2xl"
             >
               {loading ? (
                 <div className="flex items-center gap-4">
                   <LoadingSpinner className="w-5 h-5" />
-                  <span className="font-black uppercase tracking-[0.2em] text-xs">
-                    ORCHESTRATING EVALUATION...
-                  </span>
+                  <span className="font-semibold text-xs">Running…</span>
                 </div>
               ) : (
                 <div className="flex items-center gap-3">
                   <Play className="w-4 h-4 fill-current" />
-                  <span className="font-black uppercase tracking-[0.2em] text-xs">
-                    INITIATE LOGIC TEST
-                  </span>
+                  <span className="font-semibold text-xs">Run test</span>
                 </div>
               )}
             </Button>
@@ -149,7 +145,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           {result && (
             <div
               className={cn(
-                "p-8 rounded-[2.5rem] border text-[11px] font-mono overflow-hidden animate-in slide-in-from-top-4 duration-500 shadow-2xl relative glass",
+                "p-8 rounded-3xl border text-xs font-mono overflow-hidden animate-in slide-in-from-top-4 duration-500 shadow-2xl relative glass",
                 result.success
                   ? "bg-success/5 border-success/20 text-success"
                   : "bg-destructive/5 border-destructive/20 text-destructive",
@@ -169,7 +165,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                     <div className="w-8 h-8 rounded-xl bg-success/10 flex items-center justify-center border border-success/20">
                       <CheckCircle2 size={16} className="text-success" />
                     </div>
-                    <div className="text-[10px] font-black uppercase tracking-[0.3em] text-success/60">
+                    <div className="text-xs font-semibold text-success/60">
                       Execution Successful
                     </div>
                   </div>
@@ -183,7 +179,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
                     <div className="w-8 h-8 rounded-xl bg-destructive/10 flex items-center justify-center border border-destructive/20">
                       <XCircle size={16} className="text-destructive" />
                     </div>
-                    <div className="text-[10px] font-black uppercase tracking-[0.3em] text-destructive/60">
+                    <div className="text-xs font-semibold text-destructive/60">
                       Critical Evaluation Failure
                     </div>
                   </div>
@@ -200,7 +196,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           <Button
             variant="ghost"
             onClick={handleClose}
-            className="h-14 px-12 text-[10px] font-black uppercase tracking-widest text-muted-foreground/40 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95 shadow-xl"
+            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95 shadow-xl"
           >
             Close Diagnostics
           </Button>

@@ -108,7 +108,7 @@ export default function Actors() {
     mutationFn: (id: string) => terminateActor(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["actors"] });
-      toast.success("Actor terminated");
+      toast.success("Actor deleted");
     },
     onError: (e: Error) => toast.error(sanitizeErrorMessage(e.message)),
   });
@@ -180,26 +180,20 @@ export default function Actors() {
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-10 mb-12">
           <div className="space-y-4">
             <div className="flex items-center gap-6">
-              <div className="w-16 h-16 rounded-[2rem] bg-primary/10 border border-primary/20 flex items-center justify-center shadow-[0_0_40px_hsla(var(--primary),0.1)] relative">
+              <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center relative">
                 <div className="absolute inset-0 bg-primary/5 rounded-full blur-2xl animate-pulse" />
                 <Bot className="w-8 h-8 text-primary relative z-10" />
               </div>
               <div>
-                <h1 className="text-5xl font-black text-white tracking-tighter font-outfit uppercase leading-none mb-2">
-                  Identity Registry
+                <h1 className="text-5xl font-semibold text-white tracking-tight font-outfit leading-none mb-2">
+                  Actors
                 </h1>
-                <div className="flex items-center gap-3">
-                  <span className="text-[10px] font-black text-primary/60 uppercase tracking-[0.3em]">
-                    Governance Protocol Active
-                  </span>
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)] animate-pulse" />
-                </div>
               </div>
             </div>
-            <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest max-w-xl leading-relaxed">
-              Governing <span className="text-white/60">{actors.length}</span>{" "}
-              autonomous execution identities. Manage capability ceilings and
-              persistent operational memory.
+            <p className="text-sm text-muted-foreground/70 max-w-xl leading-relaxed">
+              <span className="text-white/60">{actors.length}</span> actor
+              {actors.length !== 1 ? "s" : ""}. Each actor runs workflows under
+              its own capability ceiling and keeps its own memory.
             </p>
           </div>
 
@@ -216,16 +210,16 @@ export default function Actors() {
                   setCompareSet(new Set());
                 }}
                 className={cn(
-                  "flex items-center gap-4 px-8 py-4 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl transition-premium shadow-2xl active:scale-95 border glass",
+                  "flex items-center gap-4 px-8 py-4 text-sm font-semibold rounded-2xl transition-premium shadow-2xl active:scale-95 border glass",
                   compareSet.size >= 2
-                    ? "bg-primary text-white border-white/20 shadow-primary/20"
-                    : "bg-surface-3/40 text-muted-foreground/30 border-white/5 cursor-default",
+                    ? "bg-primary text-white border-white/20"
+                    : "bg-surface-3/40 text-muted-foreground/60 border-white/5 cursor-default",
                 )}
               >
                 <GitCompare className="w-5 h-5" />
                 {compareSet.size >= 2
-                  ? `Initialize Analytics (${compareSet.size})`
-                  : "Select Identities"}
+                  ? `Compare (${compareSet.size})`
+                  : "Select actors"}
               </button>
             )}
 
@@ -235,39 +229,39 @@ export default function Actors() {
                 setCompareSet(new Set());
               }}
               className={cn(
-                "flex items-center gap-4 px-8 py-4 text-[10px] font-black uppercase tracking-[0.2em] rounded-2xl border transition-premium glass shadow-xl active:scale-95",
+                "flex items-center gap-4 px-8 py-4 text-sm font-semibold rounded-2xl border transition-premium glass shadow-xl active:scale-95",
                 compareMode
                   ? "bg-primary/10 text-primary border-primary/30"
-                  : "bg-surface-3/40 text-muted-foreground/40 border-white/5 hover:text-white hover:bg-white/5 hover:border-white/10",
+                  : "bg-surface-3/40 text-muted-foreground/70 border-white/5 hover:text-white hover:bg-white/5 hover:border-white/10",
               )}
             >
               <GitCompare className="w-5 h-5 transition-transform group-hover:rotate-12" />
-              {compareMode ? "Abort Analytics" : "Analysis Mode"}
+              {compareMode ? "Cancel" : "Compare actors"}
             </button>
 
             <button
               onClick={() => setShowCreate(true)}
-              className="flex items-center gap-4 px-10 py-4 text-[10px] font-black uppercase tracking-[0.2em] text-white bg-primary rounded-[1.5rem] transition-premium shadow-[0_15px_30px_-5px_hsla(var(--primary),0.4)] hover:shadow-[0_20px_45px_-5px_hsla(var(--primary),0.5)] active:scale-95 border border-white/20"
+              className="flex items-center gap-4 px-10 py-4 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium active:scale-95 border border-white/20"
             >
               <div className="p-1 rounded-lg bg-white/20">
                 <Plus className="w-5 h-5" />
               </div>
-              New Identity
+              New actor
             </button>
           </div>
         </div>
 
         {/* Operational Telemetry Header */}
         {actors.length > 0 && (
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2.5rem] shadow-2xl glass gpu mb-10">
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-3xl shadow-2xl glass gpu mb-10">
             {[
               {
-                label: "Total Population",
+                label: "Actors",
                 value: actors.length,
                 color: "text-white",
               },
               {
-                label: "Active Nodes",
+                label: "Active",
                 value: actors.filter((a) => a.status === "active").length,
                 color: "text-success",
                 dot: true,
@@ -278,12 +272,12 @@ export default function Actors() {
                 color: "text-warning",
               },
               {
-                label: "Terminated",
+                label: "Deleted",
                 value: actors.filter((a) => a.status === "terminated").length,
                 color: "text-destructive",
               },
               {
-                label: "Aggregate Throughput",
+                label: "Runs",
                 value:
                   totalExecutions >= 1000
                     ? `${(totalExecutions / 1000).toFixed(1)}k`
@@ -295,16 +289,16 @@ export default function Actors() {
                 key={stat.label}
                 className="px-6 py-2 flex flex-col border-r border-white/5 last:border-0"
               >
-                <span className="text-[9px] font-black text-muted-foreground/30 uppercase tracking-[0.2em] mb-2">
+                <span className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider mb-2">
                   {stat.label}
                 </span>
                 <div className="flex items-center gap-3">
                   {stat.dot && (
-                    <div className="w-2 h-2 rounded-full bg-success animate-status-pulse shadow-[0_0_8px_hsla(var(--success),0.5)]" />
+                    <div className="w-2 h-2 rounded-full bg-success animate-status-pulse" />
                   )}
                   <span
                     className={cn(
-                      "text-3xl font-black tabular-nums leading-none font-outfit tracking-tighter",
+                      "text-3xl font-semibold tabular-nums leading-none font-outfit tracking-tight",
                       stat.color,
                     )}
                   >
@@ -318,23 +312,23 @@ export default function Actors() {
 
         {/* Filter Toolbar */}
         {actors.length > 0 && (
-          <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-[2rem] shadow-2xl glass gpu">
+          <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 backdrop-blur-3xl border border-white/5 rounded-2xl shadow-2xl glass gpu">
             <div className="relative flex-1 w-full group/search">
               <div className="absolute -inset-0.5 bg-primary/20 rounded-2xl blur opacity-0 group-focus-within/search:opacity-100 transition-premium pointer-events-none" />
-              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/30 group-focus-within/search:text-primary transition-premium z-10" />
+              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-premium z-10" />
               <input
                 type="text"
-                placeholder="SEARCH IDENTITY REGISTRY..."
+                placeholder="Search actors…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-[11px] font-black uppercase tracking-[0.2em] focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium placeholder:text-muted-foreground/20 relative z-0"
+                className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium placeholder:text-muted-foreground/50 relative z-0"
               />
             </div>
 
             <div className="flex flex-col md:flex-row items-center gap-6 w-full xl:w-auto">
               <div className="flex items-center gap-3 pr-2">
-                <span className="text-[10px] font-black text-muted-foreground/30 uppercase tracking-[0.3em] mr-4 whitespace-nowrap">
-                  Sequence Registry
+                <span className="text-xs font-semibold text-muted-foreground/60 mr-4 whitespace-nowrap">
+                  Sort by
                 </span>
                 <div className="flex p-1.5 bg-surface-4/40 rounded-2xl border border-white/5 shrink-0 overflow-x-auto no-scrollbar glass-light">
                   {SORT_OPTIONS.map((opt) => (
@@ -342,10 +336,10 @@ export default function Actors() {
                       key={opt.key}
                       onClick={() => setSortKey(opt.key)}
                       className={cn(
-                        "px-6 py-2.5 text-[9px] font-black uppercase tracking-[0.2em] rounded-xl transition-premium whitespace-nowrap active:scale-95",
+                        "px-6 py-2.5 text-2xs font-semibold rounded-xl transition-premium whitespace-nowrap active:scale-95",
                         sortKey === opt.key
-                          ? "bg-primary text-white shadow-xl shadow-primary/20"
-                          : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
+                          ? "bg-primary text-white shadow-xl"
+                          : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
                       )}
                     >
                       {opt.label}
@@ -366,45 +360,44 @@ export default function Actors() {
               {[0, 1, 2, 3, 4, 5].map((i) => (
                 <div
                   key={i}
-                  className="h-[320px] rounded-[2.5rem] bg-surface-3/20 border border-white/5 animate-pulse"
+                  className="h-[320px] rounded-3xl bg-surface-3/20 border border-white/5 animate-pulse"
                 />
               ))}
             </div>
           ) : error ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 rounded-[4rem] backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
-              <div className="w-24 h-24 rounded-[3rem] bg-destructive/10 border border-destructive/20 flex items-center justify-center mb-10 shadow-2xl relative">
+            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 rounded-3xl backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
+              <div className="w-24 h-24 rounded-3xl bg-destructive/10 border border-destructive/20 flex items-center justify-center mb-10 shadow-2xl relative">
                 <X className="w-12 h-12 text-destructive relative z-10" />
               </div>
-              <h2 className="text-3xl font-black text-white tracking-tighter font-outfit uppercase mb-4">
-                Protocol Interrupted
+              <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
+                Could not load actors
               </h2>
-              <p className="text-muted-foreground/40 text-sm max-w-sm font-bold uppercase tracking-widest leading-relaxed text-center px-10">
+              <p className="text-muted-foreground/70 text-sm max-w-sm font-bold leading-relaxed text-center px-10">
                 {sanitizeErrorMessage(
                   error instanceof Error
                     ? error.message
-                    : "The identity synchronization service is currently unavailable.",
+                    : "The actor service is currently unavailable.",
                 )}
               </p>
             </div>
           ) : actors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 border-dashed border-2 rounded-[4rem] backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
-              <div className="w-24 h-24 rounded-[3rem] bg-primary/10 border border-primary/20 flex items-center justify-center mb-10 shadow-[0_0_40px_hsla(var(--primary),0.1)] relative group">
+            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 border-dashed border-2 rounded-3xl backdrop-blur-3xl glass-dark animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
+              <div className="w-24 h-24 rounded-3xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-10 relative group">
                 <div className="absolute inset-0 bg-primary/5 rounded-full blur-3xl opacity-50 group-hover:opacity-100 transition-premium" />
-                <Bot className="w-12 h-12 text-primary relative z-10 group-hover:scale-110 transition-premium" />
+                <Bot className="w-12 h-12 text-primary relative z-10 transition-premium" />
               </div>
-              <h2 className="text-4xl font-black text-white tracking-tighter font-outfit uppercase mb-6">
-                Registry Empty
+              <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit mb-6">
+                No actors yet
               </h2>
-              <p className="text-muted-foreground/40 text-sm max-w-xl font-bold uppercase tracking-widest leading-relaxed text-center px-12 mb-12">
-                Actors are bounded execution identities that govern automation
-                logic, enforce capability ceilings, and persist operational
-                memory across the platform.
+              <p className="text-muted-foreground/70 text-sm max-w-xl leading-relaxed text-center px-12 mb-12">
+                An actor is an identity a workflow runs as. It has a capability
+                ceiling, a budget and its own memory.
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="flex items-center gap-4 px-10 py-5 text-[10px] font-black uppercase tracking-[0.2em] text-white bg-primary rounded-[1.5rem] transition-premium shadow-[0_15px_30px_-5px_hsla(var(--primary),0.4)] hover:shadow-[0_20px_45px_-5px_hsla(var(--primary),0.5)] active:scale-95 border border-white/20"
+                className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium active:scale-95 border border-white/20"
               >
-                <Plus className="w-5 h-5" /> Provision First Identity
+                <Plus className="w-5 h-5" /> Create your first actor
               </button>
             </div>
           ) : (
@@ -452,17 +445,17 @@ export default function Actors() {
 
               {terminatedActors.length > 0 && (
                 <details className="group border-t border-white/5 pt-20 animate-in fade-in slide-in-from-bottom-8 duration-1000">
-                  <summary className="flex items-center gap-6 text-muted-foreground/30 hover:text-white transition-premium cursor-pointer list-none group/summary">
+                  <summary className="flex items-center gap-6 text-muted-foreground/60 hover:text-white transition-premium cursor-pointer list-none group/summary">
                     <div className="w-12 h-12 rounded-2xl bg-surface-3/40 border border-white/5 flex items-center justify-center group-open:rotate-90 group-hover/summary:border-white/20 transition-premium shadow-2xl glass">
                       <ChevronDown className="w-5 h-5" />
                     </div>
                     <div className="flex flex-col">
-                      <span className="text-[11px] font-black uppercase tracking-[0.4em] leading-none mb-1">
-                        Archived Vault
+                      <span className="text-xs font-semibold leading-none mb-1">
+                        Deleted actors
                       </span>
-                      <span className="text-[10px] font-bold uppercase tracking-widest opacity-40">
-                        {terminatedActors.length} Decommissioned Identit
-                        {terminatedActors.length !== 1 ? "ies" : "y"} Registered
+                      <span className="text-xs font-bold opacity-40">
+                        {terminatedActors.length} deleted actor
+                        {terminatedActors.length !== 1 ? "s" : ""}
                       </span>
                     </div>
                   </summary>

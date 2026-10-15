@@ -43,9 +43,7 @@ describe("GoogleCalendarSelector", () => {
 
   it("renders loading state initially", async () => {
     render(<GoogleCalendarSelector onSelect={mockOnSelect} />);
-    expect(
-      screen.getByText(/Syncing Google Auth Vectors/i),
-    ).toBeInTheDocument();
+    expect(screen.getByText(/Loading Google accounts/i)).toBeInTheDocument();
   });
 
   it("renders integrations and allows selection", async () => {
@@ -76,7 +74,7 @@ describe("GoogleCalendarSelector", () => {
     fireEvent.click(screen.getByText("Personal Calendar"));
 
     const confirmBtn = screen.getByRole("button", {
-      name: /Confirm Temporal Locking \(2 VECTORS\)/i,
+      name: /Watch 2 calendars/i,
     });
     fireEvent.click(confirmBtn);
 
@@ -85,7 +83,7 @@ describe("GoogleCalendarSelector", () => {
       CALENDAR_IDS: ["cal-1", "cal-2"],
     });
 
-    expect(screen.getByText(/Uplink Validated/i)).toBeInTheDocument();
+    expect(screen.getByText(/Calendars selected/i)).toBeInTheDocument();
   });
 
   it("shows empty state when no integrations", async () => {
@@ -102,7 +100,7 @@ describe("GoogleCalendarSelector", () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(/No Google Matrix Connected/i),
+        screen.getByText(/No Google account connected/i),
       ).toBeInTheDocument();
     });
   });

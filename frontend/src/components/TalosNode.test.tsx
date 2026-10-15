@@ -53,8 +53,8 @@ describe("TalosNode", () => {
 
   it("shows config count", () => {
     render(<TalosNode {...defaultProps} />);
-    // Config subtitle now reads "<n> Protocol Field(s)".
-    expect(screen.getByText(/1 Protocol Field/i)).toBeInTheDocument();
+    // Config subtitle reads "<n> config field(s)".
+    expect(screen.getByText(/1 config field/i)).toBeInTheDocument();
   });
 
   it("applies selected styling", () => {

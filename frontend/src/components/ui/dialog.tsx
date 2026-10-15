@@ -95,7 +95,7 @@ export const Dialog: React.FC<DialogProps> = ({
 
   return createPortal(
     <div
-      className="fixed inset-0 bg-black/40 backdrop-blur-md flex items-center justify-center z-[9999] animate-in fade-in duration-300"
+      className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[9999] animate-in fade-in duration-200"
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? "dialog-title" : undefined}
@@ -104,34 +104,28 @@ export const Dialog: React.FC<DialogProps> = ({
     >
       <div
         ref={contentRef}
-        className="w-full flex justify-center animate-in zoom-in-95 fade-in slide-in-from-bottom-4 duration-500"
+        className="w-full flex justify-center px-4 animate-in fade-in zoom-in-95 duration-200"
       >
         <DialogWrapper
           className={className}
           onClick={(e: React.MouseEvent) => e.stopPropagation()}
         >
-          <div className="flex justify-between items-start mb-8">
+          <div className="flex justify-between items-start gap-4 mb-6">
             {title && (
-              <div className="flex flex-col gap-1.5">
-                <h2
-                  id="dialog-title"
-                  className="text-3xl font-black text-white tracking-tighter leading-none"
-                >
-                  {title}
-                </h2>
-                <div className="h-0.5 w-12 bg-primary rounded-full shadow-[0_0_10px_hsla(var(--primary),0.5)]" />
-              </div>
+              <h2
+                id="dialog-title"
+                className="text-xl font-semibold text-white tracking-tight font-outfit"
+              >
+                {title}
+              </h2>
             )}
             <button
               onClick={onClose}
-              className="p-3 bg-white/5 border border-white/10 hover:bg-white/10 hover:border-white/20 rounded-2xl transition-premium text-muted-foreground hover:text-white active:scale-95 shadow-lg group"
+              className="ml-auto p-2 bg-white/5 border border-white/10 hover:bg-white/10 rounded-lg transition-premium text-muted-foreground hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               title="Close"
               aria-label="Close"
             >
-              <X
-                size={20}
-                className="transition-transform group-hover:rotate-90"
-              />
+              <X size={18} />
             </button>
           </div>
           {children}

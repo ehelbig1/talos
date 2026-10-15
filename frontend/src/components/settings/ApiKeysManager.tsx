@@ -135,7 +135,7 @@ export default function ApiKeysManager() {
             <Key size={24} />
           </div>
           <div>
-            <h2 className="text-2xl md:text-3xl font-black text-white tracking-tighter font-outfit uppercase leading-tight">
+            <h2 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
               API Ingress Keys
             </h2>
             <p className="text-sm text-muted-foreground font-medium tracking-tight">
@@ -145,7 +145,7 @@ export default function ApiKeysManager() {
         </div>
         <Button
           onClick={() => setShowCreate(true)}
-          className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl shadow-indigo-500/20 font-bold px-6 py-6 h-auto rounded-xl transition-premium hover:scale-[1.02]"
+          className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-xl font-bold px-6 py-6 h-auto rounded-xl transition-premium hover:scale-[1.02]"
         >
           <Plus className="w-5 h-5 mr-1" />
           Create New Key

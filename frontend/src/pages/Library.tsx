@@ -10,10 +10,10 @@ function TabLoading() {
     <div className="flex flex-col items-center justify-center py-40 space-y-8 animate-in fade-in duration-700">
       <div className="relative">
         <div className="w-16 h-16 border-4 border-primary/10 rounded-full" />
-        <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0 shadow-[0_0_15px_hsla(var(--primary),0.3)]" />
+        <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0" />
       </div>
       <div className="flex flex-col items-center gap-2">
-        <span className="text-xs font-black text-white/40 uppercase tracking-[0.4em] animate-pulse">
+        <span className="text-xs font-semibold text-white/70 animate-pulse">
           Synchronizing Registry
         </span>
         <div className="flex gap-1">
@@ -50,11 +50,11 @@ export default function Library() {
       {/* Dynamic Background Glows */}
       <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0">
         <div
-          className="absolute top-[-20%] left-[-10%] w-[60%] h-[60%] bg-primary/5 blur-[120px] rounded-full mix-blend-screen animate-pulse"
+          className="absolute top-[-20%] left-[-10%] w-[60%] h-[60%] bg-primary/5 blur-[120px] rounded-full mix-blend-screen"
           style={{ animationDuration: "15s" }}
         />
         <div
-          className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-surface-2/20 blur-[100px] rounded-full mix-blend-screen animate-pulse"
+          className="absolute bottom-[-10%] right-[-10%] w-[50%] h-[50%] bg-surface-2/20 blur-[100px] rounded-full mix-blend-screen"
           style={{ animationDuration: "20s" }}
         />
       </div>
@@ -64,74 +64,68 @@ export default function Library() {
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-10 mb-12">
           <div className="space-y-4">
             <div className="flex items-center gap-5">
-              <div className="w-16 h-16 rounded-[2rem] bg-surface-3/40 border border-white/10 flex items-center justify-center shadow-2xl glass">
+              <div className="w-16 h-16 rounded-2xl bg-surface-3/40 border border-white/10 flex items-center justify-center shadow-2xl glass">
                 <Box className="w-8 h-8 text-primary" />
               </div>
               <div>
-                <h1 className="text-5xl font-black text-white tracking-tighter font-outfit uppercase leading-none">
-                  Resource Library
+                <h1 className="text-5xl font-semibold text-white tracking-tight font-outfit leading-none">
+                  Library
                 </h1>
-                <div className="flex items-center gap-3 mt-3">
-                  <span className="text-[10px] font-black text-primary/60 uppercase tracking-[0.3em]">
-                    Operational Node Management
-                  </span>
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary shadow-[0_0_8px_hsla(var(--primary),0.5)] animate-pulse" />
-                </div>
               </div>
             </div>
-            <p className="text-sm text-muted-foreground/40 font-bold uppercase tracking-widest max-w-xl leading-relaxed">
-              Browse pre-configured protocols from the synchronized Registry or
-              manage your provisioned WASM execution modules.
+            <p className="text-sm text-muted-foreground/70 max-w-xl leading-relaxed">
+              Browse templates in the Catalog, or manage the modules you have
+              created.
             </p>
           </div>
 
           {/* Tab bar */}
-          <div className="flex items-center gap-3 p-2 bg-surface-3/40 backdrop-blur-3xl rounded-[2.5rem] border border-white/5 w-fit glass shadow-2xl gpu">
+          <div className="flex items-center gap-3 p-2 bg-surface-3/40 backdrop-blur-3xl rounded-3xl border border-white/5 w-fit glass shadow-2xl gpu">
             <button
               onClick={() => setTab("installed")}
               className={cn(
-                "flex items-center gap-4 px-10 py-4 text-[10px] font-black uppercase tracking-[0.2em] rounded-[1.5rem] transition-premium active:scale-95 relative group",
+                "flex items-center gap-4 px-10 py-4 text-sm font-semibold rounded-2xl transition-premium active:scale-95 relative group whitespace-nowrap",
                 tab === "installed"
-                  ? "bg-primary text-white shadow-2xl shadow-primary/30 border border-white/20"
-                  : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
+                  ? "bg-primary text-white shadow-2xl border border-white/20"
+                  : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
               )}
             >
               <div
                 className={cn(
-                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]",
+                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-2xl",
                   tab === "installed" && "hidden",
                 )}
               />
               <Box
                 className={cn(
-                  "w-4 h-4 relative z-10 transition-transform group-hover:scale-110",
-                  tab === "installed" ? "text-white" : "text-primary/40",
+                  "w-4 h-4 relative z-10 transition-transform",
+                  tab === "installed" ? "text-white" : "text-primary/70",
                 )}
               />
-              <span className="relative z-10">Active Modules</span>
+              <span className="relative z-10">Your modules</span>
             </button>
             <button
               onClick={() => setTab("templates")}
               className={cn(
-                "flex items-center gap-4 px-10 py-4 text-[10px] font-black uppercase tracking-[0.2em] rounded-[1.5rem] transition-premium active:scale-95 relative group",
+                "flex items-center gap-4 px-10 py-4 text-sm font-semibold rounded-2xl transition-premium active:scale-95 relative group whitespace-nowrap",
                 tab === "templates"
-                  ? "bg-primary text-white shadow-2xl shadow-primary/30 border border-white/20"
-                  : "text-muted-foreground/40 hover:text-white hover:bg-white/5",
+                  ? "bg-primary text-white shadow-2xl border border-white/20"
+                  : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
               )}
             >
               <div
                 className={cn(
-                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-[1.5rem]",
+                  "absolute inset-0 bg-white/10 opacity-0 group-hover:opacity-100 transition-premium rounded-2xl",
                   tab === "templates" && "hidden",
                 )}
               />
               <BookOpen
                 className={cn(
-                  "w-4 h-4 relative z-10 transition-transform group-hover:scale-110",
-                  tab === "templates" ? "text-white" : "text-primary/40",
+                  "w-4 h-4 relative z-10 transition-transform",
+                  tab === "templates" ? "text-white" : "text-primary/70",
                 )}
               />
-              <span className="relative z-10">Registry Catalog</span>
+              <span className="relative z-10">Templates</span>
             </button>
           </div>
         </div>

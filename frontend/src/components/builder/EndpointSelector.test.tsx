@@ -77,7 +77,7 @@ describe("EndpointSelector", () => {
     fireEvent.click(screen.getByText("Get user profile"));
 
     expect(screen.getByText("/users/{id}")).toBeInTheDocument();
-    expect(screen.getByText(/Isolated Path Variables/i)).toBeInTheDocument();
+    expect(screen.getByText(/Path variables/i)).toBeInTheDocument();
 
     // Check pre-filled example
     const pathInput = screen.getByPlaceholderText("123");

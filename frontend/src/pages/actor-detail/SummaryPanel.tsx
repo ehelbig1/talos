@@ -136,9 +136,9 @@ export function SummaryPanel({
     <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       <ConfirmDialog
         open={showTerminateConfirm}
-        title="Decommission Protocol"
-        message={`Permanently decommission identity "${actor.name}"? This will suspend all active operational threads and cannot be reversed.`}
-        confirmLabel="Decommission"
+        title="Delete actor"
+        message={`Delete actor "${actor.name}"? Its workflows will stop running as it. This cannot be undone.`}
+        confirmLabel="Delete actor"
         destructive
         isLoading={terminatePending}
         onConfirm={() => {
@@ -152,7 +152,7 @@ export function SummaryPanel({
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
         {/* Left: Identity & Metadata */}
         <div className="lg:col-span-2 space-y-8">
-          <div className="bg-surface-3/40 border border-white/5 rounded-[3rem] p-8 glass relative overflow-hidden group">
+          <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass relative overflow-hidden group">
             <div className="absolute inset-0 bg-gradient-to-br from-primary/5 via-transparent to-transparent opacity-50" />
 
             <div className="relative z-10">
@@ -160,8 +160,8 @@ export function SummaryPanel({
                 <div className="space-y-6">
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                     <div className="space-y-2">
-                      <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest ml-1">
-                        Identity Name
+                      <label className="text-xs font-semibold text-muted-foreground ml-1">
+                        Name
                       </label>
                       <input
                         value={editName}
@@ -171,7 +171,7 @@ export function SummaryPanel({
                       />
                     </div>
                     <div className="space-y-2">
-                      <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest ml-1">
+                      <label className="text-xs font-semibold text-muted-foreground ml-1">
                         Capability Ceiling
                       </label>
                       <select
@@ -196,15 +196,15 @@ export function SummaryPanel({
                   </div>
 
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-muted-foreground uppercase tracking-widest ml-1">
+                    <label className="text-xs font-semibold text-muted-foreground ml-1">
                       Functional Description
                     </label>
                     <textarea
                       value={editDesc}
                       onChange={(e) => setEditDesc(e.target.value)}
                       rows={3}
-                      placeholder="Define identity operational parameters..."
-                      className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-4 text-sm text-white placeholder-muted-foreground/30 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium resize-none"
+                      placeholder="What does this actor do?"
+                      className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium resize-none"
                     />
                   </div>
 
@@ -212,10 +212,10 @@ export function SummaryPanel({
                     <button
                       onClick={() => doUpdate()}
                       disabled={updatePending || !editName.trim()}
-                      className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-premium hover:shadow-lg hover:shadow-primary/20 active:scale-95 disabled:opacity-50"
+                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-premium hover:shadow-lg active:scale-95 disabled:opacity-50"
                     >
                       <Save className="w-4 h-4" />
-                      {updatePending ? "Syncing..." : "Update Protocol"}
+                      {updatePending ? "Saving…" : "Save"}
                     </button>
                     <button
                       onClick={() => {
@@ -224,7 +224,7 @@ export function SummaryPanel({
                         setEditDesc(actor.description ?? "");
                         setEditWorld(actor.maxCapabilityWorld);
                       }}
-                      className="text-[10px] font-black uppercase tracking-widest text-muted-foreground bg-white/5 px-6 py-3 rounded-xl hover:bg-white/10 hover:text-foreground transition-premium active:scale-95"
+                      className="text-sm font-semibold text-muted-foreground bg-white/5 px-6 py-3 rounded-xl hover:bg-white/10 hover:text-foreground transition-premium active:scale-95"
                     >
                       Cancel
                     </button>
@@ -237,13 +237,13 @@ export function SummaryPanel({
                       <div className="flex items-center gap-3 flex-wrap">
                         <CapabilityBadge world={actor.maxCapabilityWorld} />
                         {isAiActor && (
-                          <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-[9px] font-black uppercase tracking-widest px-3 py-1 shadow-sm">
+                          <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-2xs font-semibold uppercase tracking-wider px-3 py-1 shadow-sm">
                             <Sparkles className="w-3 h-3" />
                             AI Synthetic
                           </span>
                         )}
                       </div>
-                      <h2 className="text-4xl font-black text-white tracking-tighter leading-none group-hover:text-primary transition-colors duration-500">
+                      <h2 className="text-4xl font-semibold text-white tracking-tight leading-none group-hover:text-primary transition-colors duration-500">
                         {actor.name}
                       </h2>
                       {actor.description ? (
@@ -251,8 +251,8 @@ export function SummaryPanel({
                           {actor.description}
                         </p>
                       ) : (
-                        <p className="text-muted-foreground/30 font-black uppercase tracking-widest italic text-xs">
-                          No active operational parameters defined.
+                        <p className="text-muted-foreground/60 font-semibold italic text-xs">
+                          No description yet.
                         </p>
                       )}
                     </div>
@@ -260,20 +260,20 @@ export function SummaryPanel({
 
                   <div className="mt-8 pt-8 border-t border-white/5 flex flex-wrap gap-8">
                     <div className="space-y-1">
-                      <div className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
-                        Protocol Created
+                      <div className="text-xs font-semibold text-muted-foreground/70">
+                        Created
                       </div>
-                      <div className="text-sm font-black text-white flex items-center gap-2">
+                      <div className="text-sm font-semibold text-white flex items-center gap-2">
                         <CalendarClock className="w-4 h-4 text-primary" />
                         {relativeTime(actor.createdAt)}
                       </div>
                     </div>
                     {actor.lastActiveAt && (
                       <div className="space-y-1">
-                        <div className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
+                        <div className="text-xs font-semibold text-muted-foreground/70">
                           Last Activity
                         </div>
-                        <div className="text-sm font-black text-white flex items-center gap-2">
+                        <div className="text-sm font-semibold text-white flex items-center gap-2">
                           <Activity className="w-4 h-4 text-success" />
                           {relativeTime(actor.lastActiveAt)}
                         </div>
@@ -286,25 +286,25 @@ export function SummaryPanel({
                       <button
                         onClick={() => setEditing(true)}
                         className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-primary hover:bg-surface-4 hover:border-primary/20 transition-premium group/btn"
-                        title="Modify Identity"
+                        title="Edit actor"
                       >
-                        <Pencil className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
+                        <Pencil className="w-4 h-4 transition-transform" />
                       </button>
                       <button
                         onClick={() => doClone()}
                         disabled={clonePending}
                         className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-sky-400 hover:bg-surface-4 hover:border-sky-400/20 transition-premium group/btn disabled:opacity-30"
-                        title="Duplicate Prototype"
+                        title="Duplicate actor"
                       >
-                        <Copy className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
+                        <Copy className="w-4 h-4 transition-transform" />
                       </button>
                       <div className="h-6 w-px bg-white/5 mx-2" />
                       <button
                         onClick={() => setShowTerminateConfirm(true)}
                         className="p-3 rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/60 hover:text-destructive hover:bg-destructive/10 transition-premium group/btn"
-                        title="Terminate identity"
+                        title="Delete actor"
                       >
-                        <Square className="w-4 h-4 group-hover/btn:scale-110 transition-transform" />
+                        <Square className="w-4 h-4 transition-transform" />
                       </button>
                     </div>
                   )}
@@ -342,20 +342,20 @@ export function SummaryPanel({
         {/* Right: Quick Telemetry & Actions */}
         <div className="space-y-8">
           {/* Recent Activity Feed */}
-          <div className="bg-surface-3/40 border border-white/5 rounded-[3rem] p-8 glass h-full">
+          <div className="bg-surface-3/40 border border-white/5 rounded-3xl p-8 glass h-full">
             <div className="flex items-center justify-between mb-8">
-              <h3 className="text-xs font-black text-white uppercase tracking-widest">
-                Live Telemetry
+              <h3 className="text-xs font-semibold text-white">
+                Recent activity
               </h3>
               <Activity className="w-4 h-4 text-primary animate-status-pulse" />
             </div>
 
             {recentEntries.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 text-center">
-                <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center text-muted-foreground/20 mb-4">
+                <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/5 flex items-center justify-center text-muted-foreground/50 mb-4">
                   <Activity className="w-6 h-6" />
                 </div>
-                <p className="text-[10px] font-black text-muted-foreground/40 uppercase tracking-widest">
+                <p className="text-xs font-semibold text-muted-foreground/70">
                   No activity detected.
                 </p>
               </div>
@@ -372,10 +372,10 @@ export function SummaryPanel({
                       )}
                     </div>
                     <div className="flex-1 min-w-0">
-                      <p className="text-xs font-black text-white leading-snug truncate group-hover/entry:text-primary transition-colors">
+                      <p className="text-xs font-semibold text-white leading-snug truncate group-hover/entry:text-primary transition-colors">
                         {humanizeLogEntry(entry)}
                       </p>
-                      <time className="text-[9px] font-black text-muted-foreground/40 uppercase tracking-widest mt-1 block">
+                      <time className="text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider mt-1 block">
                         {relativeTime(entry.timestamp)}
                       </time>
                     </div>
@@ -386,8 +386,8 @@ export function SummaryPanel({
 
             {!isTerminated && (
               <div className="mt-12 pt-8 border-t border-white/5 space-y-4">
-                <h3 className="text-xs font-black text-white uppercase tracking-widest mb-4">
-                  Identity Controls
+                <h3 className="text-xs font-semibold text-white mb-4">
+                  Status
                 </h3>
                 <button
                   onClick={onToggle}
@@ -399,10 +399,10 @@ export function SummaryPanel({
                       : "bg-success/5 border-success/10 text-success hover:bg-success/10",
                   )}
                 >
-                  <span className="text-[10px] font-black uppercase tracking-widest">
+                  <span className="text-xs font-semibold">
                     {actor.status === "active"
-                      ? "Suspend Identity"
-                      : "Deploy Identity"}
+                      ? "Suspend actor"
+                      : "Activate actor"}
                   </span>
                   {actor.status === "active" ? (
                     <Pause className="w-4 h-4" />

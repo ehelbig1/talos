@@ -68,11 +68,11 @@ export const EmptyState: React.FC<EmptyStateProps> = (props) => {
       )}
     >
       <div className="p-4 rounded-2xl bg-white/5 border border-white/5 mb-4">
-        <Icon className="h-10 w-10 text-muted-foreground/40 stroke-[1.5px]" />
+        <Icon className="h-8 w-8 text-muted-foreground stroke-[1.5px]" />
       </div>
-      <h3 className="text-sm font-semibold text-foreground/80 mb-1">{title}</h3>
+      <h3 className="text-base font-semibold text-foreground mb-1">{title}</h3>
       {description && (
-        <p className="text-xs text-muted-foreground/60 max-w-[280px] mb-4">
+        <p className="text-sm text-muted-foreground max-w-[320px] mb-5">
           {description}
         </p>
       )}

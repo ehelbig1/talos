@@ -180,7 +180,7 @@ export default function WorkflowExecutionHistoryDialog({
     >
       <div className="space-y-6 relative z-10 p-2 -mt-4">
         <div className="flex items-center justify-between mb-2">
-          <p className="text-[11px] text-muted-foreground/60 font-medium truncate max-w-[360px] uppercase tracking-widest">
+          <p className="text-xs text-muted-foreground/60 font-medium truncate max-w-[360px]">
             {workflowName}
           </p>
           <button
@@ -198,11 +198,11 @@ export default function WorkflowExecutionHistoryDialog({
           </button>
         </div>
 
-        <div className="max-h-[520px] overflow-y-auto custom-scrollbar border border-white/5 rounded-[1.5rem] bg-surface-4/20 shadow-inner">
+        <div className="max-h-[520px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20 shadow-inner">
           {isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
               <LoadingSpinner className="w-8 h-8 text-primary" />
-              <p className="text-xs text-muted-foreground/60 uppercase tracking-widest font-black animate-pulse">
+              <p className="text-xs text-muted-foreground/60 font-semibold animate-pulse">
                 Loading History...
               </p>
             </div>
@@ -211,28 +211,26 @@ export default function WorkflowExecutionHistoryDialog({
               <div className="w-14 h-14 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground">
                 <History size={28} />
               </div>
-              <p className="text-[10px] font-black uppercase tracking-[0.3em]">
-                No executions recorded
-              </p>
+              <p className="text-xs font-semibold">No executions recorded</p>
             </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-left border-collapse">
                 <thead>
                   <tr className="bg-white/[0.02] border-b border-white/5">
-                    <th className="px-6 py-4 text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
+                    <th className="px-6 py-4 text-2xs font-semibold text-muted-foreground/70">
                       Status
                     </th>
-                    <th className="px-6 py-4 text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
-                      Vector
+                    <th className="px-6 py-4 text-2xs font-semibold text-muted-foreground/70">
+                      Trigger
                     </th>
-                    <th className="px-6 py-4 text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
+                    <th className="px-6 py-4 text-2xs font-semibold text-muted-foreground/70">
                       Timestamp
                     </th>
-                    <th className="px-6 py-4 text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
+                    <th className="px-6 py-4 text-2xs font-semibold text-muted-foreground/70">
                       Duration
                     </th>
-                    <th className="px-6 py-4 text-right text-[9px] font-black uppercase tracking-[0.2em] text-muted-foreground/40">
+                    <th className="px-6 py-4 text-right text-2xs font-semibold text-muted-foreground/70">
                       Actions
                     </th>
                   </tr>
@@ -253,7 +251,7 @@ export default function WorkflowExecutionHistoryDialog({
                             <div className="flex items-center gap-2">
                               <span
                                 className={cn(
-                                  "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-[9px] font-black uppercase tracking-wider",
+                                  "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md border text-2xs font-semibold uppercase tracking-wider",
                                   style.badge,
                                 )}
                               >
@@ -269,7 +267,7 @@ export default function WorkflowExecutionHistoryDialog({
                                 <button
                                   type="button"
                                   onClick={() => toggleError(exec.id)}
-                                  className="text-muted-foreground/40 hover:text-destructive transition-premium"
+                                  className="text-muted-foreground/70 hover:text-destructive transition-premium"
                                   title="Toggle error details"
                                 >
                                   {isErrorExpanded ? (
@@ -282,20 +280,20 @@ export default function WorkflowExecutionHistoryDialog({
                             </div>
                           </td>
                           <td className="px-6 py-4">
-                            <div className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
                               <TriggerIcon type={exec.triggerType} />
                               <span>{exec.triggerType ?? "unknown"}</span>
                             </div>
                           </td>
                           <td className="px-6 py-4">
-                            <div className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest whitespace-nowrap">
-                              <Clock className="w-3 h-3 text-muted-foreground/20" />
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60 whitespace-nowrap">
+                              <Clock className="w-3 h-3 text-muted-foreground/50" />
                               {formatRelativeTime(exec.startedAt)}
                             </div>
                           </td>
                           <td className="px-6 py-4">
-                            <div className="flex items-center gap-1.5 text-[10px] font-bold text-muted-foreground/60 uppercase tracking-widest">
-                              <Timer className="w-3 h-3 text-muted-foreground/20" />
+                            <div className="flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60">
+                              <Timer className="w-3 h-3 text-muted-foreground/50" />
                               {formatDuration(exec.durationMs)}
                             </div>
                           </td>
@@ -311,7 +309,7 @@ export default function WorkflowExecutionHistoryDialog({
                                       type: "retry",
                                     })
                                   }
-                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary hover:bg-primary/10 h-7 px-3 font-black transition-premium text-[9px] gap-1.5 uppercase tracking-widest"
+                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary hover:bg-primary/10 h-7 px-3 font-semibold transition-premium text-2xs gap-1.5"
                                 >
                                   <RotateCcw className="w-3 h-3" />
                                   Retry
@@ -327,7 +325,7 @@ export default function WorkflowExecutionHistoryDialog({
                                       type: "resume",
                                     })
                                   }
-                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-warning hover:bg-warning/10 h-7 px-3 font-black transition-premium text-[9px] gap-1.5 uppercase tracking-widest"
+                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-warning hover:bg-warning/10 h-7 px-3 font-semibold transition-premium text-2xs gap-1.5"
                                 >
                                   <Play className="w-3 h-3" />
                                   Resume
@@ -344,7 +342,7 @@ export default function WorkflowExecutionHistoryDialog({
                             >
                               <div className="flex items-start gap-2.5 px-6 py-4 bg-destructive/5 border border-destructive/15 rounded-2xl shadow-inner">
                                 <AlertCircle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-                                <pre className="text-[10px] text-destructive/80 font-mono whitespace-pre-wrap break-all leading-relaxed font-bold">
+                                <pre className="text-xs text-destructive/80 font-mono whitespace-pre-wrap break-all leading-relaxed font-bold">
                                   {sanitizeErrorMessage(
                                     exec.errorMessage || "",
                                   )}
@@ -368,10 +366,10 @@ export default function WorkflowExecutionHistoryDialog({
               variant="ghost"
               size="sm"
               onClick={() => setLimit((prev) => prev + 50)}
-              className="text-muted-foreground/40 hover:text-primary hover:bg-primary/5 font-black text-[9px] gap-1.5 h-10 px-8 uppercase tracking-[0.2em] rounded-2xl border border-white/5 transition-premium"
+              className="text-muted-foreground/70 hover:text-primary hover:bg-primary/5 font-semibold text-2xs gap-1.5 h-10 px-8 rounded-2xl border border-white/5 transition-premium"
             >
               <ChevronDown className="w-3 h-3" />
-              Sync Additional Telemetry
+              Load more
             </Button>
           </div>
         )}
@@ -391,7 +389,7 @@ export default function WorkflowExecutionHistoryDialog({
           <div className="p-2 text-center space-y-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-[1.5rem] flex items-center justify-center mx-auto shadow-2xl border",
+                "w-16 h-16 rounded-2xl flex items-center justify-center mx-auto shadow-2xl border",
                 confirmAction.type === "retry"
                   ? "bg-primary/10 border-primary/20 text-primary"
                   : "bg-warning/10 border-warning/20 text-warning",
@@ -404,17 +402,17 @@ export default function WorkflowExecutionHistoryDialog({
               )}
             </div>
             <div>
-              <p className="text-sm text-muted-foreground/60 font-bold uppercase tracking-widest leading-relaxed">
+              <p className="text-sm text-muted-foreground/60 leading-relaxed">
                 {confirmAction.type === "retry"
-                  ? "A new execution protocol will be initialized using the original ingress data."
-                  : "The suspended execution will be re-synchronized and continue from its last checkpoint."}
+                  ? "A new run will start with the original trigger input."
+                  : "The paused run will continue from its last checkpoint."}
               </p>
             </div>
             <div className="flex items-center gap-4 pt-4">
               <Button
                 variant="ghost"
                 onClick={() => setConfirmAction(null)}
-                className="flex-1 text-[10px] font-black uppercase tracking-widest h-12 rounded-2xl"
+                className="flex-1 text-sm font-semibold h-12 rounded-2xl"
               >
                 Abort
               </Button>
@@ -422,19 +420,19 @@ export default function WorkflowExecutionHistoryDialog({
                 onClick={handleConfirm}
                 disabled={actionPending}
                 className={cn(
-                  "flex-1 text-[10px] font-black uppercase tracking-widest h-12 rounded-2xl transition-premium shadow-2xl border border-white/10",
+                  "flex-1 text-sm font-semibold h-12 rounded-2xl transition-premium shadow-2xl border border-white/10",
                   confirmAction.type === "retry"
-                    ? "bg-primary hover:bg-primary/90 shadow-primary/20"
-                    : "bg-warning hover:bg-warning/90 shadow-warning/20 text-background",
+                    ? "bg-primary hover:bg-primary/90"
+                    : "bg-warning hover:bg-warning/90 text-background",
                 )}
               >
                 {actionPending ? (
                   <div className="flex items-center gap-2">
                     <LoadingSpinner className="w-4 h-4" />
-                    <span>ORCHESTRATING...</span>
+                    <span>Working…</span>
                   </div>
                 ) : (
-                  "CONFIRM"
+                  "Confirm"
                 )}
               </Button>
             </div>

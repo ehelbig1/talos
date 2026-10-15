@@ -67,8 +67,8 @@ describe("NodeConfigForm", () => {
       />,
     );
 
-    expect(screen.getByText(/Compute Model Architecture/i)).toBeInTheDocument();
-    expect(screen.getByText(/Prompt Directive/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Model$/i)).toBeInTheDocument();
+    expect(screen.getByText(/^Prompt$/i)).toBeInTheDocument();
     expect(screen.getByDisplayValue("gpt-4")).toBeInTheDocument();
     expect(screen.getByDisplayValue("Hello world")).toBeInTheDocument();
   });
@@ -175,7 +175,7 @@ describe("NodeConfigForm", () => {
     const textarea = screen.getByRole("textbox");
     fireEvent.change(textarea, { target: { value: "{ invalid json }" } });
 
-    // Parse failures now surface under the "SCHEMA_VIOLATION" banner.
-    expect(screen.getByText(/SCHEMA_VIOLATION/i)).toBeInTheDocument();
+    // Parse failures surface under the "Invalid JSON:" banner.
+    expect(screen.getByText(/Invalid JSON:/i)).toBeInTheDocument();
   });
 });

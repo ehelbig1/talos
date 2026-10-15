@@ -34,24 +34,22 @@ export function SetupPanel({
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
       {/* Workflow selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-[2.5rem] p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-1/40 border border-white/5 rounded-3xl p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
         <div className="absolute top-0 right-0 p-8 opacity-5">
           <Clock size={120} />
         </div>
-        <h2 className="text-[10px] font-black text-primary uppercase tracking-[0.3em] flex items-center gap-3">
+        <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
           <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
           01. SELECT TARGET WORKFLOW
         </h2>
         {loadingWorkflows ? (
-          <div className="flex items-center gap-3 text-muted-foreground/30 animate-pulse py-4">
+          <div className="flex items-center gap-3 text-muted-foreground/60 animate-pulse py-4">
             <Loader2 className="w-4 h-4 animate-spin" />
-            <span className="text-xs font-bold uppercase tracking-widest">
-              Accessing Registry...
-            </span>
+            <span className="text-xs font-bold">Accessing Registry...</span>
           </div>
         ) : workflows.length === 0 ? (
-          <p className="text-muted-foreground/40 text-xs font-bold uppercase tracking-widest py-4">
-            No active protocols detected.
+          <p className="text-muted-foreground/70 text-sm font-bold py-4">
+            No workflows yet.
           </p>
         ) : (
           <div className="relative group">
@@ -59,10 +57,10 @@ export function SetupPanel({
             <select
               value={selectedWorkflowId}
               onChange={(e) => onSelectWorkflow(e.target.value)}
-              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-xs font-bold text-white uppercase tracking-widest focus:outline-none focus:ring-2 focus:ring-primary/40 transition-premium appearance-none cursor-pointer relative z-10 shadow-inner"
+              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-premium appearance-none cursor-pointer relative z-10 shadow-inner"
             >
               <option value="" className="bg-surface-4">
-                — SELECT PROTOCOL —
+                Select a workflow…
               </option>
               {workflows.map((w) => (
                 <option key={w.id} value={w.id} className="bg-surface-4">
@@ -72,39 +70,36 @@ export function SetupPanel({
             </select>
           </div>
         )}
-        <p className="text-[10px] text-muted-foreground/20 font-bold uppercase tracking-widest leading-relaxed">
-          Choose the shared operational sequence to evaluate across multiple
-          actor profiles.
+        <p className="text-xs text-muted-foreground/50 leading-relaxed">
+          Every actor runs this same workflow.
         </p>
       </div>
 
       {/* Actor selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-[2.5rem] p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
+      <div className="bg-surface-1/40 border border-white/5 rounded-3xl p-10 space-y-6 glass-dark shadow-2xl relative overflow-hidden">
         <div className="absolute top-0 right-0 p-8 opacity-5">
           <Bot size={120} />
         </div>
-        <h2 className="text-[10px] font-black text-primary uppercase tracking-[0.3em] flex items-center gap-3">
+        <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
           <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
-          02. IDENTIFY ACTOR COHORT
-          <span className="text-muted-foreground/40 normal-case font-bold tracking-widest ml-auto">
-            (MIN_REQ: 2)
+          02. Choose actors
+          <span className="text-muted-foreground/70 normal-case font-bold tracking-wider ml-auto">
+            (at least 2)
           </span>
         </h2>
         {loadingActors ? (
-          <div className="flex items-center gap-3 text-muted-foreground/30 animate-pulse py-4">
+          <div className="flex items-center gap-3 text-muted-foreground/60 animate-pulse py-4">
             <Loader2 className="w-4 h-4 animate-spin" />
-            <span className="text-xs font-bold uppercase tracking-widest">
-              Scanning Identities...
-            </span>
+            <span className="text-xs font-bold">Loading actors…</span>
           </div>
         ) : activeActors.length === 0 ? (
-          <p className="text-muted-foreground/40 text-xs font-bold uppercase tracking-widest py-4">
-            No active identities.{" "}
+          <p className="text-muted-foreground/70 text-sm font-bold py-4">
+            No active actors.{" "}
             <button
               onClick={onGoToActors}
               className="text-primary hover:text-white transition-premium underline"
             >
-              REGISTER_NEW →
+              Create one →
             </button>
           </p>
         ) : (
@@ -125,7 +120,7 @@ export function SetupPanel({
                     className={cn(
                       "w-5 h-5 rounded-md border transition-premium flex items-center justify-center shrink-0",
                       selected
-                        ? "bg-primary border-primary shadow-[0_0_10px_hsla(var(--primary),0.5)]"
+                        ? "bg-primary border-primary"
                         : "border-white/10 group-hover:border-white/30",
                     )}
                   >
@@ -140,16 +135,16 @@ export function SetupPanel({
                     className="hidden"
                   />
                   <div className="min-w-0 flex-1">
-                    <p className="text-[11px] font-black text-white uppercase tracking-widest truncate">
+                    <p className="text-xs font-semibold text-white truncate">
                       {actor.name}
                     </p>
                     {actor.description && (
-                      <p className="text-[9px] text-muted-foreground/40 font-bold uppercase tracking-tight truncate mt-1">
+                      <p className="text-2xs text-muted-foreground/70 font-bold truncate mt-1">
                         {actor.description}
                       </p>
                     )}
                   </div>
-                  <span className="text-[9px] text-primary/40 font-black tracking-widest uppercase shrink-0">
+                  <span className="text-2xs text-primary/70 font-semibold tracking-wider uppercase shrink-0">
                     {actor.maxCapabilityWorld}
                   </span>
                 </label>

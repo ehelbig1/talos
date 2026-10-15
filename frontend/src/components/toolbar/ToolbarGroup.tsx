@@ -23,7 +23,7 @@ export function ToolbarGroup({
     >
       <span
         className={cn(
-          "absolute top-0 left-0.5 text-[8px] font-black text-muted-foreground/40 uppercase tracking-[0.4em] select-none pointer-events-none transition-premium",
+          "absolute top-0 left-0.5 text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider select-none pointer-events-none transition-premium",
           hoverColor,
         )}
       >

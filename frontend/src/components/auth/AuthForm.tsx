@@ -65,60 +65,52 @@ export function AuthForm() {
     }
   };
 
-  const labelClass =
-    "block mb-2 text-[10px] font-black text-muted-foreground/40 uppercase tracking-[0.2em] ml-1";
+  const labelClass = "block mb-2 text-sm font-medium text-muted-foreground";
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-[#0F1117] relative overflow-hidden font-inter">
+    <div className="min-h-screen flex items-center justify-center bg-background relative overflow-hidden font-inter">
       {/* Dynamic Background */}
-      <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50" />
-      <div className="absolute top-[-20%] right-[-10%] w-[70%] h-[70%] bg-primary/5 rounded-full blur-[140px] animate-pulse" />
-      <div className="absolute bottom-[-15%] left-[-15%] w-[50%] h-[50%] bg-violet-500/5 rounded-full blur-[120px] animate-pulse delay-1000" />
+      <div className="absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent opacity-50 pointer-events-none" />
 
-      <div className="relative z-10 w-full max-w-[440px] px-6 py-12 animate-in fade-in slide-in-from-bottom-8 duration-1000">
-        <div className="bg-surface-1/60 border border-white/5 rounded-[2.5rem] p-10 shadow-2xl glass-dark backdrop-blur-3xl relative overflow-hidden">
+      <div className="relative z-10 w-full max-w-[420px] px-6 py-12 animate-in fade-in duration-500">
+        <div className="bg-surface-1/80 border border-white/10 rounded-3xl p-10 shadow-2xl backdrop-blur-xl relative overflow-hidden">
           <div className="absolute inset-0 bg-gradient-to-b from-white/[0.02] to-transparent pointer-events-none" />
 
           {/* Logo & Branding */}
           <div className="text-center mb-10 relative">
-            <div className="inline-flex items-center justify-center w-16 h-16 rounded-[2rem] bg-primary/10 border border-primary/20 mb-6 shadow-[0_0_30px_hsla(var(--primary),0.2)] group hover:scale-110 transition-premium">
-              <Zap
-                className="w-8 h-8 text-primary animate-status-pulse"
-                fill="currentColor"
-              />
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 mb-5">
+              <Zap className="w-7 h-7 text-primary" fill="currentColor" />
             </div>
-            <h1 className="text-4xl font-black text-white tracking-tighter font-outfit leading-none mb-3">
-              TALOS
+            <h1 className="text-3xl font-bold text-white tracking-tight font-outfit leading-none mb-2">
+              Talos
             </h1>
-            <p className="text-[10px] text-primary/40 font-black uppercase tracking-[0.4em]">
-              Operational Gateway
-            </p>
+            <p className="text-sm text-muted-foreground">Workflow automation</p>
           </div>
 
           {/* Mode Toggle */}
           {step === "credentials" && (
-            <div className="flex bg-surface-2/40 border border-white/5 rounded-2xl p-1.5 mb-8 shadow-inner">
+            <div className="flex bg-surface-2/60 border border-white/5 rounded-2xl p-1 mb-8">
               <button
                 onClick={() => setMode("login")}
                 className={cn(
-                  "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium",
+                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-premium",
                   mode === "login"
-                    ? "bg-primary text-white shadow-xl"
-                    : "text-muted-foreground/40 hover:text-white",
+                    ? "bg-primary text-white"
+                    : "text-muted-foreground hover:text-white",
                 )}
               >
-                Access
+                Sign in
               </button>
               <button
                 onClick={() => setMode("signup")}
                 className={cn(
-                  "flex-1 py-3 text-[10px] font-black uppercase tracking-widest rounded-xl transition-premium",
+                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-premium",
                   mode === "signup"
-                    ? "bg-primary text-white shadow-xl"
-                    : "text-muted-foreground/40 hover:text-white",
+                    ? "bg-primary text-white"
+                    : "text-muted-foreground hover:text-white",
                 )}
               >
-                Enroll
+                Create account
               </button>
             </div>
           )}
@@ -132,37 +124,37 @@ export function AuthForm() {
               {mode === "signup" && (
                 <div className="animate-in fade-in slide-in-from-top-2 duration-300">
                   <label htmlFor="name" className={labelClass}>
-                    Operator Name
+                    Name
                   </label>
                   <DarkInput
                     id="name"
                     type="text"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    placeholder="E.G. COMMANDER_DATA"
-                    className="h-12 bg-surface-3/40 border-white/5 focus:ring-primary/40 text-xs font-bold uppercase tracking-widest rounded-2xl"
+                    placeholder="Your name"
+                    className="h-11 bg-surface-3/60 border-white/10 focus:ring-primary/40 text-sm rounded-xl"
                   />
                 </div>
               )}
 
               <div>
                 <label htmlFor="email" className={labelClass}>
-                  Uplink Identifier
+                  Email
                 </label>
                 <DarkInput
                   id="email"
                   type="email"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
-                  placeholder="ID@TALOS.SYS"
+                  placeholder="you@example.com"
                   required
-                  className="h-12 bg-surface-3/40 border-white/5 focus:ring-primary/40 text-xs font-bold uppercase tracking-widest rounded-2xl"
+                  className="h-11 bg-surface-3/60 border-white/10 focus:ring-primary/40 text-sm rounded-xl"
                 />
               </div>
 
               <div>
                 <label htmlFor="password" className={labelClass}>
-                  Access Protocol
+                  Password
                 </label>
                 <DarkInput
                   id="password"
@@ -172,16 +164,19 @@ export function AuthForm() {
                   placeholder="••••••••••••"
                   required
                   minLength={12}
-                  className="h-12 bg-surface-3/40 border-white/5 focus:ring-primary/40 text-xs font-bold tracking-[0.5em] rounded-2xl"
+                  className="h-11 bg-surface-3/60 border-white/10 focus:ring-primary/40 text-sm rounded-xl"
                 />
-                <p className="mt-3 text-[9px] text-muted-foreground/30 font-bold uppercase tracking-widest leading-relaxed px-1">
-                  Requires 12+ characters, mixed case, numeric & tactical
-                  symbols.
+                <p className="mt-2 text-xs text-muted-foreground leading-relaxed">
+                  At least 12 characters, with upper and lower case, a number
+                  and a symbol.
                 </p>
               </div>
 
               {error && (
-                <div className="bg-destructive/10 border border-destructive/20 text-destructive text-[10px] font-black uppercase tracking-widest rounded-2xl px-4 py-3 shadow-xl animate-in shake duration-500">
+                <div
+                  role="alert"
+                  className="bg-destructive/10 border border-destructive/20 text-destructive text-sm rounded-xl px-4 py-3"
+                >
                   {error}
                 </div>
               )}
@@ -189,15 +184,14 @@ export function AuthForm() {
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full h-14 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-[11px] font-black uppercase tracking-[0.2em] rounded-2xl transition-premium shadow-2xl active:scale-95 group relative overflow-hidden"
+                className="w-full h-11 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl transition-premium active:scale-[0.98]"
               >
-                <div className="absolute inset-0 bg-gradient-to-r from-white/0 via-white/10 to-white/0 -translate-x-full group-hover:translate-x-full transition-transform duration-1000" />
                 {isLoading ? (
                   <Loader2 className="w-5 h-5 animate-spin mx-auto" />
                 ) : mode === "login" ? (
-                  "Initiate Session"
+                  "Sign in"
                 ) : (
-                  "Register Identity"
+                  "Create account"
                 )}
               </button>
             </form>
@@ -208,13 +202,11 @@ export function AuthForm() {
               className="space-y-8"
             >
               <div className="text-center space-y-2">
-                <div className="inline-flex p-3 rounded-2xl bg-warning/10 border border-warning/20 mb-2">
+                <div className="inline-flex p-3 rounded-xl bg-warning/10 border border-warning/20 mb-2">
                   <ShieldCheck className="w-6 h-6 text-warning" />
                 </div>
-                <p className="text-[10px] text-muted-foreground/40 font-black uppercase tracking-widest leading-relaxed">
-                  Dual-Factor Verification Required.
-                  <br />
-                  Enter 6-digit terminal code.
+                <p className="text-sm text-muted-foreground leading-relaxed">
+                  Enter the 6-digit code from your authenticator app.
                 </p>
               </div>
 
@@ -230,12 +222,15 @@ export function AuthForm() {
                   placeholder="000000"
                   required
                   maxLength={6}
-                  className="h-16 text-center text-2xl tracking-[0.8em] font-mono bg-surface-3/40 border-white/5 focus:ring-warning/40 text-warning rounded-2xl shadow-inner"
+                  className="h-14 text-center text-2xl tracking-[0.5em] font-mono bg-surface-3/60 border-white/10 focus:ring-warning/40 text-white rounded-xl"
                 />
               </div>
 
               {error && (
-                <div className="bg-destructive/10 border border-destructive/20 text-destructive text-[10px] font-black uppercase tracking-widest rounded-2xl px-4 py-3 shadow-xl">
+                <div
+                  role="alert"
+                  className="bg-destructive/10 border border-destructive/20 text-destructive text-sm rounded-xl px-4 py-3"
+                >
                   {error}
                 </div>
               )}
@@ -243,9 +238,9 @@ export function AuthForm() {
               <button
                 type="submit"
                 disabled={isLoading || twoFactorCode.length < 6}
-                className="w-full h-14 bg-warning hover:bg-warning/90 disabled:opacity-40 disabled:cursor-not-allowed text-warning-foreground text-[11px] font-black uppercase tracking-[0.2em] rounded-2xl transition-premium shadow-2xl active:scale-95"
+                className="w-full h-11 bg-warning hover:bg-warning/90 disabled:opacity-40 disabled:cursor-not-allowed text-warning-foreground text-sm font-semibold rounded-xl transition-premium active:scale-[0.98]"
               >
-                {isLoading ? "Verifying..." : "Confirm Protocol"}
+                {isLoading ? "Verifying…" : "Verify"}
               </button>
 
               <button
@@ -254,20 +249,20 @@ export function AuthForm() {
                   setStep("credentials");
                   setError("");
                 }}
-                className="w-full text-[9px] text-muted-foreground/40 hover:text-white font-black uppercase tracking-[0.2em] transition-premium"
+                className="w-full text-sm text-muted-foreground hover:text-white transition-premium"
               >
-                ← Return to Identifiers
+                ← Back
               </button>
             </form>
           )}
 
           {/* Strategic Divider */}
-          <div className="flex items-center gap-6 my-10 opacity-20">
-            <div className="flex-1 h-px bg-gradient-to-r from-transparent to-white" />
-            <span className="text-[9px] text-white font-black tracking-[0.3em] uppercase">
-              Uplink
+          <div className="flex items-center gap-4 my-8">
+            <div className="flex-1 h-px bg-white/10" />
+            <span className="text-xs text-muted-foreground">
+              or continue with
             </span>
-            <div className="flex-1 h-px bg-gradient-to-l from-transparent to-white" />
+            <div className="flex-1 h-px bg-white/10" />
           </div>
 
           {/* Multi-Provider Auth */}
@@ -278,13 +273,13 @@ export function AuthForm() {
                 onClick={() => {
                   window.location.href = `${BACKEND_URL}/auth/oauth/google/login`;
                 }}
-                className="flex items-center justify-center gap-3 h-12 bg-surface-2/40 border border-white/5 hover:border-white/20 hover:bg-surface-2/60 text-white rounded-2xl transition-premium group"
+                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-premium"
               >
                 <svg
                   width="18"
                   height="18"
                   viewBox="0 0 20 20"
-                  className="grayscale group-hover:grayscale-0 transition-premium"
+                  aria-hidden="true"
                 >
                   <path
                     d="M19.6 10.23c0-.82-.1-1.42-.25-2.05H10v3.72h5.5c-.15.96-.74 2.31-2.04 3.22v2.45h3.16c1.89-1.73 2.98-4.3 2.98-7.34z"
@@ -303,9 +298,7 @@ export function AuthForm() {
                     fill="#EA4335"
                   />
                 </svg>
-                <span className="text-[10px] font-black uppercase tracking-widest">
-                  Google
-                </span>
+                <span className="text-sm font-medium">Google</span>
               </button>
 
               <button
@@ -313,13 +306,13 @@ export function AuthForm() {
                 onClick={() => {
                   window.location.href = `${BACKEND_URL}/auth/oauth/okta/login`;
                 }}
-                className="flex items-center justify-center gap-3 h-12 bg-surface-2/40 border border-white/5 hover:border-white/20 hover:bg-surface-2/60 text-white rounded-2xl transition-premium group"
+                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-premium"
               >
                 <svg
                   width="18"
                   height="18"
                   viewBox="0 0 20 20"
-                  className="grayscale group-hover:grayscale-0 transition-premium"
+                  aria-hidden="true"
                 >
                   <circle cx="10" cy="10" r="10" fill="#007DC1" />
                   <path
@@ -328,34 +321,22 @@ export function AuthForm() {
                   />
                   <path d="M10 7a3 3 0 100 6 3 3 0 000-6z" fill="#007DC1" />
                 </svg>
-                <span className="text-[10px] font-black uppercase tracking-widest">
-                  Okta
-                </span>
+                <span className="text-sm font-medium">Okta</span>
               </button>
             </div>
           )}
 
           {mode === "signup" && (
-            <p className="mt-8 text-center text-[9px] text-muted-foreground/30 font-bold uppercase tracking-[0.1em] leading-relaxed">
-              BY ENROLLING, YOU ADHERE TO THE TALOS
-              <br />
-              <span className="text-muted-foreground/50 hover:text-white transition-premium cursor-pointer">
-                OPERATIONAL DIRECTIVE
-              </span>{" "}
-              &{" "}
-              <span className="text-muted-foreground/50 hover:text-white transition-premium cursor-pointer">
-                PRIVACY PROTOCOL
-              </span>
-              .
+            <p className="mt-8 text-center text-xs text-muted-foreground leading-relaxed">
+              By creating an account you agree to the Talos terms of service and
+              privacy policy.
             </p>
           )}
         </div>
 
         {/* Footer Link */}
         <div className="mt-10 text-center">
-          <p className="text-[10px] text-muted-foreground/20 font-black uppercase tracking-[0.3em]">
-            &copy; 2026 TALOS STUDIO ORCHESTRATION LAYER
-          </p>
+          <p className="text-xs text-muted-foreground/60">&copy; 2026 Talos</p>
         </div>
       </div>
     </div>

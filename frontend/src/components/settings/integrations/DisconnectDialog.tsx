@@ -25,24 +25,24 @@ export function DisconnectDialog({
   onConfirm: () => void;
 }) {
   return (
-    <Dialog open={open} onClose={onClose} title="Protocol_Severance_Notice">
+    <Dialog open={open} onClose={onClose} title="Disconnect account">
       <div className="space-y-8 p-2">
-        <div className="flex items-start gap-6 p-8 bg-destructive/5 border border-destructive/20 rounded-[2rem] shadow-2xl relative overflow-hidden">
+        <div className="flex items-start gap-6 p-8 bg-destructive/5 border border-destructive/20 rounded-2xl shadow-2xl relative overflow-hidden">
           <div className="absolute inset-0 bg-gradient-to-br from-destructive/10 to-transparent opacity-50" />
           <div className="w-14 h-14 bg-destructive/10 rounded-2xl flex items-center justify-center text-destructive shrink-0 border border-destructive/20 relative z-10">
             <AlertTriangle size={28} />
           </div>
           <div className="relative z-10 space-y-2">
-            <p className="text-xl font-black text-white tracking-tight">
-              Sever Link: {service}?
+            <p className="text-xl font-semibold text-white tracking-tight">
+              Disconnect {service}?
             </p>
             <p className="text-xs text-muted-foreground leading-relaxed font-medium">
-              This will terminate autonomous access to{" "}
-              <span className="text-destructive font-black underline underline-offset-4">
+              Workflows will no longer be able to use{" "}
+              <span className="text-destructive font-semibold underline underline-offset-4">
                 {accountIdentifier}
               </span>
-              . Downstream protocols depending on this uplink will enter a
-              suspended state.
+              . Any workflow that depends on this connection will fail until you
+              reconnect.
             </p>
           </div>
         </div>
@@ -51,22 +51,22 @@ export function DisconnectDialog({
           <button
             onClick={onClose}
             disabled={disconnecting}
-            className="px-8 py-4 text-[10px] font-black uppercase tracking-[0.2em] border border-white/5 hover:bg-white/5 rounded-2xl transition-premium active:scale-95 text-muted-foreground hover:text-white"
+            className="px-8 py-4 text-sm font-semibold border border-white/5 hover:bg-white/5 rounded-2xl transition-premium active:scale-95 text-muted-foreground hover:text-white"
           >
-            Retain_Link
+            Cancel
           </button>
           <button
             onClick={onConfirm}
             disabled={disconnecting}
-            className="px-10 py-4 text-[10px] font-black uppercase tracking-[0.2em] bg-destructive text-white rounded-2xl shadow-2xl shadow-destructive/20 transition-premium active:scale-95 hover:bg-destructive/90"
+            className="px-10 py-4 text-sm font-semibold bg-destructive text-white rounded-2xl shadow-2xl transition-premium active:scale-95 hover:bg-destructive/90"
           >
             {disconnecting ? (
               <div className="flex items-center gap-3">
                 <Loader2 className="w-4 h-4 animate-spin" />
-                <span>SEVERING...</span>
+                <span>Disconnecting…</span>
               </div>
             ) : (
-              "SEVER_PROTOCOL_LINK"
+              "Disconnect"
             )}
           </button>
         </div>
