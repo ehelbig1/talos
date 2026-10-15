@@ -144,13 +144,40 @@ struct Event {
     title: Option<String>,
 }
 
-fn server_of(raw: &str) -> Result<String, String> {
+// ── base address contract ───────────────────────────────────────────────────
+/// A configured base address, checked (see the rule in
+/// `talos_integration_helpers::base_address`). `path_allowed` is whether the
+/// adapter takes a path after the host. The error names the setting, never
+/// its value.
+pub fn https_base(raw: &str, name: &str, path_allowed: bool) -> Result<String, String> {
     let base = raw.trim().trim_end_matches('/');
-    let host = base.strip_prefix("https://").ok_or("SERVER_URL must start with https://")?;
-    if host.is_empty() || host.contains(|c: char| c == '/' || c == '?' || c == '#' || c == '@' || c.is_whitespace()) {
-        return Err("SERVER_URL must be https://<host> with no path, query or credentials".to_string());
+    let Some(rest) = base.strip_prefix("https://") else {
+        return Err(format!("{name} must start with https://"));
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let ok = !authority.is_empty()
+        && base.len() <= 2000
+        && base.bytes().all(|b| b.is_ascii_graphic())
+        && !base.contains('?')
+        && !base.contains('#')
+        && !authority.contains('@')
+        && (path_allowed || !rest.contains('/'));
+    if ok {
+        Ok(base.to_string())
+    } else if path_allowed {
+        Err(format!(
+            "{name} must be an https:// address with no query or credentials"
+        ))
+    } else {
+        Err(format!(
+            "{name} must be https://<host> with no path, query or credentials"
+        ))
     }
-    Ok(base.to_string())
+}
+// ── end base address contract ───────────────────────────────────────────────
+
+fn server_of(raw: &str) -> Result<String, String> {
+    https_base(raw, "SERVER_URL", false)
 }
 
 fn topic_of(raw: &str) -> Result<&str, String> {

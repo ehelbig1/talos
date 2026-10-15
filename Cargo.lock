@@ -7548,6 +7548,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sqlx",
+ "talos-config",
  "talos-metrics",
  "talos-ops-alert-store",
  "tracing",
@@ -8980,6 +8981,7 @@ dependencies = [
  "anyhow",
  "reqwest",
  "serde_json",
+ "talos-actor-budget-refusal",
  "talos-dlp-provider",
  "talos-http-body",
  "talos-local-inference",

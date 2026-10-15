@@ -17,12 +17,24 @@ to the compose file, the chart or a workflow undoes it silently.
    space the worker may not reach (RFC 6598 included) is closed to it too.
 3. Every proxied nginx `location` names a `client_max_body_size` (H-3), in
    `frontend/nginx.conf` and the chart's frontend ConfigMap, so the proxy's
-   answer is a stated one and not nginx's compiled-in 1 MiB.
+   answer is a stated one and not nginx's compiled-in 1 MiB — and that size
+   EQUALS the largest body the controller accepts on a route nginx sends
+   there (security review 2026-10-15, H2-2). The controller's limits are read
+   from `controller/src/bootstrap/router.rs`: each `Router::new()` builder's
+   `.route(…)` paths take its `DefaultBodyLimit::max(…)` (a literal product
+   or a named `const` in the `talos-<module>` crate the path names), or
+   axum's 2 MiB default when it has none; a route is sent to the location
+   nginx would pick (exact, then longest prefix). Smaller than the
+   controller's and the proxy answers 413 first (H-3's symptom); larger and
+   the proxy is no cap at all. Stated limits: a router built outside that
+   file (`.nest("/mcp", …)`) is taken at axum's default; a `#[cfg(test)]`
+   module is skipped.
 4. `talos.secretChecksum` hashes no `.data` (H-4): a pod annotation is
    readable by anyone who can list pods, and a hash of the Secret's values
    was a fingerprint of the credential set.
 5. A workflow other than `main-publish.yml` / `release.yml` that holds
-   `id-token: write` carries a `# signing-identity: <why>` comment within the
+   `id-token: write` — or `permissions: write-all`, which grants it without
+   the line (2026-10-15, H2-3) — carries a `# signing-identity: <why>` comment within the
    three lines above it (H-5); and the image-admission identity regexp in
    `deploy/k3s/install.sh` and the chart's `values.yaml` names those two
    workflows, never `workflows/.+@`.
@@ -58,6 +70,8 @@ WORKFLOWS = ".github/workflows"
 SIGNING_WORKFLOWS = ("main-publish.yml", "release.yml")
 IDENTITY_FILES = ("deploy/k3s/install.sh", "deploy/helm/talos/values.yaml")
 DOCKERIGNORE = "frontend/.dockerignore"
+ROUTER = "controller/src/bootstrap/router.rs"
+AXUM_DEFAULT_BODY_BYTES = 2 * 1024 * 1024
 VALUES = "deploy/helm/talos/values.yaml"
 PARITY_SERVICES = ("controller", "worker")
 # Chart switches that are not a security posture, each with why.
@@ -77,7 +91,12 @@ _ENV_DEFAULT = re.compile(r"^\$\{[A-Z_]+:-([^}]*)\}$")
 _EXCEPT_ITEM = re.compile(r"^\s*-\s*([0-9a-fA-F:.]+/[0-9]+)")
 _LOCATION = re.compile(r"^\s*location\s+(?:=\s+|~\*?\s+)?(\S+)\s*\{")
 _CHECKSUM = re.compile(r'\{\{-?\s*define\s+"talos\.secretChecksum"\s*-?\}\}(.*?)\{\{-?\s*end\s*-?\}\}\s*$', re.S | re.M)
-_ID_TOKEN = re.compile(r"^\s*id-token:\s*write\b")
+_ID_TOKEN = re.compile(r"^\s*(?:id-token:\s*write\b|permissions:\s*write-all\b)")
+_NGINX_LOCATION = re.compile(r"^\s*location\s+(=\s+|~\*?\s+)?(\S+)\s*\{")
+_NGINX_SIZE = re.compile(r"^\s*client_max_body_size\s+(\d+)([kKmMgG]?)\s*;")
+_ROUTE_PATH = re.compile(r'\.(?:route|nest)\(\s*(?:"([^"]+)"|([A-Za-z_][A-Za-z0-9_:]*))\s*,')
+_BODY_LIMIT = re.compile(r"DefaultBodyLimit::max\(\s*((?:[^()]|\([^()]*\))*?)\s*,?\s*\)")
+_CFG_TEST_MOD = re.compile(r"#\[cfg\(test\)\]\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+\w+\s*\{")
 _REGEX_LINE = re.compile(r"certIdentityRegex:\s*\"([^\"]*)\"")
 
 
@@ -157,29 +176,155 @@ def egress_except_parity(root: str) -> list[str]:
     return out
 
 
+def _without_test_modules(text: str) -> str:
+    out, at = [], 0
+    for m in _CFG_TEST_MOD.finditer(text):
+        if m.start() < at:
+            continue
+        out.append(text[at:m.start()])
+        depth, i = 1, m.end()
+        while i < len(text) and depth:
+            depth += {"{": 1, "}": -1}.get(text[i], 0)
+            i += 1
+        at = i
+    out.append(text[at:])
+    return "".join(out)
+
+
+def _rust_const(root: str, path: str, kind: str) -> str | None:
+    """The literal a `module::NAME` constant is set to, read from the
+    `talos-<module>` crate's sources (the workspace's naming convention)."""
+    parts = path.split("::")
+    name = parts[-1]
+    crate = "talos-" + parts[0].replace("_", "-") if len(parts) > 1 else None
+    if crate is None:
+        return None
+    src = os.path.join(root, crate, "src")
+    want = re.compile(rf"\bconst\s+{re.escape(name)}\s*:\s*{kind}\s*=\s*(.+?);", re.S)
+    for dirpath, _dirs, files in os.walk(src):
+        for f in sorted(files):
+            if f.endswith(".rs"):
+                m = want.search(_read(root, os.path.relpath(os.path.join(dirpath, f), root)) or "")
+                if m:
+                    return m.group(1).strip()
+    return None
+
+
+def _bytes_of(root: str, expr: str) -> int | None:
+    expr = expr.strip()
+    if not re.fullmatch(r"[0-9_]+(?:\s*\*\s*[0-9_]+)*", expr):
+        value = _rust_const(root, expr, "usize")
+        if value is None or value == expr:
+            return None
+        return _bytes_of(root, value)
+    total = 1
+    for factor in expr.split("*"):
+        total *= int(factor.strip().replace("_", ""))
+    return total
+
+
+def _router_limits(root: str) -> tuple[list[tuple[str, int]], list[str]]:
+    """Every route the controller's router declares, with the body it accepts."""
+    text = _read(root, ROUTER)
+    if text is None:
+        return [], [f"{ROUTER}: not found"]
+    text = _without_test_modules(text)
+    routes: list[tuple[str, int]] = []
+    errors: list[str] = []
+    for chunk in text.split("Router::new()")[1:]:
+        paths = []
+        for m in _ROUTE_PATH.finditer(chunk):
+            if m.group(1) is not None:
+                paths.append(m.group(1))
+            else:
+                resolved = _rust_const(root, m.group(2), "&str")
+                if resolved is None:
+                    errors.append(f"{ROUTER}: route path `{m.group(2)}` names no `&str` constant this check can read")
+                    continue
+                paths.append(resolved.strip('"'))
+        if not paths:
+            continue
+        limit = _BODY_LIMIT.search(chunk)
+        size = AXUM_DEFAULT_BODY_BYTES
+        if limit:
+            got = _bytes_of(root, limit.group(1))
+            if got is None:
+                errors.append(f"{ROUTER}: `DefaultBodyLimit::max({limit.group(1)})` is neither a literal product nor a constant this check can read")
+                continue
+            size = got
+        routes.extend((p, size) for p in paths)
+    if not routes:
+        errors.append(f"{ROUTER}: no route found — has the router moved? Update this check with it")
+    return routes, errors
+
+
+def _nginx_size(value: str, unit: str) -> int:
+    return int(value) * {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}[unit.lower()]
+
+
+def _nginx_location_for(path: str, blocks: list[dict]) -> dict | None:
+    probe = re.sub(r"\{[^}]*\}", "x", path)
+    for b in blocks:
+        if b["exact"] and b["name"] == probe:
+            return b
+    best = None
+    for b in blocks:
+        if b["exact"] or b["regex"]:
+            continue
+        if probe.startswith(b["name"]) and (best is None or len(b["name"]) > len(best["name"])):
+            best = b
+    return best
+
+
 def nginx_body_limits(root: str) -> list[str]:
     out = []
+    routes, errors = _router_limits(root)
+    out.extend(errors)
     for rel in NGINX_FILES:
         text = _read(root, rel)
         if text is None:
             out.append(f"{rel}: not found")
             continue
-        blocks: list[tuple[str, list[str]]] = []
+        blocks: list[dict] = []
         for line in text.splitlines():
-            m = _LOCATION.match(line)
+            m = _NGINX_LOCATION.match(line)
             if m:
-                blocks.append((m.group(1), []))
+                modifier = (m.group(1) or "").strip()
+                blocks.append({"name": m.group(2), "exact": modifier == "=", "regex": modifier.startswith("~"), "body": []})
             elif blocks:
-                blocks[-1][1].append(line)
+                blocks[-1]["body"].append(line)
         proxied = 0
-        for name, body in blocks:
+        for b in blocks:
             # A location's body ends at the next location; nested blocks do not occur here.
-            if any(l.strip().startswith("proxy_pass") for l in body):
-                proxied += 1
-                if not any(l.strip().startswith("client_max_body_size") for l in body):
-                    out.append(f"{rel}: `location {name}` proxies to the controller and names no client_max_body_size")
+            if not any(l.strip().startswith("proxy_pass") for l in b["body"]):
+                continue
+            proxied += 1
+            sizes = [_NGINX_SIZE.match(l) for l in b["body"]]
+            sizes = [m for m in sizes if m]
+            if not sizes:
+                out.append(f"{rel}: `location {b['name']}` proxies to the controller and names no client_max_body_size")
+                continue
+            b["size"] = _nginx_size(sizes[0].group(1), sizes[0].group(2))
         if proxied == 0:
             out.append(f"{rel}: no proxied location found — has the proxy moved? Update this check with it")
+        if errors:
+            continue
+        widest: dict[str, tuple[int, str]] = {}
+        for path, size in routes:
+            b = _nginx_location_for(path, blocks)
+            if b is None or "size" not in b:
+                continue
+            if b["name"] not in widest or size > widest[b["name"]][0]:
+                widest[b["name"]] = (size, path)
+        for b in blocks:
+            if "size" not in b or b["name"] not in widest:
+                continue
+            size, path = widest[b["name"]]
+            if b["size"] != size:
+                out.append(
+                    f"{rel}: `location {b['name']}` caps a body at {b['size']} bytes, the controller's largest "
+                    f"under it ({path}) accepts {size} — the two must be equal"
+                )
     return out
 
 
@@ -377,6 +522,13 @@ def self_test() -> int:
         IDENTITY_FILES[0]: '    certIdentityRegex: "^https://x/\\\\.github/workflows/(main-publish\\\\.yml|release\\\\.yml)@refs/heads/main$"\n',
         IDENTITY_FILES[1]: chart_env + '    certIdentityRegex: "^https://x/\\.github/workflows/(main-publish\\.yml|release\\.yml)@refs/(heads/main|tags/v.+)$"\n',
         DOCKERIGNORE: "node_modules/\n.env*\n",
+        ROUTER: (
+            "let g = Router::new()\n    .route(\"/graphql\", post(h))\n"
+            "    .layer(DefaultBodyLimit::max(csrf::GRAPHQL_MAX_BODY_BYTES));\n"
+            "let p = Router::new()\n    .route(\"/auth/csrf\", get(h));\n"
+            "#[cfg(test)]\nmod tests {\n    fn f() { Router::new().route(\"/graphql\", x).layer(DefaultBodyLimit::max(1)); }\n}\n"
+        ),
+        "talos-csrf/src/lib.rs": "pub const GRAPHQL_MAX_BODY_BYTES: usize = 5 * 1024 * 1024;\n",
     }
 
     def tree(**override: str | None) -> str:
@@ -410,6 +562,13 @@ def self_test() -> int:
     # 3. nginx
     expect("`location /graphql` proxies", **{NGINX_FILES[0]: good[NGINX_FILES[0]].replace("        client_max_body_size 5m;\n", "")})
     expect("no proxied location", **{NGINX_FILES[1]: "location / {\n}\n"})
+    # 3b. the size equals the controller's (H2-2): smaller, larger, unreadable.
+    expect("`location /graphql` caps a body at 4194304 bytes, the controller's largest under it (/graphql) accepts 5242880",
+           **{NGINX_FILES[0]: good[NGINX_FILES[0]].replace("5m;", "4m;")})
+    expect("`location /auth/csrf` caps a body at 3145728",
+           **{NGINX_FILES[1]: good[NGINX_FILES[1]].replace("2m;", "3m;")})
+    expect("is neither a literal product nor a constant", **{"talos-csrf/src/lib.rs": "pub const OTHER: usize = 1;\n"})
+    expect("no route found", **{ROUTER: "fn main() {}\n"})
     # 4. checksum
     expect("reads the Secret's `.data`", **{HELPERS: good[HELPERS].replace("$secret.metadata.uid $secret.metadata.resourceVersion", "$secret.data")})
     expect("no `talos.secretChecksum` define", **{HELPERS: "{{- define \"x\" -}}{{- end -}}\n"})
@@ -417,6 +576,8 @@ def self_test() -> int:
     expect("quality.yml:2: `id-token: write` with no", **{f"{WORKFLOWS}/quality.yml": "permissions:\n  id-token: write\n"})
     expect("template-publish.yml:2", **{f"{WORKFLOWS}/template-publish.yml": "permissions:\n  id-token: write\n"})
     expect(None, **{f"{WORKFLOWS}/release.yml": "permissions:\n  id-token: write\n"})
+    expect("quality.yml:1: `id-token: write` with no", **{f"{WORKFLOWS}/quality.yml": "permissions: write-all\n"})
+    expect("quality.yml:3: `id-token: write` with no", **{f"{WORKFLOWS}/quality.yml": "jobs:\n  a:\n    permissions:   write-all   # job-level\n"})
     expect("admits ANY workflow", **{IDENTITY_FILES[0]: '    certIdentityRegex: "^https://x/\\\\.github/workflows/.+@refs/heads/main$"\n'})
     expect("does not name", **{IDENTITY_FILES[1]: chart_env + '    certIdentityRegex: "^https://x/\\.github/workflows/main-publish\\.yml@refs/heads/main$"\n'})
     # 7. switch parity: a chart switch the compose service lacks, or states

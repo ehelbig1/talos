@@ -140,23 +140,41 @@ fn usable_entity(s: &str) -> bool {
     }
 }
 
+// ── base address contract ───────────────────────────────────────────────────
+/// A configured base address, checked (see the rule in
+/// `talos_integration_helpers::base_address`). `path_allowed` is whether the
+/// adapter takes a path after the host. The error names the setting, never
+/// its value.
+pub fn https_base(raw: &str, name: &str, path_allowed: bool) -> Result<String, String> {
+    let base = raw.trim().trim_end_matches('/');
+    let Some(rest) = base.strip_prefix("https://") else {
+        return Err(format!("{name} must start with https://"));
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let ok = !authority.is_empty()
+        && base.len() <= 2000
+        && base.bytes().all(|b| b.is_ascii_graphic())
+        && !base.contains('?')
+        && !base.contains('#')
+        && !authority.contains('@')
+        && (path_allowed || !rest.contains('/'));
+    if ok {
+        Ok(base.to_string())
+    } else if path_allowed {
+        Err(format!(
+            "{name} must be an https:// address with no query or credentials"
+        ))
+    } else {
+        Err(format!(
+            "{name} must be https://<host> with no path, query or credentials"
+        ))
+    }
+}
+// ── end base address contract ───────────────────────────────────────────────
+
 /// An https base address with no query or fragment, without its trailing `/`.
 fn usable_base(s: &str) -> Result<String, String> {
-    let s = s.trim();
-    let ok = s.len() > "https://".len()
-        && s.len() <= 2000
-        && s.starts_with("https://")
-        && s.bytes().all(|b| b.is_ascii_graphic())
-        && !s.contains('?')
-        && !s.contains('#')
-        // No `user:password@` in the authority (security review F-11).
-        && !host_of(s).contains('@');
-    if !ok {
-        return Err(
-            "BASE_URL must be an https:// address with no query or credentials".to_string(),
-        );
-    }
-    Ok(s.trim_end_matches('/').to_string())
+    https_base(s, "BASE_URL", true)
 }
 
 fn host_of(base: &str) -> &str {

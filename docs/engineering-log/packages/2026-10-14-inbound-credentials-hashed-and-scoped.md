@@ -186,3 +186,11 @@ binaries) run, the file restored from a backup and `touch`ed, and re-run green.
 - `talos-integration-helpers`: `push_ack::tests::a_wrong_sender_is_answered_as_an_absent_watch`, `push_ack::call_site_pins::the_gcp_push_handler_answers_a_wrong_sender_as_an_absent_watch`, `watch_binding::tests::{an_archived_or_disabled_workflow_is_not_bindable, the_workflow_refusal_does_not_say_whose_the_workflow_is}`.
 - controller DB: `an_archived_workflow_cannot_be_bound` in the gmail, gcal, gcp and Jira binding suites; `a_rejected_push_writes_at_most_one_row_a_day_per_channel` (gcp).
 - `talos-atlassian`: `the_inventory_says_the_shared_workflow_refusal`.
+
+## Correction, 2026-10-15 (security review round 2, F2-5)
+
+"Lint checks" above numbers the two checks **100** and **101**; they landed
+as **101** (a token is not minted from `Uuid::new_v4()`) and **102** (every
+push-channel workflow binding asks `workflow_is_bindable`) — the renumbering
+on rebase that section foresaw. `scripts/lint-structural.sh` is authoritative;
+the earlier sections of this record already use 101 and 102.

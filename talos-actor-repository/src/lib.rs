@@ -1686,18 +1686,8 @@ impl ActorRepository {
     ///
     /// Both read failures count `talos_llm_budget_read_failures_total`.
     pub async fn external_llm_spend_refused(&self, actor_id: Uuid) -> bool {
-        match self.platform_llm_tokens_last_24h().await {
-            Ok(spent) if spent >= talos_config::platform_llm_tokens_per_day() => return true,
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "talos_llm_budget",
-                    error = %e,
-                    "the platform LLM token ceiling could not be read; refusing the external call"
-                );
-                talos_metrics::record_llm_budget_read_failure(talos_metrics::LlmBudget::Platform);
-                return true;
-            }
+        if talos_actor_budget_refusal::platform_llm_ceiling_refuses(&self.db_pool).await {
+            return true;
         }
         let policy = match self.get_actor_budget_policy(actor_id).await {
             Ok(policy) => policy,
@@ -1731,20 +1721,6 @@ impl ActorRepository {
                 false
             }
         }
-    }
-
-    /// External (non-`ollama`) LLM tokens spent with no execution behind them
-    /// — the controller's own calls on the platform key — over the trailing
-    /// 24 hours, every actor and user.
-    pub async fn platform_llm_tokens_last_24h(&self) -> Result<i64> {
-        let spent: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint FROM llm_usage \
-             WHERE recorded_at > now() - interval '24 hours' \
-               AND execution_id IS NULL AND provider <> 'ollama'",
-        )
-        .fetch_one(&self.db_pool)
-        .await?;
-        Ok(spent)
     }
 
     pub async fn sum_llm_tokens_last_24h(&self, actor_id: Uuid) -> Result<i64> {

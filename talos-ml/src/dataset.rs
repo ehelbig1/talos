@@ -474,6 +474,25 @@ impl DatasetService {
         examples: Vec<AppendExample>,
     ) -> Result<Vec<PreparedExample>> {
         use futures::stream::{self, StreamExt, TryStreamExt};
+        // The per-user ceiling, once BEFORE anything is embedded (security
+        // review 2026-10-15, I2-4): a user at the ceiling whose workflow keeps
+        // sending `__ml_distill__` spent up to a batch of embeddings on the
+        // shared embedder — queueing every tenant's memory writes — and was
+        // then refused. `insert_prepared` asks again under its write
+        // transaction, which is the gate; this read only saves the work.
+        // Read under the user's own row-security scope, as the gate is.
+        {
+            let mut tx = talos_db::begin_tenant_read_scoped(
+                self.secrets.db_pool(),
+                &talos_tenancy::TenantReadScope::new(tenancy.user_id, Vec::new()),
+            )
+            .await
+            .context("open the example-ceiling read")?;
+            refuse_past_user_example_ceiling(&mut tx, tenancy.user_id, examples.len()).await?;
+            tx.rollback()
+                .await
+                .context("close the example-ceiling read")?;
+        }
         let secrets = self.secrets.clone();
         let org_id = tenancy.org_id;
         // Fingerprints are derived ONCE per batch, before the concurrent

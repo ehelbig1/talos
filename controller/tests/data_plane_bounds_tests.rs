@@ -1,5 +1,6 @@
 //! The data plane's size and spend bounds (security review 2026-10-14,
-//! package 13): the platform LLM key's daily ceiling (I-2), a dataset's
+//! package 13): the platform LLM key's daily ceiling (I-2, and every
+//! vault-sourced client under it, I2-2), a dataset's
 //! default growth cap and the per-user example ceiling (I-1), and the
 //! cross-replica single flight (I-3).
 //!
@@ -86,6 +87,30 @@ async fn the_platform_key_has_a_daily_ceiling_across_every_actor() {
     assert!(!repo.external_llm_spend_refused(a).await, "one under");
     spend(&pool, b, "anthropic", 1, false).await;
     assert!(repo.external_llm_spend_refused(a).await, "at the ceiling");
+}
+
+/// I2-2: every caller of a vault-sourced platform client is held to the same
+/// ceiling — the shared controller client, the evaluation judge, consolidation
+/// — because the gate is in the client's key resolution, not at two call
+/// sites. At the ceiling the call is refused before a key is looked up — the
+/// client below has none, so without the gate it would fail for that reason
+/// and send nothing either way — and the refusal is the one callers recognise.
+#[tokio::test]
+async fn a_vault_sourced_llm_client_refuses_at_the_platform_ceiling() {
+    small_platform_ceiling();
+    let (pool, _db) = common::isolated_db_pool().await;
+    let secrets = std::sync::Arc::new(
+        controller::secrets::SecretsManager::new(pool.clone()).expect("secrets"),
+    );
+    let (_, actor) = seed_user_and_actor(&pool).await;
+    spend(&pool, actor, "anthropic", CEILING, false).await;
+
+    let client = talos_llm::LlmClient::with_vault(secrets, None);
+    let err = client
+        .generate_text("system", "user")
+        .await
+        .expect_err("refused at the ceiling");
+    assert!(talos_llm::is_platform_ceiling(&err), "{err}");
 }
 
 /// I-1: a dataset that names no cap is held to the default one, an existing

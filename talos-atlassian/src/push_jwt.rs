@@ -6,9 +6,11 @@
 //! (2026-10-12), so this verifier is deliberately the narrowest thing that can
 //! be justified today:
 //!
-//! * the signature must verify under the app's client secret, with an HMAC
-//!   algorithm (HS256 / HS384 / HS512) and no other. `none` and every
-//!   asymmetric algorithm are refused by name BEFORE any key is used;
+//! * the signature must verify under the app's client secret with HS256, the
+//!   algorithm the shape log measured on a real delivery, and no other
+//!   (HS384 / HS512 too until 2026-10-15, security review round 2, F2-3: the
+//!   acceptance set is now the observed set). `none`, the other HMACs and
+//!   every asymmetric algorithm are refused by name BEFORE any key is used;
 //! * `exp` is REQUIRED (since 2026-10-14) and must be at most
 //!   [`MAX_TOKEN_LIFETIME_SECS`] in the future; `nbf` is honoured when
 //!   present (60 s leeway). The shape log below showed the claims a real
@@ -47,10 +49,19 @@ pub const MIN_CLIENT_SECRET_BYTES: usize = 16;
 /// Clock skew tolerated on `exp` / `nbf`, in seconds.
 pub const LEEWAY_SECS: u64 = 60;
 
-/// Furthest in the future a token's `exp` may be. The receiver's replay
-/// cache remembers a token for at least this long plus [`LEEWAY_SECS`], so no
-/// token it accepts can outlive its memory of having seen it.
+/// Longest lifetime a token may claim. Its `exp` may be up to this plus
+/// [`LEEWAY_SECS`] ahead of the receiver's clock ([`MAX_EXP_AHEAD_SECS`]).
 pub const MAX_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
+
+/// Furthest ahead of the receiver's clock a token's `exp` may be.
+pub const MAX_EXP_AHEAD_SECS: u64 = MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS;
+
+/// The longest a token this verifier admits can still verify after the moment
+/// it is admitted: its `exp` may be [`MAX_EXP_AHEAD_SECS`] ahead, and `exp` is
+/// honoured for [`LEEWAY_SECS`] past itself. A replay memory holds a token at
+/// least this long, so no token it admits outlives its memory of having seen
+/// it (security review 2026-10-15, F2-1: the memory was one leeway shorter).
+pub const LONGEST_VERIFIABLE_AFTER_ADMISSION_SECS: u64 = MAX_EXP_AHEAD_SECS + LEEWAY_SECS;
 
 /// Why a delivery's token was refused. A closed set: the handler logs the
 /// word and never the token.
@@ -58,7 +69,7 @@ pub const MAX_TOKEN_LIFETIME_SECS: u64 = 60 * 60;
 pub enum JwtRefusal {
     /// Not three base64url segments with a JSON header, or too long.
     Malformed,
-    /// The header names an algorithm other than HS256 / HS384 / HS512.
+    /// The header names an algorithm other than HS256.
     AlgorithmNotAccepted,
     /// The header names critical extensions (`crit`); none are understood.
     CriticalHeader,
@@ -118,8 +129,6 @@ pub struct VerifiedJwt {
 pub fn accepted_algorithm(name: &str) -> Option<(Algorithm, &'static str)> {
     match name {
         "HS256" => Some((Algorithm::HS256, "HS256")),
-        "HS384" => Some((Algorithm::HS384, "HS384")),
-        "HS512" => Some((Algorithm::HS512, "HS512")),
         _ => None,
     }
 }
@@ -197,7 +206,7 @@ pub fn verify_delivery_jwt(token: &str, client_secret: &[u8]) -> Result<Verified
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    if expires_at > now.saturating_add(MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS) {
+    if expires_at > now.saturating_add(MAX_EXP_AHEAD_SECS) {
         return Err(JwtRefusal::ExpiryTooFar);
     }
 
@@ -292,20 +301,30 @@ mod tests {
     }
 
     #[test]
-    fn a_token_signed_with_the_client_secret_is_accepted_under_each_hmac_algorithm() {
-        for (alg, name) in [
-            (Algorithm::HS256, "HS256"),
-            (Algorithm::HS384, "HS384"),
-            (Algorithm::HS512, "HS512"),
-        ] {
-            let token = signed(
-                alg,
-                &serde_json::json!({"iss": "example", "exp": now() + 120, "zeta": 1}),
-                SECRET,
+    fn a_token_signed_with_the_client_secret_is_accepted_under_hs256() {
+        let token = signed(
+            Algorithm::HS256,
+            &serde_json::json!({"iss": "example", "exp": now() + 120, "zeta": 1}),
+            SECRET,
+        );
+        let verified = verify_delivery_jwt(&token, SECRET).expect("accepted");
+        assert_eq!(verified.alg, "HS256");
+        assert_eq!(verified.claim_names, ["exp", "iss", "zeta"]);
+    }
+
+    /// HS384 and HS512 are HMACs under the same secret, so accepting them was
+    /// no downgrade; they are refused because no delivery uses them (the
+    /// shape log measured HS256), and the acceptance set is the observed set
+    /// (security review 2026-10-15, F2-3). Signed with the RIGHT secret.
+    #[test]
+    fn a_token_signed_with_another_hmac_is_refused_by_name() {
+        for alg in [Algorithm::HS384, Algorithm::HS512] {
+            let token = signed(alg, &serde_json::json!({"exp": now() + 120}), SECRET);
+            assert_eq!(
+                verify_delivery_jwt(&token, SECRET),
+                Err(JwtRefusal::AlgorithmNotAccepted),
+                "{alg:?}"
             );
-            let verified = verify_delivery_jwt(&token, SECRET).expect("accepted");
-            assert_eq!(verified.alg, name);
-            assert_eq!(verified.claim_names, ["exp", "iss", "zeta"]);
         }
     }
 
