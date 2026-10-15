@@ -9,9 +9,10 @@
 //! [`DeliveryReplayCache`] remembers the SHA-256 of every token it admits, in
 //! the two-generation `ArcSwap<DashMap>` shape `talos_memory::rpc_auth` uses:
 //! rotation is an atomic pointer swap, and an entry lives at least one full
-//! rotation interval. The interval is the longest a verified token can stay
-//! valid (`MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS`), so no token is forgotten
-//! while it could still verify. Memory is bounded: at most
+//! rotation interval. The interval is the longest a token can still verify
+//! after it is admitted (`LONGEST_VERIFIABLE_AFTER_ADMISSION_SECS`: an `exp`
+//! up to `MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS` ahead, honoured for another
+//! `LEEWAY_SECS`), so no token is forgotten while it could still verify. Memory is bounded: at most
 //! [`MAX_ENTRIES_PER_GENERATION`] per generation, and a full generation
 //! REFUSES rather than admits (fail closed).
 //!
@@ -29,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::push_jwt::{LEEWAY_SECS, MAX_TOKEN_LIFETIME_SECS};
+use crate::push_jwt::{LEEWAY_SECS, LONGEST_VERIFIABLE_AFTER_ADMISSION_SECS};
 
 /// Most token hashes held per generation (32 bytes each, so ~3 MiB at most
 /// per generation). Atlassian sends one delivery per matched change; a
@@ -77,7 +78,7 @@ impl Default for DeliveryReplayCache {
 impl DeliveryReplayCache {
     #[must_use]
     pub fn new() -> Self {
-        Self::with_interval(Duration::from_secs(MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS))
+        Self::with_interval(Duration::from_secs(LONGEST_VERIFIABLE_AFTER_ADMISSION_SECS))
     }
 
     fn with_interval(interval: Duration) -> Self {
@@ -224,10 +225,41 @@ mod tests {
         assert_eq!(cache.check_and_record(hash), ReplayVerdict::Fresh);
     }
 
+    /// A token at the lifetime cap — `exp` as far ahead as the verifier
+    /// admits — still verifies until `exp + LEEWAY_SECS`. Admitted just before
+    /// a rotation, it is held for one full interval, so the interval must
+    /// reach that horizon (security review 2026-10-15, F2-1: it was one
+    /// leeway short, and such a token could be admitted twice in its last
+    /// minute by a process without the shared guard).
     #[test]
-    fn the_production_interval_outlives_every_token_it_admits() {
+    fn a_token_at_the_lifetime_cap_is_remembered_until_it_cannot_verify() {
+        use crate::push_jwt::{verify_delivery_jwt, MAX_EXP_AHEAD_SECS};
+        use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+        let secret = b"test-client-secret-of-enough-length";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let at_cap = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({"exp": now + MAX_EXP_AHEAD_SECS}),
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        let verified = verify_delivery_jwt(&at_cap, secret).expect("a token at the cap verifies");
+        let verifiable_for = verified.expires_at + LEEWAY_SECS - now;
         assert!(
-            DeliveryReplayCache::new().interval.as_secs() >= MAX_TOKEN_LIFETIME_SECS + LEEWAY_SECS
+            DeliveryReplayCache::new().interval.as_secs() >= verifiable_for,
+            "a token verifiable for {verifiable_for}s is held for one interval at worst"
         );
+        // And one second past the cap is not admitted at all, so the cap is
+        // the horizon the interval has to cover.
+        let past_cap = encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({"exp": now + MAX_EXP_AHEAD_SECS + 2}),
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap();
+        assert!(verify_delivery_jwt(&past_cap, secret).is_err());
     }
 }

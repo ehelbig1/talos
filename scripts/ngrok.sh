@@ -28,6 +28,16 @@ fi
 PUBLIC_URL=""
 TUNNEL_PID=""
 
+# One directory only this user can open holds the tunnels' logs and ngrok's
+# config, removed on exit (H2-6, 2026-10-15). A fixed `/tmp/ngrok.log` could be
+# pre-planted as a symlink between the `rm` and the redirect, and was a 0644
+# record of the tunnel's URL.
+TUNNEL_DIR="$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/talos-tunnel.XXXXXX")"
+trap 'rm -rf "$TUNNEL_DIR"' EXIT
+NGROK_LOG="$TUNNEL_DIR/ngrok.log"
+CLOUDFLARED_LOG="$TUNNEL_DIR/cloudflared.log"
+(umask 077 && : > "$NGROK_LOG" && : > "$CLOUDFLARED_LOG")
+
 # ---------------------------------------------------------------------------
 # Helper: restart the controller so it picks up the new BASE_URL
 # ---------------------------------------------------------------------------
@@ -59,37 +69,35 @@ try_ngrok() {
     # `printf` is a shell builtin, so writing the file spawns no process.
     local config_args=()
     if [[ -n "${NGROK_AUTHTOKEN-}" ]]; then
-        NGROK_CONFIG_FILE="$(umask 077 && mktemp "${TMPDIR:-/tmp}/talos-ngrok.XXXXXX")"
-        trap 'rm -f "${NGROK_CONFIG_FILE:-}"' EXIT
-        printf 'version: "2"\nauthtoken: %s\n' "$NGROK_AUTHTOKEN" > "$NGROK_CONFIG_FILE"
+        NGROK_CONFIG_FILE="$TUNNEL_DIR/ngrok.yml"
+        (umask 077 && printf 'version: "2"\nauthtoken: %s\n' "$NGROK_AUTHTOKEN" > "$NGROK_CONFIG_FILE")
         config_args=(--config "$NGROK_CONFIG_FILE")
     else
         echo "ℹ️  NGROK_AUTHTOKEN not set — trying ngrok without auth token (may fail on ngrok v3)."
     fi
 
-    rm -f /tmp/ngrok.log
     ngrok http 8000 \
         ${config_args[@]+"${config_args[@]}"} \
         --log=stdout \
         --log-format=json \
         --region=us \
-        > /tmp/ngrok.log 2>&1 &
+        > "$NGROK_LOG" 2>&1 &
     TUNNEL_PID=$!
 
     # Wait up to 10 seconds for the tunnel URL
     local timeout=10 elapsed=0
     while [[ $elapsed -lt $timeout ]]; do
-        if grep -q '"msg":"started tunnel"' /tmp/ngrok.log 2>/dev/null; then
+        if grep -q '"msg":"started tunnel"' "$NGROK_LOG" 2>/dev/null; then
             break
         fi
         # Check if ngrok already exited (auth error, etc.)
         if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-            if grep -q 'ERR_NGROK_108' /tmp/ngrok.log 2>/dev/null; then
+            if grep -q 'ERR_NGROK_108' "$NGROK_LOG" 2>/dev/null; then
                 echo "❌ ngrok error: You already have an active ngrok session on another terminal." >&2
                 echo "   Kill it at https://dashboard.ngrok.com/agents, then retry." >&2
             else
                 echo "ℹ️  ngrok exited early. Log:" >&2
-                cat /tmp/ngrok.log >&2
+                cat "$NGROK_LOG" >&2
             fi
             return 1
         fi
@@ -97,10 +105,10 @@ try_ngrok() {
         elapsed=$((elapsed + 1))
     done
 
-    PUBLIC_URL=$(grep '"msg":"started tunnel"' /tmp/ngrok.log | grep -oE 'https://[a-z0-9.-]+' | head -n1)
+    PUBLIC_URL=$(grep '"msg":"started tunnel"' "$NGROK_LOG" | grep -oE 'https://[a-z0-9.-]+' | head -n1)
     if [[ -z "$PUBLIC_URL" ]]; then
         echo "ℹ️  Could not extract ngrok URL. Log:" >&2
-        cat /tmp/ngrok.log >&2
+        cat "$NGROK_LOG" >&2
         kill "$TUNNEL_PID" 2>/dev/null || true
         return 1
     fi
@@ -118,28 +126,27 @@ try_cloudflared() {
         return 1
     fi
 
-    rm -f /tmp/cloudflared.log
     cloudflared tunnel --url http://localhost:8000 \
         --no-autoupdate \
-        > /tmp/cloudflared.log 2>&1 &
+        > "$CLOUDFLARED_LOG" 2>&1 &
     TUNNEL_PID=$!
 
     # cloudflared prints the URL to stderr; wait up to 15 seconds
     local timeout=15 elapsed=0
     while [[ $elapsed -lt $timeout ]]; do
-        if grep -qE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null; then
+        if grep -qE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CLOUDFLARED_LOG" 2>/dev/null; then
             break
         fi
         if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
             echo "ℹ️  cloudflared exited early. Log:" >&2
-            cat /tmp/cloudflared.log >&2
+            cat "$CLOUDFLARED_LOG" >&2
             return 1
         fi
         sleep 0.5
         elapsed=$((elapsed + 1))
     done
 
-    PUBLIC_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log | head -n1)
+    PUBLIC_URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$CLOUDFLARED_LOG" | head -n1)
     if [[ -z "$PUBLIC_URL" ]]; then
         echo "ℹ️  Could not extract cloudflared URL." >&2
         kill "$TUNNEL_PID" 2>/dev/null || true

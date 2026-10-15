@@ -669,6 +669,40 @@ impl ModulesMutations {
             serde_json::Value::Object(merged)
         };
 
+        // The module's secrets, resolved as a dispatch resolves them, for the
+        // CALLER (security review 2026-10-15, D2-8 / A-16; the CLAUDE.md rule
+        // for a module run outside a workflow): until then this run carried no
+        // secrets and the nil user, so a host call was attributed to nobody.
+        // The grant is the module's own `allowed_secrets`; a `vault://`
+        // reference in the input is fetched for the caller's own user when
+        // stored, and minted only when the grant covers it. Only a module the
+        // caller may load reaches here (`get_module` above is owner-scoped).
+        let vault_refs = talos_workflow_engine::vault_resolver::extract_vault_refs(&payload);
+        let wanted = talos_workflow_engine::vault_resolver::merge_vault_refs_into_allowlist(
+            module.allowed_secrets.clone(),
+            &vault_refs,
+        );
+        let secrets: std::collections::HashMap<String, String> = if wanted.is_empty() {
+            std::collections::HashMap::new()
+        } else {
+            let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+            talos_oauth::resolver::resolve_for_standalone_run(
+                secrets_manager.clone(),
+                &module.allowed_secrets,
+                &wanted,
+                Some(user_id),
+            )
+            .await
+            .map(talos_oauth::resolver::into_runtime_secrets)
+            .unwrap_or_default()
+        };
+        if let Err(msg) = talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(
+            &secrets,
+            &vault_refs,
+        ) {
+            return Err(async_graphql::Error::new(msg.to_string()).extend_safe());
+        }
+
         let execution_result = runtime
             .execute_job_with_full_features(
                 &module.wasm_bytes,
@@ -678,7 +712,7 @@ impl ModulesMutations {
                 payload,
                 None,
                 None,
-                std::collections::HashMap::new(),
+                secrets,
                 None,
                 timeout,
                 // Embedded rehearsal surface, no controller retry loop above it:
@@ -692,13 +726,13 @@ impl ModulesMutations {
                 None,                                             // max_fuel_override
                 false,                                            // dry_run
                 None,                                             // actor_id
-                uuid::Uuid::nil(), // user_id (controller-internal test path)
-                talos_workflow_job_protocol::LlmTier::default(), // tier2 for internal tests
+                user_id,                                          // the caller (D2-8 / A-16)
+                talos_workflow_job_protocol::LlmTier::default(),  // tier2 for internal tests
                 talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
-                None,              // http_verb_ceiling — inherit the permissive ceiling above
-                None,              // egress_scope — internal path: tier-derived default
-                None,              // llm_usage_out — internal test path doesn't collect usage
-                None,              // host_diag_out — no in-process diagnostic sink on this path
+                None, // http_verb_ceiling — inherit the permissive ceiling above
+                None, // egress_scope — internal path: tier-derived default
+                None, // llm_usage_out — internal test path doesn't collect usage
+                None, // host_diag_out — no in-process diagnostic sink on this path
                 0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
                 None, // inference_wait (RFC 0014 P2): no controller is timing this call
                 None, // fuel_out: this caller reports no fuel

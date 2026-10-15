@@ -353,16 +353,10 @@ where
     Ok(())
 }
 
-/// An https base address with no query or fragment, without its trailing `/`.
+/// An https base address with no query or fragment, without its trailing `/`:
+/// the shared base-address rule (the block after this one), path allowed.
 fn usable_base(s: &str, name: &str) -> Result<String, String> {
-    // No `user:password@` in the authority (2026-10-14, security review F-11):
-    // it would carry credentials in this adapter's own request line.
-    let link = usable_link(s)
-        .filter(|l| !l.contains('?') && !l.contains('#') && !host_of(l).contains('@'))
-        .ok_or_else(|| {
-            format!("{name} must be an https:// address with no query or credentials")
-        })?;
-    Ok(link.trim_end_matches('/').to_string())
+    https_base(s, name, true)
 }
 
 /// The host of an https address, for an error that names where and not what.
@@ -373,6 +367,38 @@ fn host_of(base: &str) -> &str {
         .unwrap_or("")
 }
 // ── end notification contract ───────────────────────────────────────────────
+
+// ── base address contract ───────────────────────────────────────────────────
+/// A configured base address, checked (see the rule in
+/// `talos_integration_helpers::base_address`). `path_allowed` is whether the
+/// adapter takes a path after the host. The error names the setting, never
+/// its value.
+pub fn https_base(raw: &str, name: &str, path_allowed: bool) -> Result<String, String> {
+    let base = raw.trim().trim_end_matches('/');
+    let Some(rest) = base.strip_prefix("https://") else {
+        return Err(format!("{name} must start with https://"));
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let ok = !authority.is_empty()
+        && base.len() <= 2000
+        && base.bytes().all(|b| b.is_ascii_graphic())
+        && !base.contains('?')
+        && !base.contains('#')
+        && !authority.contains('@')
+        && (path_allowed || !rest.contains('/'));
+    if ok {
+        Ok(base.to_string())
+    } else if path_allowed {
+        Err(format!(
+            "{name} must be an https:// address with no query or credentials"
+        ))
+    } else {
+        Err(format!(
+            "{name} must be https://<host> with no path, query or credentials"
+        ))
+    }
+}
+// ── end base address contract ───────────────────────────────────────────────
 
 const PROVIDER: &str = "ntfy";
 

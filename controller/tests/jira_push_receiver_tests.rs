@@ -976,6 +976,45 @@ async fn an_unknown_or_ambiguous_webhook_id_starts_nothing() {
     assert_eq!(executions(&w, bob_wf).await, 0);
 }
 
+/// An ambiguous-webhook-id refusal is recorded within the same per-registration
+/// refusal-record budget as a site mismatch or a dedup cap (security review
+/// 2026-10-15, F2-2): a flood of such deliveries writes at most the budget's
+/// rows per registration, not one per delivery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_refusal_is_budgeted_like_the_others() {
+    let w = world().await;
+    let (alice, _, _) = user_with_jira(&w).await;
+    let (bob, _, _) = user_with_jira(&w).await;
+    w.atlassian.next_webhook_id.store(4343, Ordering::SeqCst);
+    let alices = registered(&w, alice).await;
+    w.atlassian.next_webhook_id.store(4343, Ordering::SeqCst);
+    let bobs = registered(&w, bob).await;
+    let alice_wf = common::create_test_workflow(&w.pool, alice, "alices").await;
+    let bob_wf = common::create_test_workflow(&w.pool, bob, "bobs").await;
+    bind_registration_workflow(&w.pool, alice, alices.id, Some(alice_wf))
+        .await
+        .expect("bind alice");
+    bind_registration_workflow(&w.pool, bob, bobs.id, Some(bob_wf))
+        .await
+        .expect("bind bob");
+
+    for i in 0..12 {
+        let receipt = deliver(&w, &[4343], Some(&format!("delivery-ambiguous-{i}"))).await;
+        assert!(receipt.starts.is_empty());
+    }
+    for who in [alice, bob] {
+        let rows = audit(&w, who, "jira_workflow_not_started").await;
+        assert_eq!(
+            rows.len(),
+            10,
+            "one hour's refusal-record budget, not one row per delivery"
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.1.as_deref() == Some("ambiguous_webhook_id")));
+    }
+}
+
 /// More matching registrations than the receiver reads must not turn an
 /// ambiguous webhook id into an unambiguous one: the row limit would
 /// otherwise hide the id's second site, and the first would be started.

@@ -463,6 +463,17 @@ pub enum DeliverySite {
     Cloud(String),
 }
 
+/// A site's host as both sides of the site comparison spell it: the parsed
+/// URL's host (lowercased, IDNA-normalised by the parser) without a trailing
+/// root dot. ONE spelling, so `Example.atlassian.net.` in one place and
+/// `example.atlassian.net` in another name the same site (security review
+/// 2026-10-15, F2-6).
+fn site_host(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?.to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
+    (!host.is_empty()).then_some(host)
+}
+
 /// The site an `issue.self` URL names, or `None` when it is not an `https`
 /// URL with a host. Pure; only the host (or the gateway's cloud id) is kept.
 #[must_use]
@@ -471,7 +482,7 @@ pub fn delivery_site(self_url: &str) -> Option<DeliverySite> {
     if url.scheme() != "https" {
         return None;
     }
-    let host = url.host_str()?.to_ascii_lowercase();
+    let host = site_host(&url)?;
     if host == "api.atlassian.com" {
         let mut segments = url.path_segments()?;
         return match (segments.next(), segments.next(), segments.next()) {
@@ -484,21 +495,73 @@ pub fn delivery_site(self_url: &str) -> Option<DeliverySite> {
     Some(DeliverySite::Host(host))
 }
 
+/// Why a delivery is not about a registration's site — the word the audit
+/// line carries, so a site Atlassian names differently from the connection's
+/// `site_url` (a custom domain on one side, `<site>.atlassian.net` on the
+/// other) is told apart from another site's delivery (F2-6). Never a host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OffSite {
+    /// The delivery's `issue.self` names no site.
+    DeliveryNamesNoSite,
+    /// The registration's connection is gone, or its `site_url` is no URL.
+    ConnectionHasNoSite,
+    /// The gateway form names another cloud id.
+    CloudIdDiffers,
+    /// Two `*.atlassian.net` hosts, or two custom domains, that differ.
+    HostDiffers,
+    /// One host is `*.atlassian.net` and the other is not: possibly the same
+    /// site under a custom domain. Still withheld — nothing proves it is.
+    HostDiffersCustomDomain,
+}
+
+impl OffSite {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::DeliveryNamesNoSite => "delivery_names_no_site",
+            Self::ConnectionHasNoSite => "connection_has_no_site",
+            Self::CloudIdDiffers => "cloud_id_differs",
+            Self::HostDiffers => "host_differs",
+            Self::HostDiffersCustomDomain => "host_differs_custom_domain",
+        }
+    }
+}
+
+/// Whether a registration may act on a delivery from `site`, and why not.
+/// `None` is "on this site". Fail closed: no site on either side is off it.
+pub(crate) fn why_off_site(owner: &Owner, site: Option<&DeliverySite>) -> Option<OffSite> {
+    match site {
+        None => Some(OffSite::DeliveryNamesNoSite),
+        Some(DeliverySite::Cloud(cloud)) => {
+            (*cloud != owner.cloud_id).then_some(OffSite::CloudIdDiffers)
+        }
+        Some(DeliverySite::Host(host)) => {
+            let Some(own) = owner
+                .site_url
+                .as_deref()
+                .and_then(|u| reqwest::Url::parse(u).ok())
+                .as_ref()
+                .and_then(site_host)
+            else {
+                return Some(OffSite::ConnectionHasNoSite);
+            };
+            if own == *host {
+                return None;
+            }
+            let atlassian = |h: &str| h.ends_with(".atlassian.net");
+            Some(if atlassian(&own) == atlassian(host) {
+                OffSite::HostDiffers
+            } else {
+                OffSite::HostDiffersCustomDomain
+            })
+        }
+    }
+}
+
 /// Whether a registration may act on a delivery from `site`: the delivery is
-/// about the registration's own site. Fail closed: no site on either side is
-/// "not on this site".
+/// about the registration's own site.
 #[must_use]
 pub(crate) fn owner_is_on_site(owner: &Owner, site: Option<&DeliverySite>) -> bool {
-    match site {
-        Some(DeliverySite::Cloud(cloud)) => *cloud == owner.cloud_id,
-        Some(DeliverySite::Host(host)) => owner
-            .site_url
-            .as_deref()
-            .and_then(|u| reqwest::Url::parse(u).ok())
-            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
-            .is_some_and(|own| own == *host),
-        None => false,
-    }
+    why_off_site(owner, site).is_none()
 }
 
 /// Split matched registrations into those on the delivery's site and the
@@ -782,7 +845,8 @@ impl AtlassianIntegrationService {
         }
 
         for owner in &off_site {
-            self.record_off_site(owner, site.is_some()).await;
+            let why = why_off_site(owner, site.as_ref()).unwrap_or(OffSite::HostDiffers);
+            self.record_off_site(owner, why).await;
         }
         for owner in &ambiguous {
             self.record_ambiguous(owner).await;
@@ -906,14 +970,14 @@ impl AtlassianIntegrationService {
     /// site (or names none): said in the audit stream, and — when the
     /// registration would have started a workflow, within the refusal-record
     /// budget — as a row its owner can find.
-    async fn record_off_site(&self, owner: &Owner, delivery_named_a_site: bool) {
+    async fn record_off_site(&self, owner: &Owner, why: OffSite) {
         tracing::warn!(
             target: "talos_audit",
             event_kind = "jira_push_site_mismatch",
             registration = %owner.id,
             user_id = %owner.user_id,
             webhook_id = owner.webhook_id,
-            delivery_named_a_site,
+            mismatch = why.as_str(),
             "Jira webhook delivery withheld: it is not about this registration's site, so its \
              webhook id may be another site's"
         );
@@ -943,7 +1007,8 @@ impl AtlassianIntegrationService {
 
     /// A delivery withheld because its webhook id is registered on more than
     /// one site: said in the audit stream, and — when the registration would
-    /// have started a workflow — as a row its owner can find.
+    /// have started a workflow, within the refusal-record budget — as a row
+    /// its owner can find.
     async fn record_ambiguous(&self, owner: &Owner) {
         tracing::warn!(
             target: "talos_audit",
@@ -955,19 +1020,10 @@ impl AtlassianIntegrationService {
              site, and a delivery does not say which site sent it. Delete and re-create the \
              channel."
         );
-        let Some(workflow_id) = owner.workflow_id else {
-            return;
-        };
-        record_not_started(
-            &self.db_pool,
-            owner.user_id,
-            owner.id,
-            &owner.cloud_id,
-            owner.webhook_id,
-            workflow_id,
-            REFUSAL_AMBIGUOUS_WEBHOOK_ID,
-        )
-        .await;
+        // Within the same refusal-record budget as the other refusals
+        // (security review 2026-10-15, F2-2).
+        self.record_refusal(owner, REFUSAL_AMBIGUOUS_WEBHOOK_ID)
+            .await;
     }
 }
 
@@ -1580,6 +1636,45 @@ mod tests {
             ..mine
         };
         assert!(!owner_is_on_site(&orphan, Some(&host)));
+    }
+
+    /// One spelling of a site on both sides (F2-6): case and a trailing root
+    /// dot do not make a delivery another site's. A difference is named by
+    /// its class, so a custom domain is told apart from another site.
+    #[test]
+    fn a_site_is_compared_in_one_spelling_and_a_mismatch_says_which_kind() {
+        let mut mine = owner(1000, "site-a");
+        mine.site_url = Some("https://Site-A.atlassian.net./".into());
+        let delivered = delivery_site("https://site-a.ATLASSIAN.net/rest/api/3/issue/1");
+        assert_eq!(why_off_site(&mine, delivered.as_ref()), None);
+        let trailing = delivery_site("https://site-a.atlassian.net./rest/api/3/issue/1");
+        assert_eq!(why_off_site(&mine, trailing.as_ref()), None);
+
+        let other = delivery_site("https://site-b.atlassian.net/rest/api/3/issue/1");
+        assert_eq!(
+            why_off_site(&mine, other.as_ref()),
+            Some(OffSite::HostDiffers)
+        );
+        let custom = delivery_site("https://jira.example.test/rest/api/3/issue/1");
+        assert_eq!(
+            why_off_site(&mine, custom.as_ref()),
+            Some(OffSite::HostDiffersCustomDomain)
+        );
+        let gateway = DeliverySite::Cloud("site-b".into());
+        assert_eq!(
+            why_off_site(&mine, Some(&gateway)),
+            Some(OffSite::CloudIdDiffers)
+        );
+        assert_eq!(
+            why_off_site(&mine, None),
+            Some(OffSite::DeliveryNamesNoSite)
+        );
+        mine.site_url = Some("not a url".into());
+        let delivered = delivery_site("https://site-a.atlassian.net/rest/api/3/issue/1");
+        assert_eq!(
+            why_off_site(&mine, delivered.as_ref()),
+            Some(OffSite::ConnectionHasNoSite)
+        );
     }
 
     #[test]

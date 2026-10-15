@@ -441,7 +441,7 @@ impl EvaluationService {
                 client
                     .generate_with_schema(&JUDGE_SYSTEM, &user, &judge_schema(), "record_judgment")
                     .await
-                    .map_err(|_| EvaluationError::Judge)?
+                    .map_err(|e| external_judge_error(&e))?
             }
         };
         parse_judgment(&raw).ok_or(EvaluationError::Judge)
@@ -578,6 +578,18 @@ fn parse_object(raw: &str) -> Option<Value> {
 /// Whether an execution status is terminal (the row won't change further).
 /// `timed_out` and `cancelled` are terminal-but-outputless → scored 0 (a real
 /// quality signal), distinct from "not yet terminal" → the arm is skipped.
+/// What an external judge call's failure means for the task: the platform
+/// key's daily ceiling (security review 2026-10-15, I2-2) is a SKIP, coded as
+/// an unavailable tier is — the arm was not judged, which is not a 0 score —
+/// and anything else is a judge failure.
+fn external_judge_error(e: &anyhow::Error) -> EvaluationError {
+    if talos_llm::is_platform_ceiling(e) {
+        EvaluationError::JudgeBudgetSkip
+    } else {
+        EvaluationError::Judge
+    }
+}
+
 fn is_terminal(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "timed_out")
 }
@@ -612,6 +624,24 @@ fn safe_orch(e: &OrchestrationError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A judge refused by the platform ceiling skips the task (I2-2); any
+    /// other judge failure is a judge failure.
+    #[test]
+    fn a_budget_exhausted_external_judge_yields_a_skip() {
+        let refused = anyhow::Error::new(talos_llm::PlatformCeilingReached);
+        let skip = external_judge_error(&refused);
+        assert!(matches!(skip, EvaluationError::JudgeBudgetSkip));
+        assert_eq!(
+            skip.jsonrpc_code(),
+            EvaluationError::TierSkip.jsonrpc_code()
+        );
+        let other = anyhow::anyhow!("upstream 500");
+        assert!(matches!(
+            external_judge_error(&other),
+            EvaluationError::Judge
+        ));
+    }
 
     #[test]
     fn judge_user_prompt_spotlights_input_and_response() {

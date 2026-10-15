@@ -390,6 +390,7 @@ impl ReplayService {
             input.timeout_secs,
             &input.ignore_fields,
             llm_tier,
+            input.user_id,
         )
         .await;
 
@@ -515,6 +516,7 @@ impl ReplayService {
             input.timeout_secs,
             &input.ignore_fields,
             llm_tier,
+            input.user_id,
         )
         .await;
 
@@ -878,6 +880,7 @@ async fn run_replays(
     timeout_secs: u64,
     caller_ignores: &[String],
     llm_tier: LlmTier,
+    user_id: Uuid,
 ) -> Vec<ReplayResultRow> {
     let all_ignores = build_ignore_field_set(caller_ignores);
     let mut results: Vec<ReplayResultRow> = Vec::with_capacity(samples.len());
@@ -911,8 +914,11 @@ async fn run_replays(
                 Some(module.capability_world.clone()),
                 None,
                 false,
-                None,        // actor_id
-                Uuid::nil(), // user_id (controller-internal replay path)
+                None, // actor_id
+                // The caller, whose secrets `prefetch_secrets` resolved and
+                // to whom a host call is attributed (security review
+                // 2026-10-15, D2-8; was the nil user).
+                user_id,
                 // MCP-691: inherit the original actor's tier ceiling
                 // (caller-resolved). Default Tier-1 for replays without
                 // a bound actor; do NOT use LlmTier::default() (Tier-2)

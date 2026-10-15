@@ -102,8 +102,8 @@ believed until it is verified, in this order:
 
 1. `Authorization: Bearer <token>` must be present.
 2. The token must be a JWT signed with the app's **client secret**
-   (`ATLASSIAN_CLIENT_SECRET`) using HS256, HS384 or HS512. `none` and every
-   asymmetric algorithm are refused. `exp` is required and may be at most an
+   (`ATLASSIAN_CLIENT_SECRET`) using HS256, the algorithm a real delivery
+   uses. `none`, the other HMACs and every asymmetric algorithm are refused. `exp` is required and may be at most an
    hour away; `nbf` is honoured when present. A request that fails here is
    answered 401 before the body is read and before the database is touched.
 3. **A token is used once.** Its hash is remembered until it can no longer

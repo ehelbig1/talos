@@ -17,6 +17,12 @@ pub enum EvaluationError {
     #[error("cannot evaluate tier-1 actor: no local judge available (wire Ollama to judge tier-1 outputs locally)")]
     TierSkip,
 
+    /// The external judge was refused by the platform key's daily token
+    /// ceiling (security review 2026-10-15, I2-2): the arm was not judged,
+    /// which is a skip like [`Self::TierSkip`] (same code), not a 0 score.
+    #[error("the platform's daily external LLM token ceiling is reached; the judge did not run")]
+    JudgeBudgetSkip,
+
     /// A trigger/dispatch of one arm failed. Message is pre-sanitised.
     #[error("{0}")]
     Orchestration(String),
@@ -35,7 +41,7 @@ impl EvaluationError {
     pub fn jsonrpc_code(&self) -> i32 {
         match self {
             Self::InvalidArgument(_) => -32602,
-            Self::TierSkip => -32004,
+            Self::TierSkip | Self::JudgeBudgetSkip => -32004,
             Self::Orchestration(_) => -32000,
             Self::Judge => -32000,
             Self::Internal(_) => -32000,

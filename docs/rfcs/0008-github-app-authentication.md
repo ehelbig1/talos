@@ -215,7 +215,10 @@ Each phase independently shippable; PAT path intact throughout.
    LLM keys, Vault token) — the **bootstrap / k8s Secret surfaced as env vars**,
    NOT the per-user `SecretsManager` vault (which is for user/module secrets).
    Vars: `GITHUB_APP_ID` (presence = enabled), `GITHUB_APP_SLUG` (non-secret),
-   `GITHUB_APP_PRIVATE_KEY` (PEM, secret), `GITHUB_APP_WEBHOOK_SECRET` (secret).
+   `GITHUB_APP_PRIVATE_KEY` (PEM, secret). (`GITHUB_APP_WEBHOOK_SECRET` was
+   listed here until 2026-10-15: no receiver reads it, and it was removed from
+   the chart and both compose files — security review F-8 / F2-5,
+   `docs/GITHUB_APP_SETUP.md`.)
    Secrets are held in `Zeroizing` + redacted from `Debug`; blank = unset;
    half-configured fails loudly at load. The k8s Secret is the at-rest store
    (encrypted in etcd, RBAC'd, helm-managed, auto-bounced on rotation per

@@ -69,6 +69,27 @@ enum KeySource {
     },
 }
 
+/// The platform key's daily external token ceiling is reached
+/// (`TALOS_PLATFORM_LLM_TOKENS_PER_DAY`): a vault-sourced client refuses the
+/// call before any request. Recognised by [`is_platform_ceiling`], so a caller
+/// can skip rather than fail (the evaluation judge's `JudgeBudgetSkip`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlatformCeilingReached;
+
+impl std::fmt::Display for PlatformCeilingReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the platform's daily external LLM token ceiling is reached; try again later")
+    }
+}
+
+impl std::error::Error for PlatformCeilingReached {}
+
+/// Whether an [`LlmClient`] error is the platform ceiling's refusal.
+#[must_use]
+pub fn is_platform_ceiling(error: &anyhow::Error) -> bool {
+    error.is::<PlatformCeilingReached>()
+}
+
 #[derive(Clone)]
 pub struct LlmClient {
     client: Client,
@@ -161,6 +182,19 @@ impl LlmClient {
                 secrets_manager,
                 env_fallback,
             } => {
+                // The platform key's daily ceiling, asked by every caller of a
+                // vault-sourced client — the shared controller client, the
+                // evaluation judge, consolidation — before the key is handed
+                // out (security review 2026-10-15, I2-2: two callers spent the
+                // budget others were refused on). Their spend is recorded with
+                // no execution, so it is what the ceiling counts.
+                if talos_actor_budget_refusal::platform_llm_ceiling_refuses(
+                    secrets_manager.db_pool(),
+                )
+                .await
+                {
+                    return Err(anyhow::Error::new(PlatformCeilingReached));
+                }
                 // None owner scopes the lookup to org/wildcard secrets —
                 // controller-side LLM keys live under the platform's
                 // trust boundary, not a specific end-user.

@@ -215,6 +215,7 @@ fi
 # vouched for the tree. With --skip-ci-check nothing has, so the audit is
 # REQUIRED (H-6, 2026-10-14): a vulnerability, or a missing cargo-audit, aborts
 # the publish. TALOS_PUBLISH_REQUIRE_AUDIT=1/0 overrides either way.
+AUDIT_RESULT=not-run
 if [ -z "${TALOS_PUBLISH_REQUIRE_AUDIT:-}" ]; then
     if [ "$REQUIRE_CI" = "1" ]; then
         TALOS_PUBLISH_REQUIRE_AUDIT=0
@@ -226,10 +227,12 @@ fi
 if command -v cargo-audit >/dev/null 2>&1; then
     if cargo audit >/dev/null 2>&1; then
         ok "cargo audit: no RustSec advisories"
+        AUDIT_RESULT=clean
     elif [ "${TALOS_PUBLISH_REQUIRE_AUDIT:-0}" = "1" ]; then
         die "cargo audit found a vulnerable dependency (TALOS_PUBLISH_REQUIRE_AUDIT=1). \
 Run \`cargo audit\` for details; fix or downgrade before publishing."
     else
+        AUDIT_RESULT=vulnerable
         warn "cargo audit found a vulnerable dependency — building/pushing anyway."
         warn "  Run \`cargo audit\` for the advisory + fixed-version range, or set"
         warn "  TALOS_PUBLISH_REQUIRE_AUDIT=1 to make this abort the publish."
@@ -238,9 +241,33 @@ elif [ "${TALOS_PUBLISH_REQUIRE_AUDIT:-0}" = "1" ]; then
     die "cargo-audit not installed and the audit is required (TALOS_PUBLISH_REQUIRE_AUDIT=1). \
 Install: cargo install cargo-audit --locked"
 else
+    AUDIT_RESULT=not-run
     warn "cargo-audit not installed — skipping the RustSec advisory pre-flight."
     warn "  Install: cargo install cargo-audit --locked (or run \`make audit\`)."
 fi
+echo
+
+# ── What vouched for this publish (H2-4, 2026-10-15) ─────────────────
+# A publish CI did not vouch for and the audit was not REQUIRED to
+# (--skip-ci-check with TALOS_PUBLISH_REQUIRE_AUDIT=0 — whatever the audit
+# then said, nothing stopped the publish on it) is tagged `-unaudited`, as a
+# dirty tree is tagged `-dirty`, so the tag says so; and every signature carries the gates as a cosign annotation,
+# `org.talos.publish.gates=ci:<green|skipped|not-checked>,audit:<…>`,
+# which Rekor records publicly — a record that outlives this terminal and
+# that `cosign verify` prints for the digest install.env pins.
+if [[ "$REQUIRE_CI" -eq 0 ]]; then
+    CI_RESULT=skipped
+elif [[ "$DO_PUSH" -eq 1 ]]; then
+    CI_RESULT=green
+else
+    CI_RESULT=not-checked
+fi
+PUBLISH_GATES="ci:${CI_RESULT},audit:${AUDIT_RESULT}"
+if [[ "$CI_RESULT" == "skipped" && "${TALOS_PUBLISH_REQUIRE_AUDIT}" != "1" ]]; then
+    SHORT_SHA="${SHORT_SHA}-unaudited"
+    warn "Neither CI nor a required audit gated this publish (${PUBLISH_GATES}) — tags are marked '-unaudited' and must not be deployed to production."
+fi
+ok "Publish gates: ${PUBLISH_GATES}"
 echo
 
 # ── Build ─────────────────────────────────────────────────────────────
@@ -368,12 +395,12 @@ if [[ "$DO_SIGN" -eq 1 && "$DO_PUSH" -eq 1 ]]; then
         # ONCE — and the token gets reused across every image in this
         # invocation. The cert per image is short-lived (~10 min) and
         # Rekor records each signature publicly.
-        if ! COSIGN_EXPERIMENTAL=1 cosign sign --yes "${SIGN_REFS[@]}"; then
+        if ! COSIGN_EXPERIMENTAL=1 cosign sign --yes -a "org.talos.publish.gates=${PUBLISH_GATES}" "${SIGN_REFS[@]}"; then
             warn "Batched cosign sign failed — falling back to per-image loop"
             warn "(this WILL open one browser tab per image)"
             for ref in "${SIGN_REFS[@]}"; do
                 log "  cosign sign $ref"
-                COSIGN_EXPERIMENTAL=1 cosign sign --yes "$ref"
+                COSIGN_EXPERIMENTAL=1 cosign sign --yes -a "org.talos.publish.gates=${PUBLISH_GATES}" "$ref"
             done
         fi
         ok "${#SIGN_REFS[@]} image(s) signed"
@@ -385,6 +412,7 @@ fi
 if [[ "$DO_PUSH" -eq 1 ]]; then
     echo "═══════════════════════════════════════════════════════════"
     echo "  Publish complete — copy these into /etc/talos/install.env"
+    echo "  Gates: ${PUBLISH_GATES}"
     echo "═══════════════════════════════════════════════════════════"
     for i in "${!SERVICES[@]}"; do
         svc="${SERVICES[$i]}"

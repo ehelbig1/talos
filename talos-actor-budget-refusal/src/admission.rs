@@ -351,6 +351,42 @@ pub async fn llm_tokens_last_24h<'e, E: sqlx::PgExecutor<'e>>(
     .await
 }
 
+/// External (non-`ollama`) LLM tokens spent with no execution behind them —
+/// the controller's own calls on the platform key — over the trailing 24
+/// hours, every actor and user.
+pub async fn platform_llm_tokens_last_24h<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint FROM llm_usage \
+         WHERE recorded_at > now() - interval '24 hours' \
+           AND execution_id IS NULL AND provider <> 'ollama'",
+    )
+    .fetch_one(executor)
+    .await
+}
+
+/// Whether the platform key's daily external token ceiling
+/// (`TALOS_PLATFORM_LLM_TOKENS_PER_DAY`) refuses another external call — the
+/// ONE home of that decision (security review 2026-10-14 I-2; 2026-10-15
+/// I2-2: asked by `talos_llm::LlmClient` for every vault-sourced key, and by
+/// the actor repository's external-spend check). Fails CLOSED: an unreadable
+/// ledger refuses, and is counted.
+pub async fn platform_llm_ceiling_refuses(pool: &sqlx::PgPool) -> bool {
+    match platform_llm_tokens_last_24h(pool).await {
+        Ok(spent) => spent >= talos_config::platform_llm_tokens_per_day(),
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_llm_budget",
+                error = %e,
+                "the platform LLM token ceiling could not be read; refusing the external call"
+            );
+            talos_metrics::record_llm_budget_read_failure(talos_metrics::LlmBudget::Platform);
+            true
+        }
+    }
+}
+
 // ── Headroom: the same caps, read for a report ───────────────────────────
 
 /// One cap of an actor's budget and how much of it is spent.
