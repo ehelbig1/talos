@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 talos-capability-world = { path = "../talos-capability-world" }
+talos-auth-types = { path = "../talos-auth-types" }
 talos-config = { path = "../talos-config" }
 talos-engine-events = { path = "../talos-engine-events" }
 # The advisory-database age sampler publishes through the controller's registry

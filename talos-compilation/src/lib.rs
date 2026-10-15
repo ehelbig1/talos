@@ -396,47 +396,23 @@ mod advisory_db_age_tests {
 
 /// M-13: gate for the host-process JS/Python compile paths.
 ///
-/// `compile_js_to_wasm` runs `jco componentize` on the host; `compile_python_to_wasm`
-/// runs `componentize-py` on the host. Both invoke their respective
-/// language toolchains in-process — `componentize-py` in particular runs
-/// arbitrary Python introspection at compile time, which is a trivial
-/// RCE escalation if the source is operator-untrusted. Until the
-/// containerised JS/Python toolchain image lands (matching the Rust
-/// `container::build_command` pattern) we fail closed in production
-/// unless the operator explicitly opts back in.
-///
-/// `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` re-enables the host
-/// path — same gate as the Rust host-fallback escape hatch in
-/// `container::host_fallback_allowed`. A single deployment-wide
-/// switch keeps the security model consistent across languages.
-/// Wasm-security review 2026-05-23 (L-finding-6): in production
-/// the env var requires the explicit ack token (the short-form
-/// `true`/`1`/`yes` is intentionally refused there). Delegating to
-/// `container::host_fallback_allowed` keeps the production token
-/// requirement in one place — language-specific copies of the
-/// value-check logic would drift.
-///
-/// Outside production (dev / test) the gate is a no-op so local
-/// `cargo test` runs pass without env setup.
+/// `compile_js_to_wasm` runs `jco componentize` and `compile_python_to_wasm`
+/// runs `componentize-py`; when no container runtime is available they would
+/// run on the host, where `componentize-py` executes arbitrary Python at
+/// compile time. Where the sandbox is required
+/// (`container::compile_sandbox_required`, a deployment that faces users) the
+/// host path is refused, and nothing opts back in (operator decision G-9,
+/// 2026-10-15 — until then `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` did).
+/// Development is unchanged.
 fn require_host_lang_toolchain_allowed(language: &str) -> Result<()> {
-    if !talos_config::is_production() {
-        return Ok(());
-    }
-    if container::host_fallback_allowed() {
-        tracing::warn!(
-            language,
-            "compile_to_wasm({language}): host toolchain enabled via TALOS_COMPILATION_ALLOW_HOST_FALLBACK — \
-             multi-tenant deployments MUST containerise the {language} toolchain instead. \
-             See docs/platform-primitive-checklist.md (M-13)."
-        );
+    if !container::compile_sandbox_required() {
         return Ok(());
     }
     bail!(
-        "{language} compilation is disabled in production: the {language} toolchain currently runs \
-         on the host (no sandbox) which is unsafe for multi-tenant deployments. \
-         Single-tenant operators can opt in by setting \
-         TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk; \
-         multi-tenant deploys should wait for the containerised {language} build image."
+        "{language} compilation needs the sandbox container in a deployment that faces users, \
+         and none is available: the {language} toolchain would run on the controller host, which \
+         is unsafe for multi-tenant use. Give the controller podman or docker with the builder \
+         image. There is no host fallback (operator decision G-9)."
     );
 }
 
@@ -565,35 +541,6 @@ impl CompilationService {
             tracing::error!(
                 wit_path = %wit_path.display(),
                 "WIT fixture missing at expected path"
-            );
-        }
-
-        // Startup-time advisory for the host-language fallback flag.
-        // The per-compile warning inside `require_host_lang_toolchain_allowed`
-        // is operator-blind until someone actually attempts a JS/Python
-        // compile — an attacker who knows the flag is set could fire
-        // their malicious module on the FIRST compile attempt, before
-        // any warning has surfaced. This boot-time log makes the
-        // dangerous mode impossible to overlook in production.
-        //
-        // Fires once per process at construction, not per request,
-        // so log volume is bounded.
-        // L-finding-6: delegate the production-only ack-token check to
-        // `container::host_fallback_allowed` so the env-var semantics
-        // live in exactly one place. The startup advisory only fires
-        // when the gate is genuinely open in production.
-        if talos_config::is_production() && container::host_fallback_allowed() {
-            tracing::warn!(
-                target: "talos_compilation::startup_advisory",
-                flag = "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
-                "PRODUCTION DEPLOYMENT WITH HOST-LANGUAGE FALLBACK ENABLED. \
-                 JavaScript and Python user-supplied source will be \
-                 compiled by host-side toolchains WITHOUT container \
-                 isolation. componentize-py executes arbitrary Python \
-                 introspection at build time — effectively `exec(user_source)`. \
-                 Single-tenant homelab use only. If this is a multi-tenant \
-                 deployment, UNSET this variable immediately. \
-                 See docs/platform-primitive-checklist.md (M-13)."
             );
         }
 
@@ -1382,8 +1329,10 @@ impl CompilationService {
                 //      advisories caused exit 1" from "tool broke and
                 //      we found nothing" without parsing cargo-audit's
                 //      stderr. Fail-closed in prod is the right call;
-                //      the WARN tells the operator what happened.
-                if talos_config::is_production() {
+                //      the WARN tells the operator what happened. "Prod"
+                //      is wherever the sandbox is required (G-9: staging
+                //      too, as docker-compose.prod.yml runs).
+                if container::compile_sandbox_required() {
                     self.send_event(
                         user_id,
                         job_id,
@@ -1411,7 +1360,7 @@ impl CompilationService {
                 );
             }
             Err(_) => {
-                if talos_config::is_production() {
+                if container::compile_sandbox_required() {
                     self.send_event(
                         user_id,
                         job_id,
@@ -4181,124 +4130,53 @@ mod m13_gate_tests {
     // parallel mode. See container::TEST_ENV_LOCK for rationale.
     use crate::container::env_lock;
 
+    fn with_env<T>(rust_env: &str, ack: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev_env = std::env::var("RUST_ENV").ok();
+        let prev_flag = std::env::var(container::RETIRED_HOST_FALLBACK).ok();
+        std::env::set_var("RUST_ENV", rust_env);
+        match ack {
+            Some(v) => std::env::set_var(container::RETIRED_HOST_FALLBACK, v),
+            None => std::env::remove_var(container::RETIRED_HOST_FALLBACK),
+        }
+        let out = f();
+        match prev_env {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
+        }
+        match prev_flag {
+            Some(v) => std::env::set_var(container::RETIRED_HOST_FALLBACK, v),
+            None => std::env::remove_var(container::RETIRED_HOST_FALLBACK),
+        }
+        out
+    }
+
     #[test]
     fn gate_no_op_in_dev() {
         let _g = env_lock();
-        // L-finding-6 follow-up: explicitly pin RUST_ENV=development
-        // so this test does NOT depend on test-execution order. A
-        // sibling test (e.g. `gate_opt_in_allows_with_warning`,
-        // `host_fallback_prod_*`) that sets RUST_ENV=production
-        // and then panics before cleanup would otherwise leak the
-        // setting into this test even though env_lock serialised
-        // lock acquisition.
-        let prev_env = std::env::var("RUST_ENV").ok();
-        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
-        std::env::set_var("RUST_ENV", "development");
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        assert!(require_host_lang_toolchain_allowed("python").is_ok());
-        assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
-        match prev_env {
-            Some(v) => std::env::set_var("RUST_ENV", v),
-            None => std::env::remove_var("RUST_ENV"),
-        }
-        match prev_flag {
-            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
-            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
-        }
+        with_env("development", None, || {
+            assert!(require_host_lang_toolchain_allowed("python").is_ok());
+            assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
+        });
     }
 
+    /// G-9: where the sandbox is required — production and staging — the
+    /// host path is refused, and the retired acknowledgement does not open it.
     #[test]
-    fn gate_error_message_names_language_and_env_var() {
+    fn gate_refuses_the_host_path_wherever_the_sandbox_is_required() {
         let _g = env_lock();
-        // Force production via env var so we exercise the gate.
-        let prev_env = std::env::var("RUST_ENV").ok();
-        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
-        std::env::set_var("RUST_ENV", "production");
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-
-        let err = require_host_lang_toolchain_allowed("python")
-            .expect_err("expected gate to refuse in production");
-        let msg = format!("{err}");
-        assert!(msg.contains("python"), "missing language: {msg}");
-        assert!(
-            msg.contains("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
-            "missing env var hint: {msg}"
-        );
-        assert!(
-            msg.contains("multi-tenant"),
-            "missing security rationale: {msg}"
-        );
-        assert!(
-            msg.contains("disabled in production"),
-            "missing posture summary: {msg}"
-        );
-
-        // Restore env.
-        match prev_env {
-            Some(v) => std::env::set_var("RUST_ENV", v),
-            None => std::env::remove_var("RUST_ENV"),
-        }
-        match prev_flag {
-            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
-            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
-        }
-    }
-
-    #[test]
-    fn gate_opt_in_allows_with_warning() {
-        let _g = env_lock();
-        let prev_env = std::env::var("RUST_ENV").ok();
-        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
-        std::env::set_var("RUST_ENV", "production");
-        // L-finding-6: production opt-in now requires the explicit
-        // ack token; short-form `true`/`1`/`yes` is intentionally
-        // refused. Pre-fix the test set `true` and expected Ok;
-        // post-fix the gate is delegated to
-        // `container::host_fallback_allowed`, which only accepts the
-        // full ack-token value in production.
-        std::env::set_var(
-            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
-            "acknowledge-single-tenant-rce-risk",
-        );
-
-        assert!(require_host_lang_toolchain_allowed("javascript").is_ok());
-
-        match prev_env {
-            Some(v) => std::env::set_var("RUST_ENV", v),
-            None => std::env::remove_var("RUST_ENV"),
-        }
-        match prev_flag {
-            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
-            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
-        }
-    }
-
-    /// L-finding-6: production with the short-form `true` value must
-    /// now REFUSE — sibling-parity with
-    /// `host_fallback_prod_refuses_short_form` in `container::tests`.
-    #[test]
-    fn gate_prod_refuses_short_form_truthy() {
-        let _g = env_lock();
-        let prev_env = std::env::var("RUST_ENV").ok();
-        let prev_flag = std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK").ok();
-        std::env::set_var("RUST_ENV", "production");
-        std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", "true");
-
-        let err = require_host_lang_toolchain_allowed("python")
-            .expect_err("expected gate to refuse short-form `true` in production");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("acknowledge-single-tenant-rce-risk"),
-            "error must name the ack token: {msg}"
-        );
-
-        match prev_env {
-            Some(v) => std::env::set_var("RUST_ENV", v),
-            None => std::env::remove_var("RUST_ENV"),
-        }
-        match prev_flag {
-            Some(v) => std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", v),
-            None => std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK"),
+        for env in ["production", "staging"] {
+            for ack in [
+                None,
+                Some("acknowledge-single-tenant-rce-risk"),
+                Some("true"),
+            ] {
+                let err = with_env(env, ack, || require_host_lang_toolchain_allowed("python"))
+                    .expect_err("refused");
+                let msg = format!("{err}");
+                assert!(msg.contains("python"), "{env} {ack:?}: {msg}");
+                assert!(msg.contains("no host fallback"), "{env} {ack:?}: {msg}");
+                assert!(msg.contains("multi-tenant"), "{env} {ack:?}: {msg}");
+            }
         }
     }
 }

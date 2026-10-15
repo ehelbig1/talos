@@ -8,9 +8,13 @@
 //!
 //! # Configuration
 //!
-//! - `TALOS_COMPILATION_CONTAINER` — `"true"` (default in production) or
-//!   `"false"` (default in development). When `"false"`, compilation falls back
-//!   to a direct `cargo` invocation on the host.
+//! - `TALOS_COMPILATION_CONTAINER` — on by default in a deployment that faces
+//!   users ([`compile_sandbox_required`]), off in development. In development
+//!   `"false"` compiles with a direct `cargo` on the host; in a deployment that
+//!   faces users a compile that cannot run in the container is REFUSED — there
+//!   is no acknowledgement that runs it on the host (operator decision G-9,
+//!   2026-10-15; `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` is retired and refused
+//!   at boot when set there).
 //! - `TALOS_BUILDER_IMAGE` — Container image name. Default: `talos-builder:latest`.
 //! - `TALOS_BUILDER_MEMORY` — Memory limit. Default: `2g`.
 //! - `TALOS_BUILDER_CPUS` — CPU limit. Default: `2`.
@@ -164,84 +168,53 @@ fn nonempty_env_or(name: &str, default: &str) -> String {
 /// `TALOS_COMPILATION_CONTAINER=""` forced containerised compilation ON in
 /// development, the opposite of the unset default (`is_production()` = false).
 /// A dev box with no container runtime then fail-closes through
-/// `host_fallback_allowed()` and refuses to compile any module at all. Empty
+/// the sandbox rule and refuses to compile any module at all. Empty
 /// now means unset, matching this file's own `nonempty_env_or` (whose doc
 /// comment cites the same class) and `talos_config::bool_env_or_default`,
 /// which likewise returns its default on empty.
 fn container_enabled() -> bool {
-    talos_config::bool_env("TALOS_COMPILATION_CONTAINER")
-        .unwrap_or_else(talos_config::is_production)
+    talos_config::bool_env("TALOS_COMPILATION_CONTAINER").unwrap_or_else(compile_sandbox_required)
 }
 
-/// Returns `true` when the operator has explicitly opted in to running
-/// `cargo` directly on the host when no container runtime is available.
-///
-/// Default: `false`. When unset and we're in production, missing-runtime
-/// fail-closes (refuses to compile) — see `build_command` and
-/// `audit_command`. Single-tenant operators who accept the trust model
-/// (operator authors all modules) can set
-/// `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` to restore the legacy
-/// degraded-sandbox behaviour. Multi-tenant deploys MUST leave it unset
-/// — running user-supplied `build.rs` / proc-macros on the host is a
-/// trivial RCE escalation path.
-///
-/// Wasm-security review 2026-05-23 (L-finding-6): the prior gate
-/// accepted `true`/`1`/`yes` in production with only a startup-time
-/// WARN. That's the same value an operator might set in a dev
-/// `.env` file and accidentally inherit into a production rollout —
-/// the WARN is easy to miss in log-volume environments and there's
-/// no second-factor on the gate. In production we now require a
-/// deliberate acknowledgement token that names the risk, so the
-/// flag cannot be enabled by reflex / copy-paste from a dev config:
-///
-///   prod: `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk`
-///   dev:  `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` (or 1 / yes / the ack token)
-///
-/// Existing single-tenant production operators who had `=true` will
-/// see a clear startup error pointing them at the new value — they
-/// keep the same opt-in capability, the muscle-memory just costs
-/// one extra step. The ack token is also accepted in dev so an
-/// operator can mirror prod config locally for validation.
-const HOST_FALLBACK_PROD_ACK: &str = "acknowledge-single-tenant-rce-risk";
+/// Whether every compile must run in the sandbox container: the deployment
+/// faces users (`talos_auth_types::browser_hardening_required()`, true under
+/// `RUST_ENV=production` AND `staging`, as `docker-compose.prod.yml` runs).
+/// Operator decision G-9 (2026-10-15): container mode is the only compile
+/// mode there. A host compile runs a user's `build.rs` and proc-macros on the
+/// controller, and the source scan in front of it is a per-line regex
+/// (security review G-9), so it is not offered at all — where until then the
+/// acknowledgement token `acknowledge-single-tenant-rce-risk` ran it, and
+/// `RUST_ENV=staging` ran it with no token.
+#[must_use]
+pub fn compile_sandbox_required() -> bool {
+    talos_auth_types::browser_hardening_required()
+}
 
-pub fn host_fallback_allowed() -> bool {
-    let raw = match std::env::var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK") {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let normalized = raw.trim().to_ascii_lowercase();
-    // Production: ONLY the explicit ack token counts. true/1/yes are
-    // ignored (with a loud WARN) so an operator who carried a dev value
-    // into prod sees the safer "compilation refused" outcome rather than
-    // silently running unsandboxed.
-    if talos_config::is_production() {
-        if normalized == HOST_FALLBACK_PROD_ACK {
-            return true;
-        }
-        // allow-inline-env-bool: not a boolean — a production ack token whose
-        // short forms are deliberately REJECTED here (see the doc comment above).
-        if matches!(normalized.as_str(), "true" | "1" | "yes") {
-            tracing::warn!(
-                target: "talos_compilation",
-                event_kind = "host_fallback_prod_short_form_rejected",
-                value = %normalized,
-                expected = HOST_FALLBACK_PROD_ACK,
-                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK is set to a short-form truthy value \
-                 in production; this is ignored. To enable the unsandboxed fallback in \
-                 production set the value to the explicit ack token (see \
-                 host_fallback_allowed doc-comment). The short-form values remain accepted \
-                 in dev/CI for ergonomic mirroring."
-            );
-        }
-        return false;
+/// The retired escape (G-9): it no longer runs a compile on the host.
+pub const RETIRED_HOST_FALLBACK: &str = "TALOS_COMPILATION_ALLOW_HOST_FALLBACK";
+
+/// Refuse to boot a deployment that faces users while it still sets
+/// [`RETIRED_HOST_FALLBACK`]: an operator who relied on it learns at boot,
+/// not from the first refused compile. Development ignores it (a host compile
+/// needs no acknowledgement there).
+pub fn refuse_retired_host_fallback(sandbox_required: bool, setting: Option<&str>) -> Result<()> {
+    let set = setting.is_some_and(|v| !v.trim().is_empty());
+    if sandbox_required && set {
+        bail!(
+            "{RETIRED_HOST_FALLBACK} is set, and it is retired: a deployment that faces users \
+             compiles only in the sandbox container (operator decision G-9, 2026-10-15). Unset \
+             it, and give the controller a container runtime with the builder image, or set \
+             TALOS_MODULE_COMPILATION=false with TALOS_REGISTRY_URL to run registry-only."
+        );
     }
-    // Dev/CI: short-form values keep working so existing test fixtures
-    // and local `.env` files don't break. The ack token also works so
-    // operators can mirror prod config locally.
-    // allow-inline-env-bool: the dev arm of the same ack-token parse, not a boolean.
-    matches!(
-        normalized.as_str(),
-        "true" | "1" | "yes" | HOST_FALLBACK_PROD_ACK
+    Ok(())
+}
+
+/// [`refuse_retired_host_fallback`] for this process's environment.
+pub fn refuse_retired_host_fallback_from_env() -> Result<()> {
+    refuse_retired_host_fallback(
+        compile_sandbox_required(),
+        std::env::var(RETIRED_HOST_FALLBACK).ok().as_deref(),
     )
 }
 
@@ -279,32 +252,28 @@ impl HostReason {
 pub(crate) enum SandboxDecision {
     /// Inside the container, with this runtime.
     Container(&'static str),
-    /// On the host: outside production, or in production with the ack token.
+    /// On the host: development only.
     Host(HostReason),
-    /// Refused: production without the ack token.
+    /// Refused: a deployment that faces users ([`compile_sandbox_required`]).
     Refuse(HostReason),
 }
 
-/// The one rule for running cargo unsandboxed (package CA, 2026-09-17).
-///
-/// Until then only the no-runtime case consulted the production ack token:
-/// `TALOS_COMPILATION_CONTAINER=false` returned a host `cargo` with a debug
-/// log, in production, so the acknowledgement that names the RCE risk was
-/// bypassed by the other env var. A host compile in production now needs the
-/// ack whichever of the two put it there. `runtime` is only consulted when
+/// The one rule for running cargo unsandboxed (package CA, 2026-09-17; G-9,
+/// 2026-10-15). Both ways a compile can land on the host — container mode
+/// turned off, or no runtime found — are refused where the sandbox is
+/// required, and nothing waives that. `runtime` is only consulted when
 /// container mode is on (detecting it spawns processes).
 pub(crate) fn sandbox_decision(
     container_enabled: bool,
     runtime: Option<&'static str>,
-    production: bool,
-    fallback_acknowledged: bool,
+    sandbox_required: bool,
 ) -> SandboxDecision {
     let reason = match (container_enabled, runtime) {
         (true, Some(rt)) => return SandboxDecision::Container(rt),
         (true, None) => HostReason::NoRuntime,
         (false, _) => HostReason::ContainerDisabled,
     };
-    if production && !fallback_acknowledged {
+    if sandbox_required {
         SandboxDecision::Refuse(reason)
     } else {
         SandboxDecision::Host(reason)
@@ -317,37 +286,20 @@ pub(crate) fn sandbox_decision(
 fn resolve_sandbox_runtime(step: &str) -> Result<Option<&'static str>> {
     let enabled = container_enabled();
     let runtime = if enabled { detect_runtime() } else { None };
-    let production = talos_config::is_production();
-    let ack = production && host_fallback_allowed();
-    match sandbox_decision(enabled, runtime, production, ack) {
+    match sandbox_decision(enabled, runtime, compile_sandbox_required()) {
         SandboxDecision::Container(rt) => Ok(Some(rt)),
         SandboxDecision::Refuse(reason) => bail!(
-            "Container compilation is required in production ({}): {}. \
-             Install podman or docker in the controller pod and leave \
-             TALOS_COMPILATION_CONTAINER unset or true. Single-tenant operators who \
-             accept the trust model (operator authors all modules — user-supplied \
-             proc-macros run on the controller host) can set \
-             TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk. \
-             The short-form values (`true`/`1`/`yes`) accepted in dev are REFUSED in \
-             production — see `host_fallback_allowed` in talos-compilation/src/container.rs.",
+            "Container compilation is required in a deployment that faces users ({}): {}. \
+             Give the controller podman or docker with the builder image and leave \
+             TALOS_COMPILATION_CONTAINER unset or true, or set TALOS_MODULE_COMPILATION=false \
+             with TALOS_REGISTRY_URL to run registry-only. There is no host fallback \
+             (operator decision G-9, 2026-10-15).",
             step,
             match reason {
                 HostReason::ContainerDisabled => "TALOS_COMPILATION_CONTAINER disables it",
                 HostReason::NoRuntime => "neither podman nor docker was found in PATH",
             }
         ),
-        SandboxDecision::Host(reason) if production => {
-            tracing::warn!(
-                target: "talos_compilation",
-                event_kind = "compilation_unsandboxed_fallback",
-                fallback_reason = reason.as_str(),
-                step,
-                "cargo is running WITHOUT container isolation in production because \
-                 TALOS_COMPILATION_ALLOW_HOST_FALLBACK carries the acknowledgement token. \
-                 Operator-acknowledged for single-tenant deploys; UNSAFE for multi-tenant."
-            );
-            Ok(None)
-        }
         SandboxDecision::Host(HostReason::ContainerDisabled) => {
             tracing::debug!(step, "Container compilation disabled — using direct cargo");
             Ok(None)
@@ -811,7 +763,7 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<SandboxCommand> {
 /// modules race on `TALOS_COMPILATION_CONTAINER` or
 /// `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` (or `RUST_ENV`), one's
 /// teardown can clobber the other's setup mid-assertion. The fix is
-/// not to remove env-var coupling — `host_fallback_allowed()` and
+/// not to remove env-var coupling — `compile_sandbox_required()` and
 /// `container_enabled()` are env-driven by design — but to serialize
 /// the tests that mutate that shared state.
 ///
@@ -952,127 +904,39 @@ mod tests {
         );
     }
 
+    /// G-9: a deployment that faces users and still sets the retired switch
+    /// does not boot, whatever the value; development ignores it.
     #[test]
-    fn host_fallback_default_off() {
-        let _g = env_lock();
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        assert!(
-            !host_fallback_allowed(),
-            "host fallback must be off by default — production missing-runtime should bail"
-        );
-    }
-
-    #[test]
-    fn host_fallback_recognises_truthy_values() {
-        let _g = env_lock();
-        for val in ["true", "TRUE", "1", "yes", "Yes"] {
-            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
-            assert!(
-                host_fallback_allowed(),
-                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK={val} should enable fallback"
-            );
+    fn the_retired_host_fallback_is_refused_at_boot_where_the_sandbox_is_required() {
+        for value in ["acknowledge-single-tenant-rce-risk", "true", "1"] {
+            let err = refuse_retired_host_fallback(true, Some(value))
+                .expect_err("set in a deployment that faces users");
+            assert!(err.to_string().contains(RETIRED_HOST_FALLBACK), "{err}");
         }
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        assert!(refuse_retired_host_fallback(true, None).is_ok());
+        assert!(refuse_retired_host_fallback(true, Some("  ")).is_ok());
+        assert!(refuse_retired_host_fallback(false, Some("true")).is_ok());
     }
 
+    /// G-9: the sandbox requirement follows the hardening predicate, so
+    /// `RUST_ENV=staging` (how `docker-compose.prod.yml` runs) requires it,
+    /// where `is_production()` did not.
     #[test]
-    fn host_fallback_rejects_other_values() {
+    fn the_sandbox_is_required_wherever_the_deployment_faces_users() {
         let _g = env_lock();
-        for val in ["false", "0", "no", "", "maybe"] {
-            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
-            assert!(
-                !host_fallback_allowed(),
-                "TALOS_COMPILATION_ALLOW_HOST_FALLBACK={val:?} must NOT enable fallback"
-            );
-        }
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-    }
-
-    /// L-finding-6: in production the short-form truthy values must be
-    /// REFUSED — only the explicit ack token enables fallback. Guards
-    /// against an operator carrying a dev `.env` value into a prod
-    /// rollout and silently running unsandboxed.
-    #[test]
-    fn host_fallback_prod_refuses_short_form() {
-        let _g = env_lock();
-        std::env::set_var("RUST_ENV", "production");
-        for val in ["true", "TRUE", "1", "yes", "Yes"] {
-            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
-            assert!(
-                !host_fallback_allowed(),
-                "production: short-form value {val:?} MUST NOT enable fallback (ack token required)"
-            );
-        }
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        std::env::remove_var("RUST_ENV");
-    }
-
-    /// L-finding-6: in production ONLY the explicit ack token enables
-    /// the fallback. Case-insensitive match on the token; surrounding
-    /// whitespace is trimmed.
-    #[test]
-    fn host_fallback_prod_accepts_ack_token() {
-        let _g = env_lock();
-        std::env::set_var("RUST_ENV", "production");
-        for val in [
-            "acknowledge-single-tenant-rce-risk",
-            "ACKNOWLEDGE-SINGLE-TENANT-RCE-RISK",
-            "  acknowledge-single-tenant-rce-risk  ",
+        let prev = std::env::var("RUST_ENV").ok();
+        for (env, required) in [
+            ("production", true),
+            ("staging", true),
+            ("development", false),
         ] {
-            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
-            assert!(
-                host_fallback_allowed(),
-                "production: ack token {val:?} MUST enable fallback"
-            );
+            std::env::set_var("RUST_ENV", env);
+            assert_eq!(compile_sandbox_required(), required, "{env}");
         }
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        std::env::remove_var("RUST_ENV");
-    }
-
-    /// L-finding-6: the ack token also works in dev so operators can
-    /// mirror prod config locally for validation without having to flip
-    /// between values.
-    #[test]
-    fn host_fallback_dev_accepts_ack_token() {
-        let _g = env_lock();
-        std::env::set_var("RUST_ENV", "development");
-        std::env::set_var(
-            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
-            "acknowledge-single-tenant-rce-risk",
-        );
-        assert!(
-            host_fallback_allowed(),
-            "dev: ack token must also enable fallback"
-        );
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        std::env::remove_var("RUST_ENV");
-    }
-
-    /// L-finding-6: production rejects unrelated values just like dev.
-    /// Defends against e.g. `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=yes-ish`
-    /// pattern-matching the prefix of the ack token by accident.
-    #[test]
-    fn host_fallback_prod_rejects_other_values() {
-        let _g = env_lock();
-        std::env::set_var("RUST_ENV", "production");
-        for val in [
-            "false",
-            "0",
-            "no",
-            "",
-            "maybe",
-            "acknowledge",
-            "acknowledge-single",
-            "single-tenant-rce-risk",
-        ] {
-            std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", val);
-            assert!(
-                !host_fallback_allowed(),
-                "production: {val:?} must NOT enable fallback (only the full ack token)"
-            );
+        match prev {
+            Some(v) => std::env::set_var("RUST_ENV", v),
+            None => std::env::remove_var("RUST_ENV"),
         }
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-        std::env::remove_var("RUST_ENV");
     }
 
     #[test]
@@ -1207,90 +1071,76 @@ mod tests {
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
     }
 
-    /// Package CA: every combination of the four inputs. The production
-    /// arms are the point — a disabled container and a missing runtime need
-    /// the same acknowledgement.
+    /// Package CA / G-9: every combination of the inputs. Where the sandbox
+    /// is required, a disabled container and a missing runtime are both
+    /// refused; nothing admits a host compile there.
     #[test]
     fn sandbox_decision_covers_every_input() {
         use HostReason::*;
         use SandboxDecision::*;
-        for prod in [false, true] {
-            for ack in [false, true] {
-                assert_eq!(
-                    sandbox_decision(true, Some("podman"), prod, ack),
-                    Container("podman"),
-                    "a present runtime is always used (prod={prod}, ack={ack})"
-                );
-                let host_or_refuse = |reason| {
-                    if prod && !ack {
-                        Refuse(reason)
-                    } else {
-                        Host(reason)
-                    }
-                };
-                assert_eq!(
-                    sandbox_decision(true, None, prod, ack),
-                    host_or_refuse(NoRuntime)
-                );
-                assert_eq!(
-                    sandbox_decision(false, None, prod, ack),
-                    host_or_refuse(ContainerDisabled)
-                );
-                // A detected runtime does not rescue disabled container mode.
-                assert_eq!(
-                    sandbox_decision(false, Some("docker"), prod, ack),
-                    host_or_refuse(ContainerDisabled)
-                );
-            }
+        for required in [false, true] {
+            assert_eq!(
+                sandbox_decision(true, Some("podman"), required),
+                Container("podman"),
+                "a present runtime is always used (required={required})"
+            );
+            let host_or_refuse = |reason| {
+                if required {
+                    Refuse(reason)
+                } else {
+                    Host(reason)
+                }
+            };
+            assert_eq!(
+                sandbox_decision(true, None, required),
+                host_or_refuse(NoRuntime)
+            );
+            assert_eq!(
+                sandbox_decision(false, None, required),
+                host_or_refuse(ContainerDisabled)
+            );
+            // A detected runtime does not rescue disabled container mode.
+            assert_eq!(
+                sandbox_decision(false, Some("docker"), required),
+                host_or_refuse(ContainerDisabled)
+            );
         }
     }
 
-    /// Package CA: `TALOS_COMPILATION_CONTAINER=false` in production used to
-    /// return a host `cargo` with a debug log. Both production entry points
-    /// now refuse without the ack token and name the variable that caused it;
-    /// with the token they run on the host. Development is unchanged.
+    /// Package CA / G-9: `TALOS_COMPILATION_CONTAINER=false` where the sandbox
+    /// is required refuses both entry points and names the variable; the
+    /// retired acknowledgement no longer admits a host compile (until
+    /// 2026-10-15 it did). Development is unchanged.
     #[test]
-    fn container_disabled_in_production_requires_the_ack_token() {
+    fn container_disabled_where_the_sandbox_is_required_is_refused() {
         let _g = env_lock();
         let ws = PathBuf::from("/tmp/test-workspace");
         let reg = PathBuf::from("/tmp/test-registry");
         let wit = PathBuf::from("/tmp/test-wit");
         std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
-        std::env::set_var("RUST_ENV", "production");
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
-
-        for (step, result) in [
-            ("build", build_command(&ws, &reg, &wit, None).map(|_| ())),
-            ("audit", audit_command(&ws, &reg).map(|_| ())),
-        ] {
-            let err = result.expect_err("production + container disabled + no ack must refuse");
-            let msg = format!("{err}");
-            assert!(
-                msg.contains("TALOS_COMPILATION_CONTAINER disables it"),
-                "{step}: {msg}"
-            );
-            assert!(
-                msg.contains("acknowledge-single-tenant-rce-risk"),
-                "{step}: {msg}"
-            );
+        for env in ["production", "staging"] {
+            std::env::set_var("RUST_ENV", env);
+            for ack in [None, Some("acknowledge-single-tenant-rce-risk")] {
+                match ack {
+                    Some(v) => std::env::set_var(RETIRED_HOST_FALLBACK, v),
+                    None => std::env::remove_var(RETIRED_HOST_FALLBACK),
+                }
+                for (step, result) in [
+                    ("build", build_command(&ws, &reg, &wit, None).map(|_| ())),
+                    ("audit", audit_command(&ws, &reg).map(|_| ())),
+                ] {
+                    let err = result.expect_err("a host compile is refused");
+                    let msg = format!("{err}");
+                    assert!(
+                        msg.contains("TALOS_COMPILATION_CONTAINER disables it"),
+                        "{env} {step}: {msg}"
+                    );
+                    assert!(msg.contains("no host fallback"), "{env} {step}: {msg}");
+                }
+            }
         }
 
-        // The short form stays refused in production.
-        std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", "true");
-        assert!(build_command(&ws, &reg, &wit, None).is_err());
-
-        std::env::set_var(
-            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
-            "acknowledge-single-tenant-rce-risk",
-        );
-        for cmd in [
-            build_command(&ws, &reg, &wit, None).expect("ack admits the host build"),
-            audit_command(&ws, &reg).expect("ack admits the host audit"),
-        ] {
-            assert!(format!("{:?}", cmd.as_std().get_program()).contains("cargo"));
-        }
-
-        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::remove_var(RETIRED_HOST_FALLBACK);
         std::env::set_var("RUST_ENV", "development");
         assert!(
             build_command(&ws, &reg, &wit, None).is_ok(),

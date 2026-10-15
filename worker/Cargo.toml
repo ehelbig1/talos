@@ -17,6 +17,7 @@ license.workspace = true
 
 [dependencies]
 # The extracted WASM host runtime — everything the bin executes jobs with.
+talos-auth-types = { path = "../talos-auth-types" }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 
 # Core async runtime
