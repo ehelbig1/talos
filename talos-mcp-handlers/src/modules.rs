@@ -3342,16 +3342,11 @@ pub(crate) fn methods_beyond(granted: &[String], list: &[String]) -> Vec<String>
     carry_method_grant(list, granted).1
 }
 
-/// See [`hosts_beyond`]. `"*"` is beyond anything but `"*"` itself.
+/// See [`hosts_beyond`]: by the one matcher, under which a `*` grant grants
+/// nothing (D2-D, 2026-10-15) and a `*` entry is beyond everything but `*`.
 pub(crate) fn secrets_beyond(granted: &[String], list: &[String]) -> Vec<String> {
     list.iter()
-        .filter(|e| {
-            if e.as_str() == "*" {
-                !granted.iter().any(|g| g == "*")
-            } else {
-                !talos_workflow_job_protocol::vault_path_permitted(granted, e)
-            }
-        })
+        .filter(|e| !talos_workflow_job_protocol::vault_path_permitted(granted, e))
         .cloned()
         .collect()
 }
@@ -4225,10 +4220,8 @@ mod carry_grant_tests {
             ),
             v(&["plaid/secret", "*"])
         );
-        assert_eq!(
-            secrets_beyond(&v(&["*"]), &v(&["*", "x/y"])),
-            Vec::<String>::new()
-        );
+        // D2-D: a `*` grant grants nothing beyond its own text.
+        assert_eq!(secrets_beyond(&v(&["*"]), &v(&["*", "x/y"])), v(&["x/y"]));
     }
 
     #[test]
@@ -4310,11 +4303,13 @@ mod narrow_secret_grant_tests {
         assert!(not.is_empty());
     }
 
+    /// D2-D (2026-10-15): a template `*` grants nothing, so it narrows to
+    /// nothing (a manifest can no longer declare one; this pins the meaning).
     #[test]
-    fn template_wildcard_honours_the_caller_list_verbatim() {
+    fn a_template_star_grant_narrows_to_nothing() {
         let (granted, not) = narrow_secret_grant(&v(&["*"]), &v(&["anthropic/api_key"]));
-        assert_eq!(granted, v(&["anthropic/api_key"]));
-        assert!(not.is_empty());
+        assert!(granted.is_empty());
+        assert_eq!(not, v(&["anthropic/api_key"]));
     }
 
     #[test]

@@ -3965,9 +3965,11 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
     if allowed.is_empty() {
         return false;
     }
+    // `*` grants nothing (operator decision D2-D, 2026-10-15): it is refused
+    // at every write and stripped from stored rows, and a list that still
+    // carries one (a caller-declared rehearsal grant) reads nothing by it.
     allowed.iter().any(|s| {
-        s == "*"
-            || s.as_str() == key_path
+        s.as_str() == key_path
             || key_path.starts_with(&format!("{}/", s))
             || (s.ends_with("/*") && key_path.starts_with(&s[..s.len() - 1]))
     })
@@ -3995,9 +3997,10 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
 /// result is `Ok`, so nothing logs and nothing fails until the module asks for
 /// a secret that was never delivered.
 ///
-/// Semantics — exactly two forms deliver:
-///   - `["*"]`        → every secret the user can read
+/// Semantics — exactly one form delivers:
 ///   - `["a/b/c"]`    → that path, if a secret is stored at it
+///   - `["*"]`        → delivers nothing (until 2026-10-15, every secret the
+///     user can read; operator decision D2-D)
 ///   - `["a/b"]`      → does NOT deliver `"a/b/c"` (permits it; delivers nothing)
 ///   - `["a/b/*"]`    → delivers nothing, ever
 ///
@@ -4009,7 +4012,7 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
 /// So `false` means "the grant alone will not deliver this", never "this module
 /// cannot obtain this secret".
 pub fn vault_path_prefetched(allowed: &[String], key_path: &str) -> bool {
-    allowed.iter().any(|s| s == "*" || s.as_str() == key_path)
+    allowed.iter().any(|s| s.as_str() == key_path)
 }
 
 // ============================================================================
@@ -4396,9 +4399,9 @@ mod vault_matcher_tests {
     }
 
     #[test]
-    fn wildcard_allows_anything() {
-        assert!(vault_path_permitted(&s(&["*"]), "anthropic/api_key"));
-        assert!(vault_path_permitted(&s(&["*"]), "oauth/gmail/user/access"));
+    fn a_star_grant_allows_nothing() {
+        assert!(!vault_path_permitted(&s(&["*"]), "anthropic/api_key"));
+        assert!(!vault_path_permitted(&s(&["*"]), "oauth/gmail/user/access"));
     }
 
     #[test]
@@ -4505,15 +4508,14 @@ mod vault_matcher_tests {
         assert!(!vault_path_prefetched(&grant, "plaid/secret"));
     }
 
+    /// D2-D (2026-10-15): `*` neither permits nor prefetches — until then
+    /// it was the one form the resolver expanded to every secret the user
+    /// could read.
     #[test]
-    fn the_wildcard_both_permits_and_prefetches() {
+    fn a_star_grant_neither_permits_nor_prefetches() {
         let grant = s(&["*"]);
-        assert!(vault_path_permitted(&grant, "anything/at/all"));
-        assert!(
-            vault_path_prefetched(&grant, "anything/at/all"),
-            "`*` is the one form the resolver special-cases, expanding it to \
-             every secret the user can read"
-        );
+        assert!(!vault_path_permitted(&grant, "anything/at/all"));
+        assert!(!vault_path_prefetched(&grant, "anything/at/all"));
     }
 
     #[test]
@@ -13446,10 +13448,9 @@ mod method_permitted_tests {
         for m in ["GET", "POST"] {
             assert!(!method_permitted(&star, m), "`*` must not grant {m}");
         }
-        // The CONTRAST that makes the asymmetry deliberate rather than an
-        // oversight: for secrets, whose key space is unbounded, `*` IS the
-        // documented wildcard.
-        assert!(vault_path_permitted(&star, "anything/at/all"));
+        // For secrets `*` was the documented wildcard until 2026-10-15; it now
+        // grants nothing there either (operator decision D2-D).
+        assert!(!vault_path_permitted(&star, "anything/at/all"));
     }
 
     /// The refusal has to name the FIX, not just the rule.

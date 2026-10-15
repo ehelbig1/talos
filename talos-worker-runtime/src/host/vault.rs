@@ -32,11 +32,13 @@ mod vault_allowlist_tests {
         assert!(!vault_path_allowed(&[], ""));
     }
 
+    /// D2-D (2026-10-15): `*` grants nothing — a guest whose grant still
+    /// carries one reads nothing by it.
     #[test]
-    fn wildcard_allows_everything() {
+    fn a_star_grant_allows_nothing() {
         let allow = s(&["*"]);
-        assert!(vault_path_allowed(&allow, "anthropic/api_key"));
-        assert!(vault_path_allowed(&allow, "oauth/gmail/user/token"));
+        assert!(!vault_path_allowed(&allow, "anthropic/api_key"));
+        assert!(!vault_path_allowed(&allow, "oauth/gmail/user/token"));
     }
 
     #[test]

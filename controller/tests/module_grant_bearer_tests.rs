@@ -23,7 +23,7 @@ use std::sync::Arc;
 use controller::api::schema::{IsTwoFactorVerified, SecondFactorVerified};
 use controller::mcp::auth::AgentIdentity;
 use talos_actor_repository::ActorRepository;
-use talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR;
+use talos_capability_world::{SECRET_WILDCARD_RETIRED, WILDCARD_GRANT_NEEDS_SECOND_FACTOR};
 use uuid::Uuid;
 
 fn agent_with(user: Uuid, caps: &[&str]) -> Arc<AgentIdentity> {
@@ -104,10 +104,14 @@ async fn a_bearer_token_grants_exact_paths_and_hosts_only() {
             serde_json::json!({ "module_id": mid, key: ["*"] }),
         )
         .await;
-        assert_eq!(
-            mcp_common::error_message(&resp),
+        // A `*` secret grant is refused for every authority (D2-D); a `*`
+        // host grant needs a second factor.
+        let expected = if key == "allowed_secrets" {
+            SECRET_WILDCARD_RETIRED
+        } else {
             WILDCARD_GRANT_NEEDS_SECOND_FACTOR
-        );
+        };
+        assert_eq!(mcp_common::error_message(&resp), expected, "{tool}");
     }
     assert_eq!(
         grants(&pool, module).await,
@@ -369,10 +373,7 @@ async fn a_marketplace_install_is_granted_exact_paths_within_the_quota() {
     };
 
     let resp = install(serde_json::json!(["*"])).await;
-    assert_eq!(
-        mcp_common::error_message(&resp),
-        WILDCARD_GRANT_NEEDS_SECOND_FACTOR
-    );
+    assert_eq!(mcp_common::error_message(&resp), SECRET_WILDCARD_RETIRED);
     let resp = install(serde_json::json!(["svc/*"])).await;
     assert!(mcp_common::error_message(&resp).contains("exact secret paths only"));
     assert_eq!(installed(pool.clone()).await, 0);
@@ -530,11 +531,12 @@ async fn an_inline_node_takes_no_wildcard_grant_from_a_bearer() {
             node(extra.clone()),
         )
         .await;
-        assert_eq!(
-            mcp_common::error_message(&resp),
-            WILDCARD_GRANT_NEEDS_SECOND_FACTOR,
-            "{extra}"
-        );
+        let expected = if extra["allowed_secrets"] == serde_json::json!(["*"]) {
+            SECRET_WILDCARD_RETIRED
+        } else {
+            WILDCARD_GRANT_NEEDS_SECOND_FACTOR
+        };
+        assert_eq!(mcp_common::error_message(&resp), expected, "{extra}");
     }
     // A network world with no host list: the every-host default is a `*`.
     let resp = workflow_tool(

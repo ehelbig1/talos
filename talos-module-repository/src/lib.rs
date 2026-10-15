@@ -216,12 +216,15 @@ fn catalog_install_record(
 /// ([`talos_capability_world::grant_list_has_wildcard`]). Returned as the
 /// error of the `update_module_allowed_*` writers; nothing was written. A
 /// surface downcasts it to answer with its own refusal code.
+/// It carries the sentence `refuse_wildcard_grant` answered with: the
+/// second-factor one, or (D2-D, 2026-10-15) the one for a `*` secret grant,
+/// which no authority may write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WildcardGrantRefused;
+pub struct WildcardGrantRefused(pub &'static str);
 
 impl std::fmt::Display for WildcardGrantRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(talos_capability_world::WILDCARD_GRANT_NEEDS_SECOND_FACTOR)
+        f.write_str(self.0)
     }
 }
 
@@ -4385,9 +4388,10 @@ impl ModuleRepository {
     /// was replaced — these are REPLACE-style writes, so a flip-use-revert of
     /// a grant left no durable trace whenever that task failed.
     ///
-    /// A `*` in `allowed_secrets` or `allowed_hosts` is written only for an
-    /// `authority` that may loosen; for a bearer credential the answer is the
-    /// error [`WildcardGrantRefused`] and nothing is read or written. Every
+    /// A `*` in `allowed_hosts`, or a `<prefix>/*` in `allowed_secrets`, is
+    /// written only for an `authority` that may loosen; a `*` in
+    /// `allowed_secrets` for no authority (D2-D). A refusal is the error
+    /// [`WildcardGrantRefused`] and nothing is read or written. Every
     /// write that ADDS an entry is logged `module_grant_widened` on
     /// `talos_audit`, naming the entries added — paths and hosts, never a
     /// value (security review 2026-10-14, A-2 / G-23).
@@ -4411,8 +4415,8 @@ impl ModuleRepository {
             }
             _ => Ok(()),
         };
-        if refused.is_err() {
-            return Err(WildcardGrantRefused.into());
+        if let Err(sentence) = refused {
+            return Err(WildcardGrantRefused(sentence).into());
         }
         let mut tx = self.db_pool.begin().await?;
         let locked: Option<(Vec<String>, Vec<String>)> = sqlx::query_as(which.lock_sql())
