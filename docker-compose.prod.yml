@@ -39,6 +39,14 @@
 # change the three URLs to `postgres://…?sslmode=require`, `rediss://` and
 # `tls://` and flip this value — it will refuse to boot until you have.
 #
+# Two consequences of staging facing users (operator decisions, 2026-10-15):
+# the controller and the worker refuse to boot without TALOS_DISTRIBUTED_REPLAY
+# and REDIS_URL (both set below), and a module is compiled ONLY in the sandbox
+# container — this file gives the controller no container runtime, so every
+# compile is refused. Run registry-only (TALOS_MODULE_COMPILATION=false with
+# TALOS_REGISTRY_URL) or give the controller podman/docker and the builder
+# image. TALOS_COMPILATION_ALLOW_HOST_FALLBACK is retired and refused at boot.
+#
 # Usage:
 #   docker compose -f docker-compose.prod.yml up -d --build
 #

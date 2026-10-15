@@ -2390,6 +2390,13 @@ async fn main() -> anyhow::Result<()> {
     // below read the policy this gate resolved.
     let sigstore_policy_at_boot = enforce_production_sigstore_policy_explicit()?;
 
+    // Operator decision D2-B (2026-10-15): a worker in a deployment that faces
+    // users (production, and staging as `docker-compose.prod.yml` runs it)
+    // does not boot without the distributed replay guard, so a dispatch runs
+    // once per fleet. No acknowledgement waives it.
+    talos_replay_guard::boot_requirement_from_env(talos_auth_types::browser_hardening_required())
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     // Security review 2026-10-14 (B-2): a production worker does not accept
     // a dispatch signed with the fleet-shared WORKER_SHARED_KEY unless
     // TALOS_ALLOW_LEGACY_FLEET_HMAC names `dispatch`. The controller gates

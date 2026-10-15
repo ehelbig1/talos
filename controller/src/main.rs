@@ -435,11 +435,11 @@ async fn main() -> anyhow::Result<()> {
     // the two calls is still counted.
     talos_task_supervision::install_panic_hook("controller");
 
-    enforce_non_dumpable_posture(
-        non_dumpable,
-        config::is_production(),
-        talos_compilation::container::host_fallback_allowed(),
-    )?;
+    enforce_non_dumpable_posture(non_dumpable);
+    // Operator decision G-9 (2026-10-15): a deployment that faces users
+    // compiles only in the sandbox container; the retired host-fallback
+    // switch is refused at boot there rather than ignored.
+    talos_compilation::container::refuse_retired_host_fallback_from_env()?;
 
     // Verify essential environment configuration early (fail-fast gate).
     validate_startup_config()?;
@@ -944,28 +944,15 @@ fn make_process_non_dumpable() -> Result<(), String> {
     Ok(())
 }
 
-/// Log the outcome of [`make_process_non_dumpable`]; refuse to boot when it
-/// failed in the one configuration that exposes the environment to user
-/// code — production with the unsandboxed host compile fallback enabled.
-fn enforce_non_dumpable_posture(
-    result: Result<(), String>,
-    production: bool,
-    host_fallback: bool,
-) -> anyhow::Result<()> {
+/// Log the outcome of [`make_process_non_dumpable`]. Until 2026-10-15 a
+/// failure refused boot in the one configuration that exposed the environment
+/// to user code — production with the unsandboxed host compile fallback — and
+/// that configuration no longer exists (operator decision G-9: the fallback is
+/// retired and refused at boot where the sandbox is required).
+fn enforce_non_dumpable_posture(result: Result<(), String>) {
     match result {
-        Ok(()) => {
-            tracing::info!("process marked non-dumpable (PR_SET_DUMPABLE=0)");
-            Ok(())
-        }
-        Err(e) if production && host_fallback => Err(anyhow::anyhow!(
-            "could not mark the controller non-dumpable ({e}) while the unsandboxed \
-             host compile fallback is enabled — user build scripts could read this \
-             process's secrets from /proc; refusing to start"
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "could not mark the process non-dumpable");
-            Ok(())
-        }
+        Ok(()) => tracing::info!("process marked non-dumpable (PR_SET_DUMPABLE=0)"),
+        Err(e) => tracing::warn!(error = %e, "could not mark the process non-dumpable"),
     }
 }
 
@@ -1216,16 +1203,8 @@ mod tenancy;
 
 #[cfg(test)]
 mod non_dumpable_tests {
+    #[cfg(target_os = "linux")]
     use super::*;
-
-    #[test]
-    fn failure_refuses_boot_only_in_production_with_host_fallback() {
-        let failed = || Err("EPERM".to_string());
-        assert!(enforce_non_dumpable_posture(failed(), true, true).is_err());
-        assert!(enforce_non_dumpable_posture(failed(), true, false).is_ok());
-        assert!(enforce_non_dumpable_posture(failed(), false, true).is_ok());
-        assert!(enforce_non_dumpable_posture(Ok(()), true, true).is_ok());
-    }
 
     #[cfg(target_os = "linux")]
     #[test]

@@ -322,6 +322,45 @@ pub fn distributed_replay_from_env() -> bool {
     talos_config::bool_env_or_default(DISTRIBUTED_REPLAY, false)
 }
 
+/// Whether this process may boot with the replay posture it was given
+/// (operator decision D2-B, 2026-10-15). Where the deployment faces users —
+/// `hardened`, `talos_auth_types::browser_hardening_required()`, which is
+/// true under `RUST_ENV=production` AND `staging` (`docker-compose.prod.yml`)
+/// — the shared guard is REQUIRED: [`DISTRIBUTED_REPLAY`] on and `REDIS_URL`
+/// set. A captured signed RPC or dispatch otherwise replays on another
+/// replica, or on a worker restarted inside the freshness window, with only
+/// the process-local caches to refuse it. There is no acknowledgement that
+/// waives it. Development is unchanged. The controller and the worker each
+/// call this at boot; the answer is the refusal sentence.
+pub fn boot_requirement(
+    hardened: bool,
+    distributed: bool,
+    redis_configured: bool,
+) -> Result<(), &'static str> {
+    if !hardened {
+        return Ok(());
+    }
+    if !distributed {
+        return Err(
+            "TALOS_DISTRIBUTED_REPLAY is off: a deployment that faces users requires the \
+                    distributed replay guard (set TALOS_DISTRIBUTED_REPLAY=true with REDIS_URL)",
+        );
+    }
+    if !redis_configured {
+        return Err(
+            "REDIS_URL is unset: the distributed replay guard a deployment that faces \
+                    users requires has no store",
+        );
+    }
+    Ok(())
+}
+
+/// [`boot_requirement`] for this process's environment.
+pub fn boot_requirement_from_env(hardened: bool) -> Result<(), &'static str> {
+    let redis_configured = std::env::var("REDIS_URL").is_ok_and(|v| !v.trim().is_empty());
+    boot_requirement(hardened, distributed_replay_from_env(), redis_configured)
+}
+
 /// What a process does with a nonce the shared store must vouch for: whether
 /// a shared guard is meant to be there ([`DISTRIBUTED_REPLAY`]) and whether a
 /// store that cannot answer refuses ([`fail_closed_from_env`]).
@@ -419,6 +458,27 @@ pub fn guard_state() -> GuardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D2-B: a deployment that faces users does not boot without the shared
+    /// guard; development is unchanged.
+    #[test]
+    fn a_hardened_deployment_requires_the_distributed_guard() {
+        assert_eq!(boot_requirement(true, true, true), Ok(()));
+        assert!(boot_requirement(true, false, true)
+            .unwrap_err()
+            .contains("TALOS_DISTRIBUTED_REPLAY is off"));
+        assert!(boot_requirement(true, true, false)
+            .unwrap_err()
+            .contains("REDIS_URL is unset"));
+        assert!(boot_requirement(true, false, false).is_err());
+        for (d, r) in [(false, false), (false, true), (true, false), (true, true)] {
+            assert_eq!(
+                boot_requirement(false, d, r),
+                Ok(()),
+                "development: {d} {r}"
+            );
+        }
+    }
 
     /// Test double: a guard that never sees a replay. (The in-process
     /// reference implementation had no production caller and was deleted;

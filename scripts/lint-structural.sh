@@ -9752,11 +9752,10 @@ CK103_ALLOWED=(
     # The definition's own crate (is_development, the origin parser's arg).
     talos-config/src/lib.rs
     # Boot posture gates: RLS, DB sandbox, dispatch scheme, backend TLS,
-    # env-KEK, worker key, admin-query login, non-dumpable process.
+    # env-KEK, worker key, admin-query login.
     controller/src/bootstrap/services.rs
     controller/src/bootstrap/admin_query_login.rs
     controller/src/cli.rs
-    controller/src/main.rs
     talos-advanced-repository/src/lib.rs
     talos-config-validator/src/lib.rs
     talos-db/src/lib.rs
@@ -9773,7 +9772,6 @@ CK103_ALLOWED=(
     # Supply chain: Sigstore policy, registry TLS downgrade, compilation.
     talos-registry/src/sync.rs
     talos-compilation/src/advisory_db.rs
-    talos-compilation/src/container.rs
     talos-compilation/src/lib.rs
     # The worker process (no browser surface). host/limits.rs (dev egress
     # opt-ins) and host/secrets.rs (tier-2 expose cap) face tenants and are

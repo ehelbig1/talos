@@ -46,6 +46,12 @@ pub(crate) async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>
     // outside production.
     talos_rpc_subscribers::enforce_production_db_sandbox_posture(config::is_production())?;
 
+    // Operator decision D2-B (2026-10-15): a deployment that faces users
+    // (production, and staging as `docker-compose.prod.yml` runs it) does not
+    // boot without the distributed replay guard. No acknowledgement waives it.
+    talos_replay_guard::boot_requirement_from_env(talos_auth_types::browser_hardening_required())
+        .map_err(|e| anyhow::anyhow!(e))?;
+
     // Security review 2026-10-14 (B-2): production does not accept the
     // fleet-shared WORKER_SHARED_KEY on the two surfaces this process verifies
     // (job results, signed RPC) unless TALOS_ALLOW_LEGACY_FLEET_HMAC names
