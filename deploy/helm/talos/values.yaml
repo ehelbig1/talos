@@ -744,6 +744,13 @@ controller:
 worker:
   enabled: true
   replicaCount: 2
+  # The bootstrap Secret key the worker's REDIS_URL is read from. Set it to
+  # WORKER_REDIS_URL (install.sh does, when TALOS_WORKER_REDIS_URL is given)
+  # so the worker logs in as its own Redis user, limited to its key families
+  # by deploy/redis/worker.acl-rules — see docs/redis-worker-user.md. With
+  # REDIS_URL the worker shares the controller's credential and says so at
+  # boot (E2-6, 2026-10-15).
+  redisUrlSecretKey: REDIS_URL
   # Pod stop timeout. The worker drains in-flight jobs for up to 30 s on
   # SIGTERM; this must stay above that.
   terminationGracePeriodSeconds: 40

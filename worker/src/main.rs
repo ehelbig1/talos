@@ -41,6 +41,8 @@ mod inference_wait_pin;
 #[cfg(test)]
 mod outbound_tls_pin;
 #[cfg(test)]
+mod redis_acl_contract;
+#[cfg(test)]
 mod rehearsal_pin;
 mod rejected_jobs;
 #[cfg(test)]
@@ -1272,6 +1274,49 @@ fn worker_result_signing_key() -> Option<&'static talos_workflow_job_protocol::D
 /// (`TALOS_REPLAY_FAIL_CLOSED`). With the switch off the process-local nonce
 /// cache is the whole defence, as before.
 ///
+/// Whether the Redis user this worker logged in as is the shared one
+/// (security review 2026-10-15, E2-6): `default` is the controller's, and with
+/// it a compromised worker writes any key the controller reads — a module's
+/// cached bytes, the controller's replay nonces, its idempotency records. The
+/// worker's own user is `talos-worker` with deploy/redis/worker.acl-rules.
+fn redis_user_is_shared(user: &str) -> bool {
+    user.trim() == "default"
+}
+
+/// Said once at boot, loudly where the deployment faces users. Not a refusal:
+/// a managed Redis without ACL users (or a chart install that has not given
+/// the worker `WORKER_REDIS_URL`) keeps working, and says so.
+async fn report_redis_identity(conn: &mut redis::aio::MultiplexedConnection) {
+    let who: redis::RedisResult<String> = redis::cmd("ACL").arg("WHOAMI").query_async(conn).await;
+    match who {
+        Ok(user) if redis_user_is_shared(&user) => {
+            if talos_auth_types::browser_hardening_required() {
+                ::tracing::warn!(
+                    target: "talos_security",
+                    event_kind = "worker_redis_shared_credential",
+                    "the worker connects to Redis as `default`, the controller's user: a \
+                     compromised worker can write keys the controller reads. Give it the \
+                     `talos-worker` user (deploy/redis/worker.acl-rules, docs/redis-worker-user.md)"
+                );
+            }
+        }
+        Ok(user) => ::tracing::info!(target: "talos_security", redis_user = %user, "Redis user"),
+        Err(e) => {
+            ::tracing::debug!(error = %e, "ACL WHOAMI not answered (Redis without ACL users)")
+        }
+    }
+}
+
+#[cfg(test)]
+mod redis_identity_tests {
+    #[test]
+    fn only_the_default_user_is_the_shared_one() {
+        assert!(super::redis_user_is_shared("default"));
+        assert!(super::redis_user_is_shared(" default\n"));
+        assert!(!super::redis_user_is_shared("talos-worker"));
+    }
+}
+
 /// B2-2 (2026-10-15): with the switch on, the guard is registered whether or
 /// not Redis answers at boot. Until Redis answers, every dispatch is
 /// `store_unavailable` — refused when failing closed, the production default —
@@ -3057,11 +3102,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(client) => {
                 // Test connection
                 match talos_redis::multiplexed(&client).await {
-                    Ok(_) => {
+                    Ok(mut conn) => {
                         println!(
                             "      Connected to Redis at {}",
                             redis_url.split('@').next_back().unwrap_or("redis")
                         );
+                        report_redis_identity(&mut conn).await;
                         Some(Arc::new(client))
                     }
                     Err(e) => {

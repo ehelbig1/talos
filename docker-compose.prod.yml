@@ -95,14 +95,21 @@ services:
   redis:
     image: redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6
     container_name: talos-redis-prod
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env.production}
+    # Two users (security review 2026-10-15, E2-6): `default` for the
+    # controller, and `talos-worker` limited to the worker's key families and
+    # commands (deploy/redis/worker.acl-rules, created by start.sh).
+    entrypoint: ["/bin/sh", "/etc/talos-redis/start.sh"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env.production}
+      REDIS_WORKER_PASSWORD: ${REDIS_WORKER_PASSWORD:?REDIS_WORKER_PASSWORD required in .env.production}
     # ✅ SECURITY: NO port exposure — internal Docker network only
     security_opt:
       - "no-new-privileges:true"
     volumes:
       - redis_data:/data
+      - ./deploy/redis:/etc/talos-redis:ro
     healthcheck:
-      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD --no-auth-warning ping | grep -q PONG"]
       interval: 10s
       timeout: 3s
       retries: 5
@@ -307,7 +314,8 @@ services:
       # Same RUST_ENV as the controller, for the same reason (header).
       RUST_ENV: staging
       NATS_URL: nats://nats:4222
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # Its own Redis user (E2-6): the worker reaches only its key families.
+      REDIS_URL: redis://talos-worker:${REDIS_WORKER_PASSWORD:?REDIS_WORKER_PASSWORD required in .env.production}@redis:6379
       # The WORKER NATS credential (nats.conf binds it to WORKER_PERMISSIONS).
       NATS_USER: ${NATS_WORKER_USER:?NATS_WORKER_USER required in .env.production}
       NATS_PASSWORD: ${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env.production}

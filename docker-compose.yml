@@ -205,13 +205,20 @@ services:
           cpus: '0.1'
     image: redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6
     container_name: talos-redis
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+    # Two users (security review 2026-10-15, E2-6): `default` for the
+    # controller, and `talos-worker` limited to the worker's key families and
+    # commands (deploy/redis/worker.acl-rules, created by start.sh).
+    entrypoint: ["/bin/sh", "/etc/talos-redis/start.sh"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env}
+      REDIS_WORKER_PASSWORD: ${REDIS_WORKER_PASSWORD:?REDIS_WORKER_PASSWORD required in .env — run `make up` (back-fills it) or `make setup`}
     ports:
       # DEVELOPMENT: Port exposed for debugging
       # PRODUCTION: Remove this port mapping
       - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
+      - ./deploy/redis:/etc/talos-redis:ro
     healthcheck:
       test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping"]
       interval: 10s
@@ -1034,7 +1041,8 @@ services:
       # "failed to fetch wasm module from redis (not found or redis
       # unavailable)" because the controller dispatcher emits a `redis:` URI
       # that the worker can only resolve against an actual Redis client.
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # Its own Redis user (E2-6): the worker reaches only its key families.
+      REDIS_URL: redis://talos-worker:${REDIS_WORKER_PASSWORD:?REDIS_WORKER_PASSWORD required in .env — run `make up` (back-fills it) or `make setup`}@redis:6379
       RUST_LOG: info,worker=debug
       # ── DO NOT ADD `JAEGER_ENDPOINT` HERE. Trace export is deliberately OFF. ──
       #
