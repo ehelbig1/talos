@@ -83,12 +83,12 @@ export default function WorkflowCard({
     : undefined;
 
   const actionButton =
-    "flex items-center justify-center gap-2 h-9 rounded-lg text-xs font-medium transition-premium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30";
+    "flex items-center justify-center gap-2 h-9 rounded-lg text-xs font-medium transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30";
 
   return (
     <div
       className={cn(
-        "group relative flex flex-col gap-5 p-6 rounded-2xl bg-surface-3/60 border border-white/10 transition-premium hover:border-white/20",
+        "group relative flex flex-col gap-5 p-6 rounded-2xl bg-surface-3/60 border border-white/10 transition-ui hover:border-white/20",
         isRunning && "ring-1 ring-primary/30",
       )}
     >
@@ -131,7 +131,7 @@ export default function WorkflowCard({
             onRun();
           }}
           className={cn(
-            "w-10 h-10 shrink-0 flex items-center justify-center rounded-xl transition-premium active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
+            "w-10 h-10 shrink-0 flex items-center justify-center rounded-xl transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
             isRunning
               ? "bg-surface-4/60 text-muted-foreground cursor-not-allowed border border-white/5"
               : "bg-primary text-white hover:bg-primary/90",

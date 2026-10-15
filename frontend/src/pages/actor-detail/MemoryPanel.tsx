@@ -176,7 +176,7 @@ function MemoryEntryRow({
               onClick={handleExtend}
               disabled={extending}
               title="Refresh TTL to full duration"
-              className="text-xs text-muted-foreground/70 hover:text-emerald-400 transition-premium px-1.5 py-0.5 rounded disabled:opacity-40"
+              className="text-xs text-muted-foreground/70 hover:text-emerald-400 transition-ui px-1.5 py-0.5 rounded disabled:opacity-40"
             >
               {extending ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -188,7 +188,7 @@ function MemoryEntryRow({
           {isMultiline && (
             <button
               onClick={() => setExpanded((v) => !v)}
-              className="p-1 text-muted-foreground/70 hover:text-muted-foreground transition-premium"
+              className="p-1 text-muted-foreground/70 hover:text-muted-foreground transition-ui"
               aria-label={expanded ? "Collapse" : "Expand"}
             >
               {expanded ? (
@@ -200,7 +200,7 @@ function MemoryEntryRow({
           )}
           <button
             onClick={() => onEdit(entry)}
-            className="p-1 text-muted-foreground/70 hover:text-violet-400 transition-premium"
+            className="p-1 text-muted-foreground/70 hover:text-violet-400 transition-ui"
             aria-label="Edit"
           >
             <Pencil className="w-3.5 h-3.5" />
@@ -208,7 +208,7 @@ function MemoryEntryRow({
           <button
             onClick={() => onDelete(entry.key)}
             disabled={deleting}
-            className="p-1 text-muted-foreground/70 hover:text-red-400 transition-premium disabled:opacity-40"
+            className="p-1 text-muted-foreground/70 hover:text-red-400 transition-ui disabled:opacity-40"
             aria-label="Delete"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -310,7 +310,7 @@ function MemoryForm({
               key={t}
               onClick={() => setMemType(t)}
               className={cn(
-                "text-xs px-3 py-1.5 rounded-lg border transition-premium font-medium",
+                "text-xs px-3 py-1.5 rounded-lg border transition-ui font-medium",
                 memType === t
                   ? `${MEMORY_TYPE_META[t].color} ${MEMORY_TYPE_META[t].bg} border-current/30`
                   : "text-muted-foreground bg-background border-white/10 hover:border-white/20",
@@ -352,7 +352,7 @@ function MemoryForm({
       <div className="flex justify-end gap-2">
         <button
           onClick={onCancel}
-          className="text-xs text-muted-foreground hover:text-white px-3 py-1.5 rounded-lg border border-white/10 hover:border-white/20 transition-premium"
+          className="text-xs text-muted-foreground hover:text-white px-3 py-1.5 rounded-lg border border-white/10 hover:border-white/20 transition-ui"
         >
           Cancel
         </button>
@@ -361,7 +361,7 @@ function MemoryForm({
           disabled={
             isPending || !key.trim() || !value.trim() || jsonError !== null
           }
-          className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg transition-premium"
+          className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg transition-ui"
         >
           <Save className="w-3.5 h-3.5" />
           {isPending ? "Saving…" : "Save"}
@@ -540,12 +540,12 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             value={memSearch}
             onChange={(e) => setMemSearch(e.target.value)}
             placeholder="Search key or value…"
-            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 transition-premium"
+            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 transition-ui"
           />
           {memSearch && (
             <button
               onClick={() => setMemSearch("")}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground/70 hover:text-white transition-premium"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground/70 hover:text-white transition-ui"
             >
               <X className="w-3.5 h-3.5" />
             </button>
@@ -559,7 +559,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
           <button
             onClick={() => setFilterType("all")}
             className={cn(
-              "text-xs px-2.5 py-1 rounded-lg border transition-premium",
+              "text-xs px-2.5 py-1 rounded-lg border transition-ui",
               filterType === "all"
                 ? "bg-surface-4/60 text-white border-white/10"
                 : "text-muted-foreground border-transparent hover:bg-surface-3/60",
@@ -576,7 +576,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
                 key={t}
                 onClick={() => setFilterType(t)}
                 className={cn(
-                  "text-xs px-2.5 py-1 rounded-lg border transition-premium",
+                  "text-xs px-2.5 py-1 rounded-lg border transition-ui",
                   filterType === t
                     ? `${meta.color} ${meta.bg} border-current/20`
                     : "text-muted-foreground border-transparent hover:bg-surface-3/60",
@@ -592,7 +592,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             <button
               onClick={handleExport}
               title="Export memories as JSON"
-              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-premium"
+              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-ui"
             >
               <Download className="w-3.5 h-3.5" />
               Export
@@ -602,7 +602,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             onClick={() => importRef.current?.click()}
             disabled={isImporting}
             title="Import memories from JSON"
-            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-premium disabled:opacity-50"
+            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-ui disabled:opacity-50"
           >
             <Upload className="w-3.5 h-3.5" />
             {isImporting ? "Importing…" : "Import"}
@@ -620,7 +620,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
                 setEditing(null);
                 setShowForm(true);
               }}
-              className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 text-white px-3 py-1.5 rounded-lg transition-premium"
+              className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 text-white px-3 py-1.5 rounded-lg transition-ui"
             >
               <Plus className="w-3.5 h-3.5" />
               Add memory
@@ -642,7 +642,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
           <p className="text-muted-foreground/70 text-sm">No memories yet.</p>
           <button
             onClick={() => setShowForm(true)}
-            className="text-xs text-violet-400 hover:text-violet-300 transition-premium"
+            className="text-xs text-violet-400 hover:text-violet-300 transition-ui"
           >
             Add the first memory →
           </button>
@@ -657,7 +657,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
               setMemSearch("");
               setFilterType("all");
             }}
-            className="text-xs text-violet-400 hover:text-violet-300 transition-premium"
+            className="text-xs text-violet-400 hover:text-violet-300 transition-ui"
           >
             Clear filters →
           </button>

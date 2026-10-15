@@ -279,7 +279,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
   const Icon = meta.icon;
 
   return (
-    <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 flex flex-col gap-4 transition-premium hover:border-white/10 group relative overflow-hidden">
+    <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 flex flex-col gap-4 transition-ui hover:border-white/10 group relative overflow-hidden">
       <div className="flex items-start justify-between gap-3 relative z-10">
         <div className="flex items-center gap-3">
           <div className="w-11 h-11 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary shrink-0">
@@ -306,7 +306,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
 
       <button
         onClick={() => setShowRaw((s) => !s)}
-        className="relative z-10 self-start flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60 hover:text-muted-foreground/70 transition-premium"
+        className="relative z-10 self-start flex items-center gap-1.5 text-xs font-bold text-muted-foreground/60 hover:text-muted-foreground/70 transition-ui"
       >
         <ChevronDown
           className={cn(

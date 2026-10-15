@@ -149,7 +149,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
         aria-expanded={isOpen}
         aria-haspopup="true"
         className={cn(
-          "h-8 px-3 flex items-center gap-2 text-xs font-semibold rounded-xl transition-premium active:scale-[0.98] border whitespace-nowrap",
+          "h-8 px-3 flex items-center gap-2 text-xs font-semibold rounded-xl transition-ui border whitespace-nowrap",
           isOpen
             ? "bg-white/10 text-white border-white/20"
             : "bg-white/5 hover:bg-white/10 text-foreground border-white/10",
@@ -161,7 +161,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
 
       {isOpen && (
         <div
-          className="absolute top-full left-0 mt-2 z-50 bg-surface-3 border border-white/10 rounded-2xl py-2 min-w-[240px] overflow-hidden animate-in fade-in slide-in-from-top-2 duration-300 origin-top-left"
+          className="absolute top-full left-0 mt-2 z-50 bg-surface-3 border border-white/10 rounded-2xl py-2 min-w-[240px] overflow-hidden origin-top-left"
           role="menu"
           aria-label="Control flow nodes"
         >
@@ -178,7 +178,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
               onFocus={() => setActiveIndex(idx)}
               role="menuitem"
               className={cn(
-                "w-full text-left px-4 py-2.5 transition-premium group outline-none relative z-10",
+                "w-full text-left px-4 py-2.5 transition-ui group outline-none relative z-10",
                 activeIndex === idx ? "bg-white/5" : "hover:bg-white/[0.02]",
               )}
             >

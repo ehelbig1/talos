@@ -153,7 +153,7 @@ export function EndpointSelector({
 
   if (!selectedEndpoint) {
     return (
-      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 animate-in zoom-in-95 duration-500 relative overflow-hidden">
+      <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-8 space-y-6 relative overflow-hidden">
         <div className="flex items-center gap-3 relative z-10 mb-2">
           <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
             <Target className="h-4 w-4" />
@@ -167,18 +167,18 @@ export function EndpointSelector({
             <button
               key={`${endpoint.method}-${endpoint.path}`}
               onClick={() => handleSelectEndpoint(endpoint)}
-              className="p-5 bg-surface-3/60 hover:bg-surface-4 border border-white/5 hover:border-primary/40 rounded-2xl text-left transition-premium group active:scale-[0.98]"
+              className="p-5 bg-surface-3/60 hover:bg-surface-4 border border-white/5 hover:border-primary/40 rounded-2xl text-left transition-ui group"
             >
               <div className="flex items-center gap-4 mb-3">
                 <span
                   className={cn(
-                    "px-2.5 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium",
+                    "px-2.5 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-ui",
                     getMethodStyles(endpoint.method),
                   )}
                 >
                   {endpoint.method}
                 </span>
-                <code className="text-xs font-mono text-white/80 group-hover:text-primary transition-premium truncate">
+                <code className="text-xs font-mono text-white/80 group-hover:text-primary transition-ui truncate">
                   {endpoint.path}
                 </code>
               </div>
@@ -208,7 +208,7 @@ export function EndpointSelector({
     pathParameters.length + queryParameters.length + headerParameters.length;
 
   return (
-    <div className="bg-surface-2/60 border border-primary/20 rounded-2xl p-8 space-y-10 animate-in zoom-in-95 duration-500 relative overflow-hidden">
+    <div className="bg-surface-2/60 border border-primary/20 rounded-2xl p-8 space-y-10 relative overflow-hidden">
       <div className="relative z-10">
         <div className="flex justify-between items-start mb-6">
           <div className="space-y-4">
@@ -234,7 +234,7 @@ export function EndpointSelector({
           <button
             type="button"
             onClick={() => setSelectedEndpoint(null)}
-            className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
+            className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
           >
             <X className="h-5 w-5" />
           </button>
@@ -248,7 +248,7 @@ export function EndpointSelector({
             type="button"
             onClick={() => setActiveTab("params")}
             className={cn(
-              "pb-4 text-xs font-semibold transition-premium relative",
+              "pb-4 text-xs font-semibold transition-ui relative",
               activeTab === "params"
                 ? "text-primary"
                 : "text-muted-foreground/70 hover:text-white",
@@ -256,7 +256,7 @@ export function EndpointSelector({
           >
             Parameters
             {totalParams > 0 && (
-              <span className="ml-2 px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-full text-2xs animate-pulse">
+              <span className="ml-2 px-2 py-0.5 bg-primary/10 border border-primary/20 rounded-full text-2xs">
                 {totalParams}
               </span>
             )}
@@ -269,7 +269,7 @@ export function EndpointSelector({
               type="button"
               onClick={() => setActiveTab("body")}
               className={cn(
-                "pb-4 text-xs font-semibold transition-premium relative",
+                "pb-4 text-xs font-semibold transition-ui relative",
                 activeTab === "body"
                   ? "text-primary"
                   : "text-muted-foreground/70 hover:text-white",
@@ -287,7 +287,7 @@ export function EndpointSelector({
       {/* Tab Content */}
       <div className="relative z-10 min-h-[300px]">
         {activeTab === "params" && (
-          <div className="space-y-10 animate-in fade-in slide-in-from-left-4 duration-500">
+          <div className="space-y-10">
             {pathParameters.length > 0 && (
               <div className="space-y-4">
                 <div className="flex items-center gap-3 px-1">
@@ -361,7 +361,7 @@ export function EndpointSelector({
             )}
 
             {totalParams === 0 && (
-              <div className="py-20 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl animate-in fade-in">
+              <div className="py-20 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl">
                 <p className="text-xs font-semibold text-muted-foreground/50">
                   Zero Parameters Required for Operation
                 </p>
@@ -371,7 +371,7 @@ export function EndpointSelector({
         )}
 
         {activeTab === "body" && hasBody && (
-          <div className="space-y-6 animate-in fade-in slide-in-from-right-4 duration-500">
+          <div className="space-y-6">
             <div className="flex items-center gap-3 px-1">
               <FileText className="h-4 w-4 text-primary" />
               <h5 className="text-xs font-semibold text-white/60">
@@ -410,7 +410,7 @@ export function EndpointSelector({
                       placeholder={String(
                         prop.example || prop.default || `Enter ${key}...`,
                       ).toUpperCase()}
-                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium"
+                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui"
                     />
                   </div>
                 ))}
@@ -428,7 +428,7 @@ export function EndpointSelector({
                   }}
                   placeholder='{ "PAYLOAD": "METADATA" }'
                   rows={10}
-                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium outline-none custom-scrollbar"
+                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui outline-none custom-scrollbar"
                 />
               </div>
             )}
@@ -440,14 +440,14 @@ export function EndpointSelector({
       <div className="relative z-10 flex gap-4 pt-10 border-t border-white/5">
         <Button
           onClick={handleApplyConfiguration}
-          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-premium active:scale-95 flex items-center justify-center gap-3"
+          className="flex-1 h-14 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-ui flex items-center justify-center gap-3"
         >
           <Zap className="h-4 w-4" /> Finalize Configuration
         </Button>
         <Button
           onClick={() => setSelectedEndpoint(null)}
           variant="ghost"
-          className="h-14 px-10 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-premium active:scale-95"
+          className="h-14 px-10 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-ui"
         >
           Abort
         </Button>
@@ -510,7 +510,7 @@ function ParameterInput({
             `IDENTIFIER VALUE...`,
         ).toUpperCase()}
         required={parameter.required}
-        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium"
+        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui"
       />
     </div>
   );

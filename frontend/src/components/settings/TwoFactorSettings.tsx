@@ -130,7 +130,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           <div className="flex items-center gap-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-2xl flex items-center justify-center border transition-premium duration-700",
+                "w-16 h-16 rounded-2xl flex items-center justify-center border transition-ui",
                 enabled
                   ? "bg-primary/10 border-primary/20 text-primary"
                   : "bg-white/5 border-white/10 text-muted-foreground/50",
@@ -155,7 +155,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           {enabled && (
             <Button
               variant="outline"
-              className="h-12 px-6 text-destructive border-destructive/20 hover:bg-destructive/10 hover:border-destructive/40 rounded-xl font-semibold text-sm transition-premium"
+              className="h-12 px-6 text-destructive border-destructive/20 hover:bg-destructive/10 hover:border-destructive/40 rounded-xl font-semibold text-sm transition-ui"
               onClick={() => setShowDisableConfirm(true)}
             >
               Turn off
@@ -164,7 +164,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
         </div>
 
         {enabled ? (
-          <div className="bg-success/5 border border-success/20 rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6 animate-in fade-in slide-in-from-top-4 duration-500">
+          <div className="bg-success/5 border border-success/20 rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6">
             <div className="flex items-center gap-6">
               <div className="w-14 h-14 rounded-2xl bg-success/10 flex items-center justify-center text-success">
                 <Check className="w-7 h-7" />
@@ -193,10 +193,10 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             />
           </div>
         ) : step === "initial" ? (
-          <div className="space-y-10 animate-in fade-in duration-700">
+          <div className="space-y-10">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
-              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-premium relative overflow-hidden">
-                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-premium relative z-10">
+              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-ui relative overflow-hidden">
+                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-ui relative z-10">
                   <Smartphone className="w-6 h-6" />
                 </div>
                 <h4 className="text-sm font-semibold text-white mb-3 relative z-10">
@@ -208,8 +208,8 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 </p>
               </div>
 
-              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-premium relative overflow-hidden">
-                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-premium relative z-10">
+              <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-ui relative overflow-hidden">
+                <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-ui relative z-10">
                   <Lock className="w-6 h-6" />
                 </div>
                 <h4 className="text-sm font-semibold text-white mb-3 relative z-10">
@@ -239,7 +239,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             </Button>
           </div>
         ) : step === "setup" && setupData ? (
-          <div className="space-y-10 animate-in fade-in slide-in-from-right-8 duration-700">
+          <div className="space-y-10">
             <div className="flex flex-col lg:flex-row items-stretch gap-10">
               <div className="bg-white p-6 rounded-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
                 <img
@@ -286,7 +286,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                         variant="ghost"
                         size="icon"
                         onClick={copySecret}
-                        className="h-10 w-10 hover:bg-primary/10 hover:text-primary transition-premium rounded-xl"
+                        className="h-10 w-10 hover:bg-primary/10 hover:text-primary transition-ui rounded-xl"
                       >
                         {isCopying ? (
                           <Check className="w-4 h-4 text-success" />
@@ -303,7 +303,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             <div className="pt-8 flex items-center justify-between border-t border-white/5">
               <Button
                 variant="ghost"
-                className="text-xs font-semibold text-muted-foreground/70 hover:text-white transition-premium"
+                className="text-xs font-semibold text-muted-foreground/70 hover:text-white transition-ui"
                 onClick={() => setStep("initial")}
               >
                 <ArrowLeft className="w-4 h-4 mr-3" />
@@ -319,7 +319,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             </div>
           </div>
         ) : step === "verify" ? (
-          <div className="space-y-10 animate-in fade-in zoom-in-95 duration-700 max-w-md mx-auto py-4">
+          <div className="space-y-10 max-w-md mx-auto py-4">
             <div className="text-center space-y-6">
               <div className="w-24 h-24 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-8 border border-primary/20 relative group">
                 <QrCode className="w-12 h-12 text-primary relative z-10" />
@@ -338,7 +338,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   type="text"
                   placeholder="000000"
                   maxLength={6}
-                  className="text-center text-4xl tracking-[0.8em] font-semibold h-24 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-2xl transition-premium text-white placeholder:text-white/5"
+                  className="text-center text-4xl tracking-[0.8em] font-semibold h-24 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-2xl transition-ui text-white placeholder:text-white/5"
                   value={verificationCode}
                   onChange={(e) =>
                     setVerificationCode(e.target.value.replace(/\D/g, ""))

@@ -179,10 +179,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
           const color = STATUS_COLORS[bar.status];
 
           return (
-            <g
-              key={`${bar.nodeId}-${i}`}
-              className="group/bar transition-premium"
-            >
+            <g key={`${bar.nodeId}-${i}`} className="group/bar transition-ui">
               {/* Row background hover */}
               <rect
                 x={0}
@@ -191,7 +188,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 height={ROW_HEIGHT}
                 fill="white"
                 fillOpacity={0}
-                className="group-hover/bar:fill-white/[0.02] transition-premium"
+                className="group-hover/bar:fill-white/[0.02] transition-ui"
               />
 
               {/* Node label */}
@@ -199,7 +196,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 x={LABEL_WIDTH - 20}
                 y={y + ROW_HEIGHT / 2 - 2}
                 textAnchor="end"
-                className="fill-white/40 group-hover/bar:fill-white font-semibold text-xs transition-premium"
+                className="fill-white/40 group-hover/bar:fill-white font-semibold text-xs transition-ui"
               >
                 {bar.nodeName.length > 24
                   ? bar.nodeName.slice(0, 22) + "..."
@@ -227,7 +224,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
                 rx={6}
                 fill={color}
                 className={cn(
-                  "transition-premium",
+                  "transition-ui",
                   bar.status === "running" && "animate-pulse",
                 )}
               />
@@ -236,7 +233,7 @@ export function ExecutionWaterfall({ events, nodeNames }: WaterfallProps) {
               <text
                 x={barX + barW + 12}
                 y={y + ROW_HEIGHT / 2 - 2}
-                className="fill-white/20 font-mono text-2xs font-bold group-hover/bar:fill-white/60 transition-premium"
+                className="fill-white/20 font-mono text-2xs font-bold group-hover/bar:fill-white/60 transition-ui"
               >
                 {bar.durationMs >= 1000
                   ? `${(bar.durationMs / 1000).toFixed(1)}S`

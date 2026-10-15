@@ -78,7 +78,7 @@ export function CreateSecretDialog({
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. OpenAI Production Key"
                 required
-                className="bg-background/50 border-border focus:border-primary/50 transition-premium"
+                className="bg-background/50 border-border focus:border-primary/50 transition-ui"
               />
             </FormField>
 
@@ -91,7 +91,7 @@ export function CreateSecretDialog({
                 onChange={(e) => setKeyPath(e.target.value)}
                 placeholder="e.g. openai/prod/api-key"
                 required
-                className="bg-background/50 border-border focus:border-primary/50 transition-premium"
+                className="bg-background/50 border-border focus:border-primary/50 transition-ui"
               />
             </FormField>
 
@@ -101,7 +101,7 @@ export function CreateSecretDialog({
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="What is this secret used for?"
                 rows={2}
-                className="bg-background/50 border-border focus:border-primary/50 transition-premium resize-none"
+                className="bg-background/50 border-border focus:border-primary/50 transition-ui resize-none"
               />
             </FormField>
 
@@ -113,12 +113,12 @@ export function CreateSecretDialog({
                   placeholder="sk-..."
                   required
                   type={showValue ? "text" : "password"}
-                  className="bg-background/50 border-border focus:border-primary/50 transition-premium pr-12"
+                  className="bg-background/50 border-border focus:border-primary/50 transition-ui pr-12"
                 />
                 <button
                   type="button"
                   onClick={() => setShowValue(!showValue)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-premium p-1.5 hover:bg-accent rounded-md"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-ui p-1.5 hover:bg-accent rounded-md"
                   title={showValue ? "Hide value" : "Show value"}
                 >
                   {showValue ? (
@@ -147,14 +147,14 @@ export function CreateSecretDialog({
               type="button"
               variant="ghost"
               onClick={onClose}
-              className="text-muted-foreground hover:text-foreground hover:bg-accent font-semibold text-sm h-11 px-6 rounded-xl transition-premium"
+              className="text-muted-foreground hover:text-foreground hover:bg-accent font-semibold text-sm h-11 px-6 rounded-xl transition-ui"
             >
               Cancel
             </Button>
             <Button
               type="submit"
               disabled={!name || !keyPath || !value || createMutation.isPending}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground px-8 h-11 border-b-4 border-primary/50 active:scale-95 transition-premium font-semibold text-sm rounded-xl"
+              className="bg-primary hover:bg-primary/90 text-primary-foreground px-8 h-11 border-b-4 border-primary/50 transition-ui font-semibold text-sm rounded-xl"
             >
               {createMutation.isPending ? (
                 <div className="flex items-center gap-2">

@@ -70,7 +70,7 @@ interface ResultBoxProps {
 
 function ResultBox({ children }: ResultBoxProps) {
   return (
-    <div className="mt-6 flex items-start gap-4 p-5 bg-success/5 border border-success/20 rounded-2xl animate-in fade-in slide-in-from-top-2 duration-500">
+    <div className="mt-6 flex items-start gap-4 p-5 bg-success/5 border border-success/20 rounded-2xl">
       <CheckCircle2 className="w-5 h-5 text-success shrink-0 mt-0.5" />
       <div className="text-xs text-success/80 leading-relaxed">{children}</div>
     </div>
@@ -97,13 +97,13 @@ function RotateDekCard() {
     <>
       <div
         className={cn(
-          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden",
+          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-ui group relative overflow-hidden",
           result && "border-success/20",
         )}
       >
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary shrink-0 transition-premium">
+            <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary shrink-0 transition-ui">
               <KeyRound size={28} />
             </div>
             <div>
@@ -195,13 +195,13 @@ function ReEncryptSecretsCard() {
     <>
       <div
         className={cn(
-          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden",
+          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-ui group relative overflow-hidden",
           result && "border-success/20",
         )}
       >
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-premium">
+            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-ui">
               <Lock size={28} />
             </div>
             <div>
@@ -303,14 +303,14 @@ function RotateMasterKeyCard() {
   return (
     <div
       className={cn(
-        "bg-black/40 border-2 rounded-2xl p-10 overflow-hidden relative transition-premium group",
+        "bg-black/40 border-2 rounded-2xl p-10 overflow-hidden relative transition-ui group",
         result ? "border-success/20" : "border-destructive/20",
       )}
     >
       <div className="relative z-10 space-y-8">
         {/* Title row */}
         <div className="flex items-start gap-6">
-          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 transition-premium">
+          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 transition-ui">
             <ShieldAlert size={32} />
           </div>
           <div>
@@ -370,7 +370,7 @@ function RotateMasterKeyCard() {
                   setNewMasterKey(e.target.value)
                 }
                 className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-premium",
+                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-ui",
                   newMasterKey.length > 0 &&
                     !isKeyValid &&
                     "border-destructive/40 focus:border-destructive/60",
@@ -380,7 +380,7 @@ function RotateMasterKeyCard() {
               <button
                 type="button"
                 onClick={() => setShowKey((v) => !v)}
-                className="absolute inset-y-0 right-5 flex items-center text-muted-foreground/70 hover:text-white transition-premium"
+                className="absolute inset-y-0 right-5 flex items-center text-muted-foreground/70 hover:text-white transition-ui"
               >
                 {showKey ? <EyeOff size={18} /> : <Eye size={18} />}
               </button>
@@ -412,7 +412,7 @@ function RotateMasterKeyCard() {
                   setConfirmPhrase(e.target.value)
                 }
                 className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium",
+                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui",
                   isConfirmed && "border-success/40",
                 )}
               />
@@ -426,7 +426,7 @@ function RotateMasterKeyCard() {
             onClick={handleSubmit}
             disabled={!canSubmit}
             variant="premium"
-            className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-premium"
+            className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
@@ -482,13 +482,13 @@ function RotateEncryptionKeyCard() {
     <>
       <div
         className={cn(
-          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden",
+          "bg-white/[0.02] border border-white/5 rounded-2xl p-8 hover:bg-white/[0.04] hover:border-white/10 transition-ui group relative overflow-hidden",
           rotatedCount !== null && "border-success/20",
         )}
       >
         <div className="flex items-start justify-between gap-8 relative z-10">
           <div className="flex items-start gap-6">
-            <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground shrink-0 transition-premium">
+            <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground shrink-0 transition-ui">
               <RotateCcw size={28} />
             </div>
             <div>
@@ -556,7 +556,7 @@ function RotateEncryptionKeyCard() {
 
 export default function SecurityManager() {
   return (
-    <div className="max-w-6xl mx-auto py-4 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
+    <div className="max-w-6xl mx-auto py-4 space-y-10">
       {/* Page header */}
       <div className="flex items-center gap-6">
         <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive relative">
@@ -609,7 +609,7 @@ export default function SecurityManager() {
 
       {/* Info footer */}
       <div className="flex items-start gap-6 p-8 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
-        <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground/70 shrink-0 relative z-10 transition-premium">
+        <div className="w-14 h-14 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-muted-foreground/70 shrink-0 relative z-10 transition-ui">
           <Info size={28} />
         </div>
         <div className="relative z-10">

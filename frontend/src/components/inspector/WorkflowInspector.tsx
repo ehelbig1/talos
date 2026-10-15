@@ -69,13 +69,13 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
             onClick={t.onClick}
             disabled={!t.onClick}
             className={cn(
-              "w-full flex items-center gap-4 px-4 py-3 rounded-2xl border border-white/5 bg-white/[0.02] hover:bg-white/[0.04] transition-premium text-left disabled:opacity-40 disabled:cursor-default group relative overflow-hidden",
+              "w-full flex items-center gap-4 px-4 py-3 rounded-2xl border border-white/5 bg-white/[0.02] hover:bg-white/[0.04] transition-ui text-left disabled:opacity-40 disabled:cursor-default group relative overflow-hidden",
               t.onClick && "hover:border-white/10",
             )}
           >
             <div
               className={cn(
-                "p-2 rounded-xl bg-white/5 border border-white/10 transition-premium",
+                "p-2 rounded-xl bg-white/5 border border-white/10 transition-ui",
                 t.color,
               )}
             >
@@ -90,7 +90,7 @@ function TriggersSection({ workflowId }: { workflowId: string | null }) {
               </p>
             </div>
             {t.onClick && (
-              <span className="text-2xs text-primary font-semibold uppercase tracking-wider opacity-0 group-hover:opacity-100 transition-premium">
+              <span className="text-2xs text-primary font-semibold uppercase tracking-wider opacity-0 group-hover:opacity-100 transition-ui">
                 CONFIGURE →
               </span>
             )}
@@ -190,7 +190,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5 animate-in slide-in-from-right duration-500">
+    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5">
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
@@ -209,7 +209,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95"
+          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-ui"
         >
           <X className="h-5 w-5" />
         </button>
@@ -223,14 +223,14 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
             <TabsTrigger
               value="info"
-              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-ui"
             >
               <Info className="w-3.5 h-3.5 mr-2 opacity-40" />
               Manifest
             </TabsTrigger>
             <TabsTrigger
               value="executions"
-              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-ui"
             >
               <Clock className="w-3.5 h-3.5 mr-2 opacity-40" />
               History
@@ -240,7 +240,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
         <TabsContent
           value="info"
-          className="flex-1 min-h-0 overflow-auto p-8 space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500 custom-scrollbar focus:outline-none"
+          className="flex-1 min-h-0 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
         >
           <div className="space-y-4">
             <label className="text-xs text-muted-foreground/60 font-semibold ml-1">
@@ -282,7 +282,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           )}
 
           <div className="grid grid-cols-2 gap-4">
-            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl bg-surface-3 border border-white/10 group hover:bg-white/[0.04] transition-premium">
+            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl bg-surface-3 border border-white/10 group hover:bg-white/[0.04] transition-ui">
               <div className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold mb-3">
                 Nodes
               </div>
@@ -293,7 +293,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                 </div>
               </div>
             </div>
-            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl bg-surface-3 border border-white/10 group hover:bg-white/[0.04] transition-premium">
+            <div className="p-6 bg-white/[0.02] border border-white/5 rounded-2xl bg-surface-3 border border-white/10 group hover:bg-white/[0.04] transition-ui">
               <div className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold mb-3">
                 Edges
               </div>
@@ -310,7 +310,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
 
           <div className="p-8 bg-primary/5 border border-primary/10 rounded-2xl space-y-8 relative overflow-hidden group">
             <h4 className="text-xs font-semibold text-white flex items-center gap-4 font-outfit relative z-10">
-              <div className="p-2.5 rounded-2xl bg-primary/10 border border-primary/20 transition-premium">
+              <div className="p-2.5 rounded-2xl bg-primary/10 border border-primary/20 transition-ui">
                 <Zap className="w-5 h-5 text-primary" />
               </div>
               Limits
@@ -330,7 +330,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     onChange={(e) =>
                       setMaxConcurrentExecutions(parseInt(e.target.value) || 1)
                     }
-                    className="w-24 bg-black/40 border border-white/5 rounded-2xl px-6 py-3 text-sm focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium font-semibold text-white"
+                    className="w-24 bg-black/40 border border-white/5 rounded-2xl px-6 py-3 text-sm focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui font-semibold text-white"
                   />
                   <div className="text-xs text-muted-foreground/50 font-bold italic">
                     Default: 1
@@ -348,7 +348,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     onChange={(e) =>
                       setPriority(e.target.value as "high" | "normal" | "low")
                     }
-                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60 text-white"
+                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer hover:bg-black/60 text-white"
                   >
                     <option value="low">Low</option>
                     <option value="normal">Normal</option>
@@ -364,7 +364,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     Intent Metadata (JSON)
                   </label>
                   {jsonError && (
-                    <span className="text-2xs text-destructive font-semibold animate-pulse uppercase tracking-wider bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
+                    <span className="text-2xs text-destructive font-semibold uppercase tracking-wider bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
                       Invalid JSON
                     </span>
                   )}
@@ -374,7 +374,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   onChange={handleJsonChange}
                   rows={6}
                   className={cn(
-                    "w-full bg-black/40 border transition-premium rounded-2xl p-6 text-xs font-mono focus:outline-none focus:ring-4 resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar",
+                    "w-full bg-black/40 border transition-ui rounded-2xl p-6 text-xs font-mono focus:outline-none focus:ring-4 resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar",
                     jsonError
                       ? "border-destructive/40 focus:ring-destructive/10"
                       : "border-white/5 focus:border-primary/40 focus:ring-primary/10",
@@ -387,7 +387,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
           </div>
 
           {!workflowId && (
-            <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl flex gap-5 bg-surface-3 border border-white/10 animate-status-pulse">
+            <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl flex gap-5 bg-surface-3 border border-white/10">
               <AlertTriangle className="w-6 h-6 text-warning shrink-0 mt-0.5" />
               <p className="text-xs text-warning/80 leading-relaxed">
                 This workflow is not saved yet. Save it to set up triggers and

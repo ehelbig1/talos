@@ -45,7 +45,7 @@ export function RoleChangeDialog({
 
           <div className="flex items-center justify-center">
             <div className="w-10 h-10 bg-primary/10 rounded-full flex items-center justify-center border border-primary/20">
-              <ArrowRightLeft className="w-4 h-4 text-primary animate-pulse" />
+              <ArrowRightLeft className="w-4 h-4 text-primary" />
             </div>
           </div>
 

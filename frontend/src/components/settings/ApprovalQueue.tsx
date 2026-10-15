@@ -123,7 +123,7 @@ export function ApprovalQueue() {
           type="button"
           onClick={() => setActiveTab("pending")}
           className={cn(
-            "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-premium",
+            "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-ui",
             activeTab === "pending"
               ? "bg-warning/10 text-warning border border-warning/20"
               : "text-muted-foreground/70 hover:text-white",
@@ -141,7 +141,7 @@ export function ApprovalQueue() {
           type="button"
           onClick={() => setActiveTab("decided")}
           className={cn(
-            "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-premium",
+            "flex-1 flex items-center justify-center gap-3 py-4 rounded-xl text-sm font-semibold transition-ui",
             activeTab === "decided"
               ? "bg-primary/10 text-primary border border-primary/20"
               : "text-muted-foreground/70 hover:text-white",
@@ -156,7 +156,7 @@ export function ApprovalQueue() {
         <div className="space-y-4 relative z-10">
           {pending.length === 0 ? (
             <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
-              <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-premium" />
+              <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-ui" />
               <p className="text-sm text-muted-foreground font-semibold">
                 All Systems Authorized
               </p>
@@ -168,11 +168,11 @@ export function ApprovalQueue() {
             pending.map((approval) => (
               <div
                 key={approval.id}
-                className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
+                className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-ui group relative overflow-hidden"
               >
                 <div className="flex items-center justify-between mb-5 relative z-10">
                   <div className="flex items-center gap-4">
-                    <div className="w-2.5 h-2.5 rounded-full bg-warning animate-status-pulse" />
+                    <div className="w-2.5 h-2.5 rounded-full bg-warning" />
                     <span className="text-xs font-semibold font-mono text-primary bg-primary/5 border border-primary/10 px-3 py-1 rounded-xl tracking-tighter">
                       Run {approval.executionId.slice(0, 12)}
                     </span>
@@ -187,7 +187,7 @@ export function ApprovalQueue() {
                   {approval.requiredFor.map((op: string) => (
                     <div
                       key={op}
-                      className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/40 border border-white/5 text-2xs font-semibold text-white uppercase tracking-wider group-hover:border-warning/30 transition-premium shadow-sm"
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/40 border border-white/5 text-2xs font-semibold text-white uppercase tracking-wider group-hover:border-warning/30 transition-ui shadow-sm"
                     >
                       <ShieldAlert className="w-3 h-3 text-warning" />
                       {op}
@@ -197,7 +197,7 @@ export function ApprovalQueue() {
 
                 <div className="grid grid-cols-2 gap-4 relative z-10">
                   <Button
-                    className="h-14 rounded-2xl font-semibold text-sm bg-success/10 hover:bg-success text-success hover:text-black border border-success/20 transition-premium"
+                    className="h-14 rounded-2xl font-semibold text-sm bg-success/10 hover:bg-success text-success hover:text-black border border-success/20 transition-ui"
                     onClick={() => handleDecision(approval.id, "approved")}
                   >
                     <Check className="w-4 h-4 mr-3" />
@@ -205,7 +205,7 @@ export function ApprovalQueue() {
                   </Button>
                   <Button
                     variant="ghost"
-                    className="h-14 rounded-2xl font-semibold text-sm text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 transition-premium"
+                    className="h-14 rounded-2xl font-semibold text-sm text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-transparent hover:border-destructive/20 transition-ui"
                     onClick={() => handleDecision(approval.id, "denied")}
                   >
                     <X className="w-4 h-4 mr-3" />
@@ -229,7 +229,7 @@ export function ApprovalQueue() {
             decided.map((approval) => (
               <div
                 key={approval.id}
-                className="bg-white/[0.01] border border-white/5 rounded-2xl p-6 opacity-60 hover:opacity-100 transition-premium grayscale hover:grayscale-0"
+                className="bg-white/[0.01] border border-white/5 rounded-2xl p-6 opacity-60 hover:opacity-100 transition-ui grayscale hover:grayscale-0"
               >
                 <div className="flex items-center justify-between mb-4">
                   <div className="flex items-center gap-4">
@@ -279,7 +279,7 @@ export function ApprovalQueue() {
                       ? approval.decidedBy.slice(0, 8)
                       : "the system"}
                   </div>
-                  <button className="flex items-center gap-2 text-2xs text-primary/70 hover:text-primary font-semibold uppercase tracking-wider transition-premium ml-auto">
+                  <button className="flex items-center gap-2 text-2xs text-primary/70 hover:text-primary font-semibold uppercase tracking-wider transition-ui ml-auto">
                     <ExternalLink className="w-3.5 h-3.5" />
                     View audit log
                   </button>
@@ -298,7 +298,7 @@ export function ApprovalQueue() {
           </p>
         </div>
         <div className="flex items-center gap-3">
-          <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+          <div className="w-2 h-2 rounded-full bg-success" />
           <span className="text-2xs text-muted-foreground/70 font-semibold uppercase tracking-wider">
             Live
           </span>

@@ -21,10 +21,10 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
   const isApproval = ev.status === "WAITING";
 
   return (
-    <div className="flex gap-6 group animate-in fade-in slide-in-from-left-4 duration-500">
+    <div className="flex gap-6 group">
       {/* Timestamp */}
       <div className="w-14 pt-1.5 shrink-0 text-right">
-        <span className="text-xs font-semibold font-mono text-muted-foreground/50 group-hover:text-primary transition-premium tracking-tighter">
+        <span className="text-xs font-semibold font-mono text-muted-foreground/50 group-hover:text-primary transition-ui tracking-tighter">
           +{formatDuration(ev.elapsedMs)}
         </span>
       </div>
@@ -34,20 +34,20 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
         <div className="relative z-10 flex flex-col items-center shrink-0 pt-2">
           <div
             className={cn(
-              "w-3 h-3 rounded-full border-2 bg-background transition-premium relative",
+              "w-3 h-3 rounded-full border-2 bg-background transition-ui relative",
               isFailed
                 ? "border-destructive"
                 : isCompleted
                   ? "border-success"
                   : isRunningStatus
-                    ? "border-primary animate-status-pulse"
+                    ? "border-primary"
                     : isApproval
                       ? "border-warning"
                       : "border-muted-foreground/10",
             )}
           >
             {isRunningStatus && (
-              <div className="absolute inset-0 rounded-full animate-ping bg-primary/20" />
+              <div className="absolute inset-0 rounded-full bg-primary/20" />
             )}
           </div>
         </div>
@@ -70,7 +70,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
             </span>
 
             {ev.nodeId && (
-              <span className="text-sm font-semibold text-white font-outfit tracking-tight truncate max-w-[220px] group-hover:text-primary transition-premium">
+              <span className="text-sm font-semibold text-white font-outfit tracking-tight truncate max-w-[220px] group-hover:text-primary transition-ui">
                 {nodeName}
               </span>
             )}
@@ -101,7 +101,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
                   href={`${import.meta.env.VITE_JAEGER_URL}${ev.traceId}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 hover:text-primary flex items-center gap-2 ml-auto transition-premium group/link"
+                  className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 hover:text-primary flex items-center gap-2 ml-auto transition-ui group/link"
                 >
                   <ExternalLink className="h-3 w-3 transition-transform" />
                   Open trace
@@ -111,8 +111,8 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
 
           {ev.logMessage && (
             <div className="mt-4 relative group/logbox">
-              <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/logbox:opacity-100 transition-premium pointer-events-none" />
-              <div className="relative bg-surface-4/40 rounded-2xl p-5 border border-white/5 bg-surface-3 border border-white/10 transition-premium group-hover:border-white/10 group-hover:bg-surface-4/60">
+              <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/logbox:opacity-100 transition-ui pointer-events-none" />
+              <div className="relative bg-surface-4/40 rounded-2xl p-5 border border-white/5 bg-surface-3 border border-white/10 transition-ui group-hover:border-white/10 group-hover:bg-surface-4/60">
                 <p className="text-xs leading-relaxed text-muted-foreground group-hover:text-white/80 transition-colors font-mono break-words selection:bg-primary/30">
                   {ev.logMessage}
                 </p>

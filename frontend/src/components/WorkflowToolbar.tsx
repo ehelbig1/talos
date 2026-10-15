@@ -324,7 +324,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             <Button
               variant="ghost"
               onClick={closeModal}
-              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
             >
               Cancel
             </Button>
@@ -378,7 +378,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
             <Button
               variant="ghost"
               onClick={closeModal}
-              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
             >
               Cancel
             </Button>

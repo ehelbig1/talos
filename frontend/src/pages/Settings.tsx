@@ -200,7 +200,7 @@ const SECTION_ITEMS: SidebarItem[] = ALL_ITEMS.filter((i) => !i.to);
 
 const sidebarItemClass = (isActive: boolean) =>
   cn(
-    "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-premium",
+    "w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-ui",
     isActive
       ? "bg-primary/10 text-primary"
       : "text-muted-foreground hover:text-foreground hover:bg-white/5",
@@ -237,13 +237,13 @@ function SettingsSidebar({
       {/* Search */}
       <div className="p-4 sticky top-0 bg-surface-2/80 z-10">
         <div className="relative group">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60 group-focus-within:text-primary transition-premium" />
+          <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/60 group-focus-within:text-primary transition-ui" />
           <input
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Find a setting…"
-            className="w-full bg-surface-4/60 border border-white/10 rounded-xl pl-10 pr-4 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium"
+            className="w-full bg-surface-4/60 border border-white/10 rounded-xl pl-10 pr-4 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui"
           />
         </div>
       </div>
@@ -312,7 +312,7 @@ function PanelLoading() {
   return (
     <div className="flex flex-col items-center justify-center py-24 gap-4">
       <div className="w-12 h-12 rounded-2xl bg-surface-4/60 border border-white/5 flex items-center justify-center relative overflow-hidden">
-        <div className="absolute inset-0 bg-primary/10 animate-pulse" />
+        <div className="absolute inset-0 bg-primary/10" />
         <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin relative z-10" />
       </div>
       <span className="text-sm text-muted-foreground">Loading…</span>
@@ -370,7 +370,7 @@ export default function Settings() {
           {ALL_ITEMS.map((item) => {
             const isActive = !item.to && active === item.value;
             const pill = cn(
-              "whitespace-nowrap text-xs font-medium px-3 py-2 rounded-full border transition-premium shrink-0",
+              "whitespace-nowrap text-xs font-medium px-3 py-2 rounded-full border transition-ui shrink-0",
               isActive
                 ? "bg-primary/10 text-primary border-primary/20"
                 : "bg-surface-4/60 text-muted-foreground border-white/5 hover:text-foreground",
@@ -402,7 +402,7 @@ export default function Settings() {
 
         {/* Content area */}
         <main className="flex-1 overflow-y-auto custom-scrollbar">
-          <div className="max-w-6xl mx-auto px-8 py-10 animate-in fade-in duration-300">
+          <div className="max-w-6xl mx-auto px-8 py-10">
             {active === "integrations" && (
               <ErrorBoundary>
                 <Suspense fallback={<PanelLoading />}>
@@ -522,7 +522,6 @@ export default function Settings() {
                 <div className="relative z-10 space-y-10">
                   <div className="flex items-center gap-6">
                     <div className="w-20 h-20 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center relative group/avatar">
-                      <div className="absolute inset-0 bg-primary/10 rounded-2xl scale-0 transition-transform duration-500" />
                       <UserIcon className="w-10 h-10 text-primary relative z-10" />
                     </div>
                     <div>
@@ -536,7 +535,7 @@ export default function Settings() {
                   </div>
 
                   <div className="grid gap-6">
-                    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 group/field hover:bg-surface-4/60 transition-premium">
+                    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 group/field hover:bg-surface-4/60 transition-ui">
                       <div className="min-w-0">
                         <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 block">
                           Signed in as
@@ -573,7 +572,7 @@ export default function Settings() {
                   <div className="pt-8 border-t border-white/5 flex justify-end">
                     <button
                       onClick={logout}
-                      className="px-4 h-10 text-sm font-medium border border-destructive/20 text-destructive hover:text-white hover:bg-destructive transition-premium rounded-xl"
+                      className="px-4 h-10 text-sm font-medium border border-destructive/20 text-destructive hover:text-white hover:bg-destructive transition-ui rounded-xl"
                     >
                       Sign out
                     </button>

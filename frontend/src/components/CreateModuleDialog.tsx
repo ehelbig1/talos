@@ -183,7 +183,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           {/* Search and Filter Bar */}
           <div className="flex items-center gap-4">
             <div className="relative flex-1 group">
-              <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70 group-focus-within:text-primary transition-premium" />
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70 group-focus-within:text-primary transition-ui" />
               <DarkInput
                 type="text"
                 placeholder="Search templates…"
@@ -195,7 +195,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               />
             </div>
             <div className="relative group">
-              <Filter className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/70 group-hover:text-white transition-premium z-10" />
+              <Filter className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/70 group-hover:text-white transition-ui z-10" />
               <DarkSelect
                 value={selectedCategory}
                 onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
@@ -232,13 +232,13 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                   <button
                     key={template.id}
                     onClick={() => setSelectedTemplateId(template.id)}
-                    className="group relative bg-surface-2/40 border border-white/5 hover:border-primary/40 hover:bg-surface-2/60 rounded-2xl p-6 text-left transition-premium hover:scale-[1.02] active:scale-95 overflow-hidden"
+                    className="group relative bg-surface-2/40 border border-white/5 hover:border-primary/40 hover:bg-surface-2/60 rounded-2xl p-6 text-left transition-ui overflow-hidden"
                   >
-                    <div className="absolute top-6 right-6 p-2 rounded-xl bg-surface-4/60 border border-white/5 opacity-0 group-hover:opacity-100 transition-premium">
+                    <div className="absolute top-6 right-6 p-2 rounded-xl bg-surface-4/60 border border-white/5 opacity-0 group-hover:opacity-100 transition-ui">
                       <Sparkles className="w-4 h-4 text-primary" />
                     </div>
                     <div className="flex items-start gap-4 mb-5">
-                      <div className="flex items-center justify-center w-14 h-14 bg-surface-3 border border-white/10 rounded-2xl group-hover:border-primary/20 transition-premium">
+                      <div className="flex items-center justify-center w-14 h-14 bg-surface-3 border border-white/10 rounded-2xl group-hover:border-primary/20 transition-ui">
                         {template.icon ? (
                           <span className="text-3xl">{template.icon}</span>
                         ) : (
@@ -246,7 +246,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                         )}
                       </div>
                       <div className="flex-1 min-w-0">
-                        <h3 className="font-semibold text-white group-hover:text-primary transition-premium font-outfit leading-none mb-1.5">
+                        <h3 className="font-semibold text-white group-hover:text-primary transition-ui font-outfit leading-none mb-1.5">
                           {template.name}
                         </h3>
                         <span className="text-2xs font-semibold uppercase tracking-wider text-primary/60">
@@ -286,7 +286,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             <Button
               onClick={onClose}
               variant="ghost"
-              className="h-11 px-6 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-xl border border-white/5 active:scale-95"
+              className="h-11 px-6 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-xl border border-white/5"
             >
               Cancel
             </Button>
@@ -306,7 +306,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             variant="ghost"
             size="icon"
             onClick={() => setSelectedTemplateId("")}
-            className="shrink-0 h-10 w-10 rounded-2xl bg-surface-2/60 border border-white/5 hover:bg-surface-3 transition-premium active:scale-90 relative z-10"
+            className="shrink-0 h-10 w-10 rounded-2xl bg-surface-2/60 border border-white/5 hover:bg-surface-3 transition-ui relative z-10"
             aria-label="Back to Templates"
           >
             <ArrowLeft className="w-4 h-4 text-muted-foreground/70" />
@@ -395,7 +395,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
 
           {/* Error Display */}
           {error && (
-            <div className="animate-in fade-in slide-in-from-top-2 duration-300">
+            <div>
               <ErrorBanner message={error} />
             </div>
           )}
@@ -406,7 +406,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           <Button
             variant="ghost"
             onClick={onClose}
-            className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+            className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
           >
             Cancel
           </Button>
@@ -414,7 +414,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             onClick={handleCreate}
             disabled={creating || !moduleName}
             className={cn(
-              "h-12 px-10 text-sm font-semibold transition-premium active:scale-[0.98] rounded-2xl",
+              "h-12 px-10 text-sm font-semibold transition-ui rounded-2xl",
               "bg-primary hover:bg-primary/90 text-white border-none",
               (creating || !moduleName) &&
                 "opacity-50 grayscale cursor-not-allowed",

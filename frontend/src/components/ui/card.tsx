@@ -12,7 +12,7 @@ export const Card: React.FC<{
 }> = ({ children, className, style }) => (
   <div
     className={cn(
-      "bg-surface-3/60 rounded-xl p-4 border border-white/5 transition-premium",
+      "bg-surface-3/60 rounded-xl p-4 border border-white/5 transition-ui",
       className,
     )}
     style={style}

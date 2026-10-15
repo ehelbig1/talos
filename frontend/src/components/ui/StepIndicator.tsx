@@ -36,7 +36,7 @@ export const StepIndicator: React.FC<StepIndicatorProps> = ({
           <div className="flex items-center gap-1.5">
             <div
               className={cn(
-                "w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-premium",
+                "w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold transition-ui",
                 isCompleted && "bg-primary text-white",
                 isCurrent &&
                   "bg-primary/20 text-primary border border-primary/50 ring-2 ring-primary/20",

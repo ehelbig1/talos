@@ -27,7 +27,7 @@ const STARTERS = [
 export default function EmptyState({ onNew }: { onNew: () => void }) {
   const navigate = useNavigate();
   return (
-    <div className="space-y-10 animate-in fade-in duration-500">
+    <div className="space-y-10">
       <div className="text-center py-16 px-6 bg-surface-3/40 border border-white/10 border-dashed rounded-2xl">
         <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-6 border border-primary/20">
           <Folder className="w-7 h-7 text-primary" />
@@ -59,7 +59,7 @@ export default function EmptyState({ onNew }: { onNew: () => void }) {
             <button
               key={card.title}
               onClick={onNew}
-              className="text-left p-5 rounded-2xl bg-surface-3/60 border border-white/5 hover:border-white/20 hover:bg-surface-3 transition-premium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+              className="text-left p-5 rounded-2xl bg-surface-3/60 border border-white/5 hover:border-white/20 hover:bg-surface-3 transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
             >
               <div
                 className={`w-10 h-10 rounded-xl flex items-center justify-center border mb-4 ${card.color}`}

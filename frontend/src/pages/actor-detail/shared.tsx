@@ -170,7 +170,7 @@ export function StatCard({
   accent?: string;
 }) {
   return (
-    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 transition-premium hover:border-white/10">
+    <div className="bg-surface-4/40 border border-white/5 rounded-2xl p-6 transition-ui hover:border-white/10">
       <div
         className={cn(
           "text-3xl font-semibold tabular-nums tracking-tight",
@@ -261,7 +261,7 @@ export function TabBar({
           key={t.id}
           onClick={() => onChange(t.id)}
           className={cn(
-            "px-5 py-2 rounded-xl text-xs font-semibold transition-premium flex items-center gap-2",
+            "px-5 py-2 rounded-xl text-xs font-semibold transition-ui flex items-center gap-2",
             active === t.id
               ? "bg-primary text-primary-foreground"
               : "text-muted-foreground hover:text-foreground hover:bg-white/5",
@@ -332,7 +332,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
   );
 
   return (
-    <div className="flex items-start gap-4 px-5 py-3 hover:bg-[rgba(255,255,255,0.02)] transition-premium">
+    <div className="flex items-start gap-4 px-5 py-3 hover:bg-[rgba(255,255,255,0.02)] transition-ui">
       <div className="w-7 h-7 rounded-lg bg-violet-500/10 flex items-center justify-center text-violet-400 text-xs shrink-0 mt-0.5">
         {icon}
       </div>
@@ -354,7 +354,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
           {isExecutionEntry && (
             <button
               onClick={handleExpand}
-              className="text-xs text-muted-foreground/70 hover:text-violet-300 transition-premium flex items-center gap-0.5"
+              className="text-xs text-muted-foreground/70 hover:text-violet-300 transition-ui flex items-center gap-0.5"
             >
               {expanded ? (
                 <>

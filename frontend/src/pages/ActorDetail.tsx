@@ -117,7 +117,7 @@ export default function ActorDetail() {
         </p>
         <button
           onClick={() => navigate("/actors")}
-          className="px-6 py-2.5 text-sm font-semibold text-primary-foreground bg-primary rounded-xl transition-premium flex items-center gap-2"
+          className="px-6 py-2.5 text-sm font-semibold text-primary-foreground bg-primary rounded-xl transition-ui flex items-center gap-2"
         >
           <ChevronLeft className="w-4 h-4" /> Return to Registry
         </button>
@@ -144,13 +144,7 @@ export default function ActorDetail() {
                   colors.badge,
                 )}
               >
-                <span
-                  className={cn(
-                    "w-1.5 h-1.5 rounded-full",
-                    colors.dot,
-                    actor.status === "active" && "animate-status-pulse",
-                  )}
-                />
+                <span className={cn("w-1.5 h-1.5 rounded-full", colors.dot)} />
                 {actor.status}
               </span>
             </span>
@@ -210,32 +204,32 @@ export default function ActorDetail() {
             />
           )}
           {activeTab === "workflows" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <WorkflowsPanel actorId={id!} />
             </div>
           )}
           {activeTab === "memory" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <MemoryPanel actorId={id!} />
             </div>
           )}
           {activeTab === "budget" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <BudgetPanel actorId={id!} actor={actor} />
             </div>
           )}
           {activeTab === "policies" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <PoliciesPanel />
             </div>
           )}
           {activeTab === "log" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <LogPanel actorId={id!} />
             </div>
           )}
           {activeTab === "handoffs" && (
-            <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <div>
               <HandoffsPanel entries={logEntries} />
             </div>
           )}

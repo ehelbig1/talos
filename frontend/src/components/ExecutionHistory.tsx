@@ -101,7 +101,7 @@ function StatusPill({ status }: { status: string }) {
   return (
     <span
       className={cn(
-        "px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-premium",
+        "px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-ui",
         cls,
       )}
     >
@@ -112,7 +112,7 @@ function StatusPill({ status }: { status: string }) {
 
 const LogItem = React.memo(({ log }: { log: GqlModuleExecutionLog }) => (
   <div className="flex gap-4 group/log py-1">
-    <span className="text-xs font-semibold font-mono text-muted-foreground/50 group-hover/log:text-primary transition-premium shrink-0 pt-0.5">
+    <span className="text-xs font-semibold font-mono text-muted-foreground/50 group-hover/log:text-primary transition-ui shrink-0 pt-0.5">
       {new Date(log.createdAt).toLocaleTimeString([], {
         hour12: false,
         hour: "2-digit",
@@ -179,7 +179,7 @@ const ExecutionItem = React.memo(
     return (
       <div
         className={cn(
-          "group border border-white/5 bg-surface-1/40 rounded-2xl overflow-hidden transition-premium",
+          "group border border-white/5 bg-surface-1/40 rounded-2xl overflow-hidden transition-ui",
           isExpanded
             ? "border-primary/20 ring-1 ring-primary/10 bg-surface-2/60"
             : "hover:bg-surface-2/40 hover:border-white/10",
@@ -187,18 +187,18 @@ const ExecutionItem = React.memo(
       >
         {/* Row header */}
         <button
-          className="w-full flex items-center gap-5 p-4 text-xs transition-premium text-left focus:outline-none"
+          className="w-full flex items-center gap-5 p-4 text-xs transition-ui text-left focus:outline-none"
           onClick={handleToggle}
           aria-expanded={isExpanded}
         >
           <ChevronRight
             className={cn(
-              "w-4 h-4 text-muted-foreground/50 shrink-0 transition-transform duration-500",
+              "w-4 h-4 text-muted-foreground/50 shrink-0 transition-transform",
               isExpanded && "rotate-90 text-primary",
             )}
           />
 
-          <div className="shrink-0 flex items-center justify-center w-10 h-10 rounded-2xl bg-surface-4 border border-white/5 transition-premium relative">
+          <div className="shrink-0 flex items-center justify-center w-10 h-10 rounded-2xl bg-surface-4 border border-white/5 transition-ui relative">
             <StatusIcon status={exec.status} />
           </div>
 
@@ -212,19 +212,19 @@ const ExecutionItem = React.memo(
               )}
             </div>
             <div className="flex items-center gap-4 text-xs font-bold text-white/50 tracking-tight">
-              <span className="truncate max-w-[200px] group-hover:text-white/70 transition-premium">
+              <span className="truncate max-w-[200px] group-hover:text-white/70 transition-ui">
                 {formatDistanceToNow(new Date(exec.startedAt), {
                   addSuffix: true,
                 })}
               </span>
               <div className="w-1 h-1 rounded-full bg-white/5" />
-              <span className="font-mono group-hover:text-primary/70 transition-premium">
+              <span className="font-mono group-hover:text-primary/70 transition-ui">
                 {formatDuration(exec.durationMs ?? null)}
               </span>
             </div>
           </div>
 
-          <div className="shrink-0 opacity-0 group-hover:opacity-100 transition-premium translate-x-4 group-hover:translate-x-0">
+          <div className="shrink-0 opacity-0 group-hover:opacity-100 transition-ui">
             <Activity className="w-4 h-4 text-primary/70" />
           </div>
         </button>
@@ -232,14 +232,14 @@ const ExecutionItem = React.memo(
         {/* Expand panel */}
         <div
           className={cn(
-            "overflow-hidden transition-premium duration-700 ease-in-out",
+            "overflow-hidden transition-ui ease-in-out",
             isExpanded ? "max-h-[800px] opacity-100" : "max-h-0 opacity-0",
           )}
         >
           <div className="p-8 border-t border-white/5 bg-surface-3/40 space-y-8">
             {exec.errorMessage && (
               <div className="relative group/error">
-                <div className="relative p-5 bg-destructive/5 rounded-2xl border border-destructive/20 text-xs font-bold text-destructive leading-relaxed animate-in fade-in slide-in-from-top-2">
+                <div className="relative p-5 bg-destructive/5 rounded-2xl border border-destructive/20 text-xs font-bold text-destructive leading-relaxed">
                   <div className="flex items-center gap-3 mb-2">
                     <XCircle className="w-4 h-4" />
                     <span className="font-semibold uppercase tracking-wider text-2xs">
@@ -258,7 +258,7 @@ const ExecutionItem = React.memo(
                 Diagnostic Payload
               </h5>
               <div className="relative group/output">
-                <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/output:opacity-100 transition-premium pointer-events-none" />
+                <div className="absolute -inset-0.5 bg-primary/5 rounded-2xl opacity-0 group-hover/output:opacity-100 transition-ui pointer-events-none" />
                 {outputText ? (
                   <pre
                     tabIndex={0}
@@ -284,7 +284,7 @@ const ExecutionItem = React.memo(
               </h5>
               <div
                 tabIndex={0}
-                className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 font-mono space-y-2 max-h-64 overflow-y-auto focus:outline-none focus:ring-2 focus:ring-primary/20 custom-scrollbar relative z-10 animate-in fade-in slide-in-from-bottom-2"
+                className="p-6 bg-surface-4/60 rounded-2xl border border-white/5 font-mono space-y-2 max-h-64 overflow-y-auto focus:outline-none focus:ring-2 focus:ring-primary/20 custom-scrollbar relative z-10"
               >
                 {loadingLogs ? (
                   <div className="flex items-center gap-4 text-muted-foreground/50 py-4">
@@ -366,13 +366,13 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
   const hasRunning = history.some((e) => e.status === "running");
 
   return (
-    <div className="mt-12 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-1000">
+    <div className="mt-12 space-y-8">
       {/* Header */}
       <div className="flex items-center justify-between px-2">
         <div className="flex items-center gap-5">
           <div
             className={cn(
-              "w-12 h-12 rounded-2xl flex items-center justify-center bg-surface-3 border border-white/5 transition-premium",
+              "w-12 h-12 rounded-2xl flex items-center justify-center bg-surface-3 border border-white/5 transition-ui",
               hasRunning && "border-primary/40 animate-status-pulse",
             )}
           >
@@ -391,7 +391,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
                 {hasRunning ? "A run is in progress…" : "Past runs"}
               </span>
               {hasRunning && (
-                <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
+                <div className="w-1.5 h-1.5 rounded-full bg-primary" />
               )}
             </div>
           </div>
@@ -400,7 +400,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
           onClick={() => refetch()}
           disabled={isFetching}
           variant="ghost"
-          className="h-11 px-5 text-sm font-semibold text-muted-foreground/70 hover:text-white bg-surface-3 border border-white/5 rounded-xl transition-premium active:scale-95 disabled:opacity-50"
+          className="h-11 px-5 text-sm font-semibold text-muted-foreground/70 hover:text-white bg-surface-3 border border-white/5 rounded-xl transition-ui disabled:opacity-50"
         >
           <RefreshCw
             className={cn("w-4 h-4 mr-2.5", isFetching && "animate-spin")}
@@ -415,7 +415,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
           <p className="text-xs font-semibold">Loading…</p>
         </div>
       ) : history.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-32 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl animate-in zoom-in-95 duration-1000">
+        <div className="flex flex-col items-center justify-center py-32 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl">
           <HistoryIcon className="w-16 h-16 text-muted-foreground/5 mb-6" />
           <p className="text-xs font-semibold text-muted-foreground/50">
             Zero Execution Cycles Logged

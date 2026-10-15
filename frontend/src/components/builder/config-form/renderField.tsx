@@ -23,7 +23,7 @@ export function renderField(
   isValid?: boolean,
 ) {
   const baseClassName = cn(
-    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-premium",
+    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-ui",
     isValid === false &&
       "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
     isValid === true &&
@@ -92,7 +92,7 @@ export function renderField(
                 : (schema.default as boolean) || false
             }
             onChange={(e) => onChange(e.target.checked)}
-            className="w-5 h-5 rounded-lg border-white/10 bg-surface-2 text-primary focus:ring-primary/40 transition-premium cursor-pointer"
+            className="w-5 h-5 rounded-lg border-white/10 bg-surface-2 text-primary focus:ring-primary/40 transition-ui cursor-pointer"
           />
           <label
             htmlFor={`field-${field}`}
@@ -133,7 +133,7 @@ export function renderField(
                   onClick={() =>
                     onChange(arrayValue.filter((_, i) => i !== index))
                   }
-                  className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-premium active:scale-90"
+                  className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-ui"
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -148,7 +148,7 @@ export function renderField(
                 });
                 onChange([...arrayValue, newItem]);
               }}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-premium flex items-center gap-2"
+              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-ui flex items-center gap-2"
             >
               <Plus className="h-4 w-4" /> Add entry
             </button>
@@ -170,7 +170,7 @@ export function renderField(
                     type="button"
                     onClick={() => onChange(preset.value)}
                     className={cn(
-                      "p-4 rounded-2xl border text-left transition-premium group/preset relative overflow-hidden",
+                      "p-4 rounded-2xl border text-left transition-ui group/preset relative overflow-hidden",
                       isSelected
                         ? "bg-primary/10 border-primary"
                         : "bg-surface-2 border-white/5 hover:border-white/20 hover:bg-surface-3",
@@ -179,7 +179,7 @@ export function renderField(
                     <div className="flex flex-col relative z-10">
                       <span
                         className={cn(
-                          "text-xs font-semibold mb-1 transition-premium",
+                          "text-xs font-semibold mb-1 transition-ui",
                           isSelected
                             ? "text-white"
                             : "text-white/70 group-hover/preset:text-white",
@@ -201,10 +201,10 @@ export function renderField(
               })}
             </div>
             <Collapsible>
-              <CollapsibleTrigger className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider hover:text-white transition-premium ml-1">
+              <CollapsibleTrigger className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider hover:text-white transition-ui ml-1">
                 Edit as JSON
               </CollapsibleTrigger>
-              <CollapsibleContent className="mt-3 animate-in fade-in slide-in-from-top-2">
+              <CollapsibleContent className="mt-3">
                 <textarea
                   value={JSON.stringify(arrayValue, null, 2)}
                   onChange={(e) => {
@@ -249,7 +249,7 @@ export function renderField(
                   onClick={() =>
                     onChange(arrayValue.filter((_, i) => i !== index))
                   }
-                  className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-premium"
+                  className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-ui"
                 >
                   <X className="h-4 w-4" />
                 </button>
@@ -258,7 +258,7 @@ export function renderField(
             <button
               type="button"
               onClick={() => onChange([...arrayValue, ""])}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-premium flex items-center gap-2"
+              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-ui flex items-center gap-2"
             >
               <Plus className="h-4 w-4" /> Add item
             </button>

@@ -22,7 +22,7 @@ export function CapabilityBadge({
   return (
     <div
       className={cn(
-        "inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border text-2xs font-semibold tracking-wider uppercase transition-premium group overflow-hidden relative",
+        "inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border text-2xs font-semibold tracking-wider uppercase transition-ui group overflow-hidden relative",
         visuals.bgColor,
         visuals.borderColor,
         visuals.color,
@@ -57,19 +57,19 @@ export function LlmConfigSection({
   if (!hasLlm) return null;
 
   const selectBase =
-    "w-full px-4 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
+    "w-full px-4 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
 
   return (
     <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl space-y-6 relative overflow-hidden group">
       <div className="flex items-center justify-between relative z-10">
         <h4 className="text-xs font-semibold text-white flex items-center gap-3 font-outfit">
-          <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 transition-premium">
+          <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 transition-ui">
             <Brain className="w-4 h-4 text-primary" />
           </div>
           Language model
         </h4>
         <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-          <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+          <div className="w-1.5 h-1.5 rounded-full bg-primary" />
           <span className="text-2xs font-semibold text-primary tracking-wider uppercase">
             Enabled
           </span>
@@ -145,7 +145,7 @@ export function LlmConfigSection({
               min="0"
               max="2"
               step="0.1"
-              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
+              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30"
               value={(data.config?.llm_temperature as number) ?? 0.7}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -167,7 +167,7 @@ export function LlmConfigSection({
             <input
               type="number"
               min="1"
-              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30"
+              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30"
               value={(data.config?.llm_max_tokens as number) ?? 4096}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -191,7 +191,7 @@ export function LlmConfigSection({
           <div className="relative group/directive">
             <textarea
               rows={4}
-              className="relative w-full px-5 py-4 text-xs font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-premium resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/50"
+              className="relative w-full px-5 py-4 text-xs font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-ui resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/50"
               placeholder="Tell the model what to do…"
               value={(data.config?.llm_system_prompt as string) || ""}
               onChange={(e) =>
@@ -217,10 +217,10 @@ export function RetryPolicySection({
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => void;
 }) {
   const inputBase =
-    "w-full px-5 py-3.5 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30";
+    "w-full px-5 py-3.5 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30";
 
   return (
-    <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
+    <div className="space-y-8">
       <div className="grid grid-cols-2 gap-6">
         <div className="space-y-3">
           <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
@@ -277,7 +277,7 @@ export function RetryPolicySection({
         <div className="relative group/logic">
           <textarea
             placeholder="ctx.last_error.code == 503"
-            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-xs min-h-[140px] transition-premium rounded-2xl selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40"
+            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-xs min-h-[140px] transition-ui rounded-2xl selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40"
             value={data.retryPolicy?.retryCondition ?? ""}
             onChange={(e) => {
               const currentPolicy = data.retryPolicy || {};
@@ -312,7 +312,7 @@ export function RetryPolicySection({
                   },
                 });
               }}
-              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-premium active:scale-95"
+              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-ui"
             >
               {snippet.label}
             </button>
@@ -341,7 +341,7 @@ export function SystemInternalsSection({
   onDelete: () => void;
 }) {
   return (
-    <div className="space-y-8 py-4 animate-in fade-in duration-700">
+    <div className="space-y-8 py-4">
       <div className="space-y-4">
         <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1 flex items-center gap-2">
           <Activity size={12} className="text-primary/70" />
@@ -367,7 +367,7 @@ export function SystemInternalsSection({
         <button
           type="button"
           onClick={onDelete}
-          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-premium active:scale-[0.98] group overflow-hidden relative"
+          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-ui group overflow-hidden relative"
         >
           <span className="relative z-10">Delete node</span>
         </button>

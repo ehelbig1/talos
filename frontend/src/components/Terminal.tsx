@@ -46,7 +46,7 @@ const TerminalRow = React.memo(function TerminalRow({
   return (
     <div
       className={cn(
-        "group flex gap-6 px-4 py-2 transition-premium rounded-xl border-l-4",
+        "group flex gap-6 px-4 py-2 transition-ui rounded-xl border-l-4",
         isError
           ? "bg-destructive/5 border-destructive text-white"
           : isWarn
@@ -54,7 +54,7 @@ const TerminalRow = React.memo(function TerminalRow({
             : "border-transparent hover:bg-white/[0.02] text-muted-foreground/80 hover:text-white",
       )}
     >
-      <span className="text-xs font-semibold font-mono text-muted-foreground/60 group-hover:text-primary transition-premium shrink-0 select-none tracking-tighter w-12 text-right">
+      <span className="text-xs font-semibold font-mono text-muted-foreground/60 group-hover:text-primary transition-ui shrink-0 select-none tracking-tighter w-12 text-right">
         {entry.timestamp}
       </span>
 
@@ -96,7 +96,7 @@ const TerminalRow = React.memo(function TerminalRow({
                       {entry.structured.toolName}
                     </span>
                   </div>
-                  <div className="w-2 h-2 rounded-full bg-warning animate-status-pulse" />
+                  <div className="w-2 h-2 rounded-full bg-warning" />
                 </div>
                 <div className="relative">
                   <div className="absolute top-0 right-0 p-2">
@@ -143,7 +143,7 @@ const TerminalRow = React.memo(function TerminalRow({
                 ? "text-white font-semibold"
                 : isWarn
                   ? "text-white"
-                  : "text-muted-foreground group-hover:text-white transition-premium",
+                  : "text-muted-foreground group-hover:text-white transition-ui",
             )}
           >
             {entry.text.toUpperCase()}
@@ -151,7 +151,7 @@ const TerminalRow = React.memo(function TerminalRow({
         )}
       </div>
 
-      <div className="w-12 flex justify-end shrink-0 opacity-0 group-hover:opacity-100 transition-premium">
+      <div className="w-12 flex justify-end shrink-0 opacity-0 group-hover:opacity-100 transition-ui">
         {isError ? (
           <AlertCircle className="h-4 w-4 text-destructive" />
         ) : isWarn ? (
@@ -234,7 +234,7 @@ const Terminal = () => {
   if (terminalState === "collapsed") {
     return (
       <div
-        className="h-full flex items-center justify-between px-6 cursor-pointer hover:bg-white/[0.04] transition-premium border-t border-white/5 bg-surface-2/60 relative overflow-hidden"
+        className="h-full flex items-center justify-between px-6 cursor-pointer hover:bg-white/[0.04] transition-ui border-t border-white/5 bg-surface-2/60 relative overflow-hidden"
         onClick={() => setTerminalState("compact")}
       >
         <div className="flex items-center gap-6 relative z-10">
@@ -245,7 +245,7 @@ const Terminal = () => {
           <div className="flex items-center gap-4">
             {errorCount > 0 && (
               <div className="flex items-center gap-2 px-2.5 py-0.5 bg-destructive/10 border border-destructive/20 rounded-full">
-                <div className="w-1.5 h-1.5 rounded-full bg-destructive animate-pulse" />
+                <div className="w-1.5 h-1.5 rounded-full bg-destructive" />
                 <span className="text-2xs font-semibold text-destructive uppercase tracking-wider">
                   {errorCount} FAULTS
                 </span>
@@ -253,7 +253,7 @@ const Terminal = () => {
             )}
             {warningCount > 0 && (
               <div className="flex items-center gap-2 px-2.5 py-0.5 bg-warning/10 border border-warning/20 rounded-full">
-                <div className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
+                <div className="w-1.5 h-1.5 rounded-full bg-warning" />
                 <span className="text-2xs font-semibold text-warning uppercase tracking-wider">
                   {warningCount} ALERTS
                 </span>
@@ -272,7 +272,7 @@ const Terminal = () => {
   return (
     <div
       className={cn(
-        "h-full flex flex-col bg-surface-1/80 border-t border-white/5 transition-premium relative overflow-hidden",
+        "h-full flex flex-col bg-surface-1/80 border-t border-white/5 transition-ui relative overflow-hidden",
         terminalState === "full" ? "rounded-t-3xl" : "",
       )}
     >
@@ -295,7 +295,7 @@ const Terminal = () => {
                   key={level}
                   onClick={() => setFilter(level)}
                   className={cn(
-                    "text-2xs px-4 py-1.5 rounded-lg transition-premium font-semibold uppercase tracking-wider",
+                    "text-2xs px-4 py-1.5 rounded-lg transition-ui font-semibold uppercase tracking-wider",
                     filter === level
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
@@ -308,13 +308,13 @@ const Terminal = () => {
           </div>
 
           <div className="relative group">
-            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/50 group-focus-within:text-primary transition-premium" />
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/50 group-focus-within:text-primary transition-ui" />
             <input
               type="text"
               placeholder="Search logs…"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="bg-surface-3/40 border border-white/5 rounded-xl pl-10 pr-4 py-1.5 text-sm font-bold w-40 focus:w-64 transition-premium outline-none text-white placeholder:text-muted-foreground/50 focus:border-primary/50"
+              className="bg-surface-3/40 border border-white/5 rounded-xl pl-10 pr-4 py-1.5 text-sm font-bold w-40 focus:w-64 transition-ui outline-none text-white placeholder:text-muted-foreground/50 focus:border-primary/50"
             />
           </div>
         </div>
@@ -328,7 +328,7 @@ const Terminal = () => {
                   size="icon"
                   onClick={() => clearEvents()}
                   aria-label="Clear all logs"
-                  className="h-9 w-9 text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 transition-premium rounded-xl"
+                  className="h-9 w-9 text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 transition-ui rounded-xl"
                 >
                   <Trash2 className="h-4 w-4" />
                 </Button>
@@ -350,7 +350,7 @@ const Terminal = () => {
                 ? "Maximize terminal"
                 : "Minimize terminal"
             }
-            className="h-9 w-9 text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-premium rounded-xl active:scale-90"
+            className="h-9 w-9 text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-ui rounded-xl"
           >
             {terminalState === "compact" ? (
               <Maximize2 className="h-4 w-4" />
@@ -364,7 +364,7 @@ const Terminal = () => {
             size="icon"
             onClick={() => setTerminalState("collapsed")}
             aria-label="Collapse terminal"
-            className="h-9 w-9 text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-premium rounded-xl active:scale-90"
+            className="h-9 w-9 text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-ui rounded-xl"
           >
             <ChevronDown className="h-5 w-5" />
           </Button>

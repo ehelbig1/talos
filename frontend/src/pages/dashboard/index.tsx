@@ -304,7 +304,7 @@ export default function Dashboard() {
       {/* Dynamic background */}
       <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/10 via-background to-background opacity-50" />
 
-      <div className="relative max-w-7xl mx-auto px-8 py-10 animate-in fade-in duration-300">
+      <div className="relative max-w-7xl mx-auto px-8 py-10">
         {/* Header Section */}
         <PageHeader
           title="Workflows"
@@ -316,7 +316,7 @@ export default function Dashboard() {
               {pendingApprovalCount > 0 && (
                 <button
                   onClick={() => navigate("/settings#approvals")}
-                  className="px-2.5 py-0.5 text-xs font-medium bg-warning/10 text-warning border border-warning/20 rounded-full hover:bg-warning/20 transition-premium"
+                  className="px-2.5 py-0.5 text-xs font-medium bg-warning/10 text-warning border border-warning/20 rounded-full hover:bg-warning/20 transition-ui"
                 >
                   {pendingApprovalCount} pending approval
                   {pendingApprovalCount !== 1 ? "s" : ""}
@@ -350,7 +350,7 @@ export default function Dashboard() {
               aria-label="Search workflows"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl pl-9 pr-4 text-sm focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/60"
+              className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl pl-9 pr-4 text-sm focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20 transition-ui placeholder:text-muted-foreground/60"
             />
           </div>
 
@@ -360,7 +360,7 @@ export default function Dashboard() {
                 value={sortBy}
                 aria-label="Sort workflows"
                 onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
-                className="h-10 appearance-none bg-surface-3/60 border border-white/10 text-muted-foreground rounded-xl pl-3 pr-9 text-sm focus:outline-none focus:border-primary/40 transition-premium cursor-pointer hover:text-white"
+                className="h-10 appearance-none bg-surface-3/60 border border-white/10 text-muted-foreground rounded-xl pl-3 pr-9 text-sm focus:outline-none focus:border-primary/40 transition-ui cursor-pointer hover:text-white"
               >
                 <option value="name">Sort by name</option>
                 <option value="lastRun">Sort by last run</option>
@@ -387,7 +387,7 @@ export default function Dashboard() {
                   onClick={() => setStatusFilter(s)}
                   aria-pressed={statusFilter === s}
                   className={cn(
-                    "px-3 h-8 text-xs font-medium rounded-lg transition-premium whitespace-nowrap",
+                    "px-3 h-8 text-xs font-medium rounded-lg transition-ui whitespace-nowrap",
                     statusFilter === s
                       ? "bg-white/10 text-white"
                       : "text-muted-foreground hover:text-white",
@@ -410,7 +410,7 @@ export default function Dashboard() {
           {workflows.length === 0 ? (
             <EmptyState onNew={handleNew} />
           ) : filteredWorkflows.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-24 bg-surface-3/40 border border-white/5 rounded-2xl animate-in fade-in duration-300">
+            <div className="flex flex-col items-center justify-center py-24 bg-surface-3/40 border border-white/5 rounded-2xl">
               <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-5">
                 <Search className="w-6 h-6 text-muted-foreground" />
               </div>
@@ -457,12 +457,12 @@ export default function Dashboard() {
               {/* Add New Workflow Card */}
               <button
                 onClick={handleNew}
-                className="group flex flex-col items-center justify-center gap-4 p-8 bg-transparent border-2 border-dashed border-white/10 rounded-2xl transition-premium hover:bg-primary/5 hover:border-primary/40 min-h-[220px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+                className="group flex flex-col items-center justify-center gap-4 p-8 bg-transparent border-2 border-dashed border-white/10 rounded-2xl transition-ui hover:bg-primary/5 hover:border-primary/40 min-h-[220px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               >
-                <div className="w-12 h-12 rounded-xl bg-surface-4 border border-white/10 text-muted-foreground group-hover:text-primary transition-premium flex items-center justify-center">
+                <div className="w-12 h-12 rounded-xl bg-surface-4 border border-white/10 text-muted-foreground group-hover:text-primary transition-ui flex items-center justify-center">
                   <Plus className="w-6 h-6" />
                 </div>
-                <span className="text-sm font-medium text-muted-foreground group-hover:text-white transition-premium">
+                <span className="text-sm font-medium text-muted-foreground group-hover:text-white transition-ui">
                   New workflow
                 </span>
               </button>

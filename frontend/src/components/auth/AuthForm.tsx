@@ -71,7 +71,7 @@ export function AuthForm() {
     <div className="min-h-screen flex items-center justify-center bg-background relative overflow-hidden font-inter">
       {/* Dynamic Background */}
 
-      <div className="relative z-10 w-full max-w-[420px] px-6 py-12 animate-in fade-in duration-500">
+      <div className="relative z-10 w-full max-w-[420px] px-6 py-12">
         <div className="bg-surface-1/80 border border-white/10 rounded-2xl p-10 relative overflow-hidden">
           {/* Logo & Branding */}
           <div className="text-center mb-10 relative">
@@ -90,7 +90,7 @@ export function AuthForm() {
               <button
                 onClick={() => setMode("login")}
                 className={cn(
-                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-premium",
+                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-ui",
                   mode === "login"
                     ? "bg-primary text-white"
                     : "text-muted-foreground hover:text-white",
@@ -101,7 +101,7 @@ export function AuthForm() {
               <button
                 onClick={() => setMode("signup")}
                 className={cn(
-                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-premium",
+                  "flex-1 py-2.5 text-sm font-medium rounded-xl transition-ui",
                   mode === "signup"
                     ? "bg-primary text-white"
                     : "text-muted-foreground hover:text-white",
@@ -119,7 +119,7 @@ export function AuthForm() {
               className="space-y-6"
             >
               {mode === "signup" && (
-                <div className="animate-in fade-in slide-in-from-top-2 duration-300">
+                <div>
                   <label htmlFor="name" className={labelClass}>
                     Name
                   </label>
@@ -181,7 +181,7 @@ export function AuthForm() {
               <button
                 type="submit"
                 disabled={isLoading}
-                className="w-full h-11 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl transition-premium active:scale-[0.98]"
+                className="w-full h-11 bg-primary hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-xl transition-ui"
               >
                 {isLoading ? (
                   <Loader2 className="w-5 h-5 animate-spin mx-auto" />
@@ -235,7 +235,7 @@ export function AuthForm() {
               <button
                 type="submit"
                 disabled={isLoading || twoFactorCode.length < 6}
-                className="w-full h-11 bg-warning hover:bg-warning/90 disabled:opacity-40 disabled:cursor-not-allowed text-warning-foreground text-sm font-semibold rounded-xl transition-premium active:scale-[0.98]"
+                className="w-full h-11 bg-warning hover:bg-warning/90 disabled:opacity-40 disabled:cursor-not-allowed text-warning-foreground text-sm font-semibold rounded-xl transition-ui"
               >
                 {isLoading ? "Verifying…" : "Verify"}
               </button>
@@ -246,7 +246,7 @@ export function AuthForm() {
                   setStep("credentials");
                   setError("");
                 }}
-                className="w-full text-sm text-muted-foreground hover:text-white transition-premium"
+                className="w-full text-sm text-muted-foreground hover:text-white transition-ui"
               >
                 ← Back
               </button>
@@ -270,7 +270,7 @@ export function AuthForm() {
                 onClick={() => {
                   window.location.href = `${BACKEND_URL}/auth/oauth/google/login`;
                 }}
-                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-premium"
+                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-ui"
               >
                 <svg
                   width="18"
@@ -303,7 +303,7 @@ export function AuthForm() {
                 onClick={() => {
                   window.location.href = `${BACKEND_URL}/auth/oauth/okta/login`;
                 }}
-                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-premium"
+                className="flex items-center justify-center gap-3 h-11 bg-surface-2/60 border border-white/10 hover:border-white/20 hover:bg-surface-2 text-white rounded-xl transition-ui"
               >
                 <svg
                   width="18"

@@ -78,7 +78,7 @@ export function OpenAPIBrowser({
           onClick={discoverAPI}
           disabled={loading || !baseUrl}
           className={cn(
-            "h-10 px-6 text-sm font-semibold rounded-xl transition-premium active:scale-95",
+            "h-10 px-6 text-sm font-semibold rounded-xl transition-ui",
             baseUrl
               ? "bg-primary hover:bg-primary/90 text-white"
               : "bg-surface-3 text-muted-foreground/70 grayscale",
@@ -97,7 +97,7 @@ export function OpenAPIBrowser({
         </Button>
 
         {error && (
-          <div className="p-3 bg-destructive/5 border border-destructive/20 rounded-xl flex items-center gap-2 text-destructive animate-in shake duration-500">
+          <div className="p-3 bg-destructive/5 border border-destructive/20 rounded-xl flex items-center gap-2 text-destructive">
             <X className="h-3.5 w-3.5" />
             <p className="m-0 text-2xs font-semibold leading-none">{error}</p>
           </div>
@@ -108,7 +108,7 @@ export function OpenAPIBrowser({
 
   if (useSelector && endpoints.length > 0) {
     return (
-      <div className="animate-in fade-in slide-in-from-top-4 duration-700">
+      <div>
         <EndpointSelector
           endpoints={endpoints}
           baseUrl={baseUrl}
@@ -119,7 +119,7 @@ export function OpenAPIBrowser({
   }
 
   return (
-    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-2xl space-y-8 animate-in zoom-in-95 duration-500">
+    <div className="relative overflow-hidden p-8 bg-surface-2/40 border border-white/5 rounded-2xl space-y-8">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-xl bg-primary/10 border border-primary/20">
@@ -138,7 +138,7 @@ export function OpenAPIBrowser({
         <button
           type="button"
           onClick={() => setShowBrowser(false)}
-          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
+          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
         >
           <X className="h-4 w-4" />
         </button>

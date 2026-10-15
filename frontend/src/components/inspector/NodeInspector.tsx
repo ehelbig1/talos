@@ -56,7 +56,7 @@ const STATUS_DOT: Record<NodeStatusType, string> = {
   success: "bg-success",
   failed: "bg-destructive",
   skipped: "bg-muted-foreground/50",
-  awaiting_approval: "bg-warning animate-pulse",
+  awaiting_approval: "bg-warning",
 };
 
 const STATUS_LABEL: Record<NodeStatusType, string> = {
@@ -155,7 +155,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5 animate-in slide-in-from-right duration-500">
+    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5">
       {/* Header */}
       <div className="flex items-center justify-between px-8 py-6 border-b border-white/5 bg-white/[0.02] relative z-10">
         <div className="flex items-center gap-5">
@@ -179,7 +179,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
-          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95"
+          className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-ui"
         >
           <X className="h-5 w-5" />
         </button>
@@ -197,14 +197,14 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
           <TabsList className="w-full justify-start rounded-2xl border border-white/5 bg-black/20 p-1.5 gap-1 shrink-0 h-auto">
             <TabsTrigger
               value="config"
-              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-ui"
             >
               <Settings className="w-3.5 h-3.5 mr-2 opacity-40" />
               Configuration
             </TabsTrigger>
             <TabsTrigger
               value="logs"
-              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-premium"
+              className="flex-1 text-sm font-semibold data-[state=active]:text-white data-[state=active]:bg-primary/20 data-[state=active]:border-primary/20 border border-transparent text-muted-foreground/70 rounded-xl py-3 px-5 transition-ui"
             >
               <Activity className="w-3.5 h-3.5 mr-2 opacity-40" />
               Diagnostics
@@ -225,7 +225,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
             )}
           </div>
 
-          <div className="space-y-8 animate-in fade-in slide-in-from-bottom-2 duration-500">
+          <div className="space-y-8">
             <div className="space-y-4">
               <label className="text-xs font-semibold text-muted-foreground/60 ml-1">
                 Node Parameters
@@ -269,20 +269,20 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
               <Collapsible
                 open={advancedOpen}
                 onOpenChange={setAdvancedOpen}
-                className="border border-white/5 rounded-2xl bg-white/[0.02] overflow-hidden transition-premium hover:bg-white/[0.03]"
+                className="border border-white/5 rounded-2xl bg-white/[0.02] overflow-hidden transition-ui hover:bg-white/[0.03]"
               >
-                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/60 hover:text-white transition-premium group">
-                  <Zap className="w-4 h-4 text-primary opacity-40 group-hover:opacity-100 transition-premium" />
+                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/60 hover:text-white transition-ui group">
+                  <Zap className="w-4 h-4 text-primary opacity-40 group-hover:opacity-100 transition-ui" />
                   <span>Execution Controls</span>
                   <div className="flex-1 h-px bg-white/5" />
                   <ChevronDown
                     className={cn(
-                      "w-4 h-4 transition-premium",
+                      "w-4 h-4 transition-ui",
                       advancedOpen && "rotate-180",
                     )}
                   />
                 </CollapsibleTrigger>
-                <CollapsibleContent className="px-8 pb-8 space-y-8 animate-in slide-in-from-top-4 duration-300">
+                <CollapsibleContent className="px-8 pb-8 space-y-8">
                   <div className="space-y-6">
                     <FormField label="Conditional Skip (Rhai Script)">
                       <Textarea
@@ -313,7 +313,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                           })
                         }
                         className={cn(
-                          "w-12 h-6 rounded-full border p-1 cursor-pointer transition-premium relative",
+                          "w-12 h-6 rounded-full border p-1 cursor-pointer transition-ui relative",
                           node.data.continueOnError
                             ? "bg-primary/20 border-primary/40"
                             : "bg-white/5 border-white/10",
@@ -321,7 +321,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       >
                         <div
                           className={cn(
-                            "w-4 h-4 rounded-full transition-premium",
+                            "w-4 h-4 rounded-full transition-ui",
                             node.data.continueOnError
                               ? "bg-primary translate-x-6"
                               : "bg-white/20 translate-x-0",
@@ -364,15 +364,15 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
               <Collapsible
                 open={internalsOpen}
                 onOpenChange={setInternalsOpen}
-                className="border border-white/5 rounded-2xl bg-white/[0.01] overflow-hidden transition-premium hover:bg-white/[0.02]"
+                className="border border-white/5 rounded-2xl bg-white/[0.01] overflow-hidden transition-ui hover:bg-white/[0.02]"
               >
-                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium group">
-                  <Activity className="w-4 h-4 text-muted-foreground/50 group-hover:text-primary transition-premium" />
+                <CollapsibleTrigger className="flex items-center gap-4 w-full px-8 py-5 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui group">
+                  <Activity className="w-4 h-4 text-muted-foreground/50 group-hover:text-primary transition-ui" />
                   <span>Details</span>
                   <div className="flex-1 h-px bg-white/5" />
                   <ChevronDown
                     className={cn(
-                      "w-4 h-4 transition-premium",
+                      "w-4 h-4 transition-ui",
                       internalsOpen && "rotate-180",
                     )}
                   />
@@ -397,7 +397,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
           value="logs"
           className="flex-1 min-h-0 overflow-auto p-8 space-y-10 custom-scrollbar focus:outline-none"
         >
-          <div className="space-y-10 animate-in fade-in slide-in-from-bottom-2 duration-500">
+          <div className="space-y-10">
             {/* Status Panel */}
             <div className="p-6 rounded-2xl bg-surface-3/40 border border-white/5 bg-surface-3 border border-white/10 relative overflow-hidden group">
               <div className="flex items-center justify-between relative z-10">
@@ -410,7 +410,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                   >
                     <div
                       className={cn(
-                        "absolute inset-0 rounded-full animate-ping opacity-20",
+                        "absolute inset-0 rounded-full opacity-20",
                         STATUS_DOT[status],
                       )}
                     />
@@ -427,7 +427,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                     {[...Array(5)].map((_, i) => (
                       <div
                         key={i}
-                        className="w-1 h-3 bg-primary/20 rounded-full animate-pulse"
+                        className="w-1 h-3 bg-primary/20 rounded-full"
                         style={{ animationDelay: `${i * 150}ms` }}
                       />
                     ))}
@@ -451,7 +451,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                 </div>
                 {fixSuggestion && (
                   <div className="p-5 bg-warning/5 border border-warning/10 rounded-2xl text-warning relative z-10 flex gap-4">
-                    <Zap className="w-5 h-5 shrink-0 text-warning animate-pulse" />
+                    <Zap className="w-5 h-5 shrink-0 text-warning" />
                     <div className="space-y-1">
                       <span className="text-2xs font-semibold uppercase tracking-wider opacity-40 block">
                         Suggested fix
@@ -488,7 +488,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                         // Clipboard API unavailable
                       }
                     }}
-                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-premium"
+                    className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-ui"
                     title="Copy Payload"
                   >
                     <Copy className="w-4 h-4" />
@@ -521,7 +521,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       className="flex gap-6 text-xs pb-5 border-b border-white/[0.03] last:border-0 last:pb-0 relative z-10 group"
                     >
                       <div className="flex flex-col items-center gap-2 shrink-0">
-                        <span className="text-muted-foreground/50 font-semibold w-14 tabular-nums text-right group-hover:text-primary/70 transition-premium">
+                        <span className="text-muted-foreground/50 font-semibold w-14 tabular-nums text-right group-hover:text-primary/70 transition-ui">
                           +{(ev.elapsedMs / 1000).toFixed(2)}s
                         </span>
                       </div>
@@ -537,7 +537,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                                 ? "text-destructive"
                                 : ev.status === "WAITING"
                                   ? "text-warning"
-                                  : "text-white/60 group-hover:text-white transition-premium",
+                                  : "text-white/60 group-hover:text-white transition-ui",
                             )}
                           >
                             {ev.logMessage || ev.status}

@@ -77,9 +77,7 @@ function EditorPage() {
             <div className="flex-1 flex items-center justify-center text-muted-foreground">
               <div className="flex flex-col items-center gap-3">
                 <div className="w-8 h-8 border-2 border-violet-500/20 border-t-violet-500 rounded-full animate-spin" />
-                <span className="text-sm font-medium animate-pulse">
-                  Loading editor…
-                </span>
+                <span className="text-sm font-medium">Loading editor…</span>
               </div>
             </div>
           }

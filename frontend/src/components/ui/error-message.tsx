@@ -141,7 +141,7 @@ export function ErrorMessage({
             {onRetry && (
               <button
                 onClick={onRetry}
-                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-primary-foreground bg-primary rounded hover:bg-primary/90 transition-premium"
+                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-primary-foreground bg-primary rounded hover:bg-primary/90 transition-ui"
               >
                 Retry
               </button>
@@ -149,7 +149,7 @@ export function ErrorMessage({
             {onDismiss && (
               <button
                 onClick={onDismiss}
-                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-foreground border border-input rounded hover:bg-accent transition-premium"
+                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-foreground border border-input rounded hover:bg-accent transition-ui"
               >
                 Dismiss
               </button>
@@ -158,7 +158,7 @@ export function ErrorMessage({
               href="https://github.com/anthropics/talos/issues"
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-foreground border border-input rounded hover:bg-accent transition-premium"
+              className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-foreground border border-input rounded hover:bg-accent transition-ui"
             >
               Contact Support
             </a>

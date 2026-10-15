@@ -38,7 +38,7 @@ export function OrgListSidebar({
               key={org.id}
               onClick={() => onSelect(org.id)}
               className={cn(
-                "w-full flex items-center gap-4 p-4 rounded-2xl border transition-premium text-left relative overflow-hidden group",
+                "w-full flex items-center gap-4 p-4 rounded-2xl border transition-ui text-left relative overflow-hidden group",
                 selectedOrgId === org.id
                   ? "bg-primary/10 border-primary/40"
                   : "bg-white/[0.02] border-white/5 hover:bg-white/[0.04] hover:border-white/10",
@@ -46,7 +46,7 @@ export function OrgListSidebar({
             >
               <div
                 className={cn(
-                  "w-12 h-12 rounded-xl flex items-center justify-center text-xl font-semibold font-outfit transition-premium",
+                  "w-12 h-12 rounded-xl flex items-center justify-center text-xl font-semibold font-outfit transition-ui",
                   selectedOrgId === org.id
                     ? "bg-primary text-white"
                     : "bg-white/5 text-muted-foreground/60",
@@ -57,7 +57,7 @@ export function OrgListSidebar({
               <div className="flex-1 min-w-0 relative z-10">
                 <div
                   className={cn(
-                    "text-sm font-semibold tracking-tight font-outfit truncate transition-premium",
+                    "text-sm font-semibold tracking-tight font-outfit truncate transition-ui",
                     selectedOrgId === org.id
                       ? "text-white"
                       : "text-muted-foreground/60 group-hover:text-white",
@@ -70,7 +70,7 @@ export function OrgListSidebar({
                 </div>
               </div>
               {selectedOrgId === org.id && (
-                <div className="absolute right-4 w-1.5 h-1.5 bg-primary rounded-full animate-pulse" />
+                <div className="absolute right-4 w-1.5 h-1.5 bg-primary rounded-full" />
               )}
             </button>
           ))}

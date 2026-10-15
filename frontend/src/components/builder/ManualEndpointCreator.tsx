@@ -86,7 +86,7 @@ export function ManualEndpointCreator({
 
   if (customEndpoints.length > 0) {
     return (
-      <div className="animate-in fade-in slide-in-from-top-4 duration-700">
+      <div>
         <EndpointSelector
           endpoints={customEndpoints}
           baseUrl={baseUrl}
@@ -103,7 +103,7 @@ export function ManualEndpointCreator({
         onClick={() => setShowCreator(true)}
         disabled={!baseUrl}
         className={cn(
-          "h-10 px-6 text-sm font-semibold rounded-xl transition-premium active:scale-95",
+          "h-10 px-6 text-sm font-semibold rounded-xl transition-ui",
           baseUrl
             ? "bg-emerald-500 hover:bg-emerald-400 text-white shadow-emerald-500/20"
             : "bg-surface-3 text-muted-foreground/70 grayscale",
@@ -115,7 +115,7 @@ export function ManualEndpointCreator({
   }
 
   return (
-    <div className="bg-surface-2/60 border border-emerald-500/20 rounded-2xl p-8 space-y-8 animate-in zoom-in-95 duration-500 relative overflow-hidden">
+    <div className="bg-surface-2/60 border border-emerald-500/20 rounded-2xl p-8 space-y-8 relative overflow-hidden">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
           <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
@@ -133,7 +133,7 @@ export function ManualEndpointCreator({
         <button
           type="button"
           onClick={() => setShowCreator(false)}
-          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
+          className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
         >
           <X className="h-4 w-4" />
         </button>
@@ -154,7 +154,7 @@ export function ManualEndpointCreator({
                   method: e.target.value,
                 })
               }
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white outline-none focus:border-emerald-500/40 transition-premium"
+              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white outline-none focus:border-emerald-500/40 transition-ui"
             >
               <option value="GET">GET</option>
               <option value="POST">POST</option>
@@ -175,7 +175,7 @@ export function ManualEndpointCreator({
                 setCurrentEndpoint({ ...currentEndpoint, path: e.target.value })
               }
               placeholder="/API/V1/RESOURCES/{ID}"
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-mono font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-premium"
+              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-mono font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-ui"
             />
           </div>
         </div>
@@ -195,7 +195,7 @@ export function ManualEndpointCreator({
               })
             }
             placeholder="e.g. Get a user by ID"
-            className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-premium"
+            className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-ui"
           />
         </div>
 
@@ -209,7 +209,7 @@ export function ManualEndpointCreator({
                   key={type}
                   type="button"
                   onClick={() => addParameter(type)}
-                  className="h-7 px-3 bg-white/5 hover:bg-white/10 text-2xs font-semibold text-white rounded-lg border border-white/5 transition-premium"
+                  className="h-7 px-3 bg-white/5 hover:bg-white/10 text-2xs font-semibold text-white rounded-lg border border-white/5 transition-ui"
                 >
                   <Plus className="h-3 w-3 mr-1.5 inline" /> {type}
                 </button>
@@ -229,7 +229,7 @@ export function ManualEndpointCreator({
                 {parameters.map((param, index) => (
                   <div
                     key={index}
-                    className="flex gap-3 p-4 bg-surface-3/60 border border-white/5 rounded-2xl group/param items-center transition-premium hover:bg-surface-4"
+                    className="flex gap-3 p-4 bg-surface-3/60 border border-white/5 rounded-2xl group/param items-center transition-ui hover:bg-surface-4"
                   >
                     <Badge
                       className={cn(
@@ -270,14 +270,14 @@ export function ManualEndpointCreator({
                         }
                         className="w-4 h-4 rounded border-white/10 bg-surface-4 text-emerald-500 focus:ring-emerald-500/40"
                       />
-                      <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider group-hover/check:text-white transition-premium">
+                      <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider group-hover/check:text-white transition-ui">
                         Req
                       </span>
                     </label>
                     <button
                       type="button"
                       onClick={() => removeParameter(index)}
-                      className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground/50 hover:text-destructive transition-premium"
+                      className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground/50 hover:text-destructive transition-ui"
                     >
                       <X className="h-4 w-4" />
                     </button>
@@ -295,7 +295,7 @@ export function ManualEndpointCreator({
             onClick={saveEndpoint}
             disabled={!currentEndpoint.path}
             className={cn(
-              "flex-1 h-12 text-sm font-semibold rounded-2xl transition-premium active:scale-95 flex items-center justify-center gap-3",
+              "flex-1 h-12 text-sm font-semibold rounded-2xl transition-ui flex items-center justify-center gap-3",
               currentEndpoint.path
                 ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20"
                 : "bg-surface-3 text-muted-foreground/70",
@@ -307,7 +307,7 @@ export function ManualEndpointCreator({
             type="button"
             onClick={() => setShowCreator(false)}
             variant="ghost"
-            className="h-12 px-8 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-premium"
+            className="h-12 px-8 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-ui"
           >
             Abort
           </Button>

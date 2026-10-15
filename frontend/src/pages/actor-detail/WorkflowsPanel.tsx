@@ -73,7 +73,7 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
             return (
               <tr
                 key={wf.id}
-                className="border-b border-[rgba(255,255,255,0.04)] last:border-0 hover:bg-[rgba(255,255,255,0.03)] transition-premium"
+                className="border-b border-[rgba(255,255,255,0.04)] last:border-0 hover:bg-[rgba(255,255,255,0.03)] transition-ui"
               >
                 <td className="px-5 py-3">
                   <span className="text-white font-medium flex items-center gap-2">
@@ -114,7 +114,7 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                           ? "Publish workflow to enable triggering"
                           : "Run as this actor"
                       }
-                      className="flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-30 disabled:cursor-not-allowed transition-premium px-2 py-1 rounded-md border border-emerald-500/20 hover:bg-emerald-500/10"
+                      className="flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-30 disabled:cursor-not-allowed transition-ui px-2 py-1 rounded-md border border-emerald-500/20 hover:bg-emerald-500/10"
                     >
                       {triggeringId === wf.id.toString() ? (
                         <RefreshCw className="w-3 h-3 animate-spin" />
@@ -125,7 +125,7 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                     </button>
                     <button
                       onClick={() => navigate(`/editor/${wf.id}`)}
-                      className="text-xs text-violet-400 hover:text-violet-300 transition-premium px-2 py-1 rounded-md border border-violet-500/20 hover:bg-violet-500/10"
+                      className="text-xs text-violet-400 hover:text-violet-300 transition-ui px-2 py-1 rounded-md border border-violet-500/20 hover:bg-violet-500/10"
                     >
                       Open
                     </button>

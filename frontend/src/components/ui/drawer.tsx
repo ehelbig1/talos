@@ -78,7 +78,7 @@ const DrawerHeader = React.forwardRef<HTMLDivElement, DrawerHeaderProps>(
       {onClose && (
         <button
           onClick={onClose}
-          className="ml-4 p-1.5 rounded-xl hover:bg-white/10 transition-premium text-muted-foreground hover:text-foreground"
+          className="ml-4 p-1.5 rounded-xl hover:bg-white/10 transition-ui text-muted-foreground hover:text-foreground"
           aria-label="Close drawer"
         >
           <X className="h-4 w-4" />

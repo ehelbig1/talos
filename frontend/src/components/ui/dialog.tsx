@@ -95,17 +95,14 @@ export const Dialog: React.FC<DialogProps> = ({
 
   return createPortal(
     <div
-      className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[9999] animate-in fade-in duration-200"
+      className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[9999] animate-fade-in"
       role="dialog"
       aria-modal="true"
       aria-labelledby={title ? "dialog-title" : undefined}
       onClick={onClose}
       onKeyDown={handleKey}
     >
-      <div
-        ref={contentRef}
-        className="w-full flex justify-center px-4 animate-in fade-in zoom-in-95 duration-200"
-      >
+      <div ref={contentRef} className="w-full flex justify-center px-4">
         <DialogWrapper
           className={className}
           onClick={(e: React.MouseEvent) => e.stopPropagation()}
@@ -121,7 +118,7 @@ export const Dialog: React.FC<DialogProps> = ({
             )}
             <button
               onClick={onClose}
-              className="ml-auto p-2 bg-white/5 border border-white/10 hover:bg-white/10 rounded-lg transition-premium text-muted-foreground hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
+              className="ml-auto p-2 bg-white/5 border border-white/10 hover:bg-white/10 rounded-lg transition-ui text-muted-foreground hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
               title="Close"
               aria-label="Close"
             >

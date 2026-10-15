@@ -65,19 +65,19 @@ export function BudgetPanel({
             {summary.totalExecutions > 0 && (
               <div className="w-full h-2 bg-background rounded-full overflow-hidden flex">
                 <div
-                  className="h-full bg-emerald-500 transition-premium"
+                  className="h-full bg-emerald-500 transition-ui"
                   style={{
                     width: `${(summary.successfulExecutions / summary.totalExecutions) * 100}%`,
                   }}
                 />
                 <div
-                  className="h-full bg-red-500 transition-premium"
+                  className="h-full bg-red-500 transition-ui"
                   style={{
                     width: `${(summary.failedExecutions / summary.totalExecutions) * 100}%`,
                   }}
                 />
                 <div
-                  className="h-full bg-sky-500 transition-premium"
+                  className="h-full bg-sky-500 transition-ui"
                   style={{
                     width: `${(summary.activeExecutions / summary.totalExecutions) * 100}%`,
                   }}
@@ -171,7 +171,7 @@ export function BudgetPanel({
                 <div className="w-full h-2 bg-background rounded-full overflow-hidden">
                   <div
                     className={cn(
-                      "h-full transition-premium",
+                      "h-full transition-ui",
                       tokenPct >= 90
                         ? "bg-red-500"
                         : tokenPct >= 75

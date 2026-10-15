@@ -162,10 +162,10 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           role="button"
           aria-label={`${displayName} node. Status: ${status}. ${configCount} configured fields.`}
           className={cn(
-            "relative border-l-[4px] outline-none transition-premium duration-500",
+            "relative border-l-[4px] outline-none transition-ui",
             "bg-surface-3/40 backdrop-blur-2xl border-y border-r border-white/5 px-5 py-4 min-w-[220px]",
             dragging && "transition-none",
-            "group active:scale-[0.98] hover:-translate-y-2 hover:bg-surface-3/60",
+            "group hover:bg-surface-3/60",
             systemStyle ? "rounded-2xl" : "rounded-2xl",
             selected
               ? "ring-2 ring-primary/40 border-y-primary/20 border-r-primary/20"
@@ -178,7 +178,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           {/* Status Glow Overlay */}
           <div
             className={cn(
-              "absolute inset-0 rounded-[inherit] opacity-0 group-hover:opacity-100 transition-opacity duration-700 pointer-events-none",
+              "absolute inset-0 rounded-[inherit] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none",
               status === "success" && "bg-success/5",
               status === "failed" && "bg-destructive/5",
               status === "running" && "bg-primary/5",
@@ -189,7 +189,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           <div className="flex items-center gap-3 relative z-10">
             <StatusDot status={status} />
             {data.category && (
-              <div className="p-1.5 bg-white/5 rounded-lg border border-white/5 group-hover:bg-white/10 transition-premium">
+              <div className="p-1.5 bg-white/5 rounded-lg border border-white/5 group-hover:bg-white/10 transition-ui">
                 <CategoryIcon
                   className={cn(
                     "w-3.5 h-3.5 shrink-0 transition-transform",
@@ -231,14 +231,14 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
                 <XCircle className="w-3.5 h-3.5 text-destructive" />
               )}
               {status === "awaiting_approval" && (
-                <ShieldAlert className="w-3.5 h-3.5 text-warning animate-status-pulse" />
+                <ShieldAlert className="w-3.5 h-3.5 text-warning" />
               )}
             </div>
           )}
 
           {/* Compact output preview or streaming content */}
           {resultPreview && (status === "success" || status === "running") && (
-            <div className="mt-3 px-3 py-2 rounded-xl bg-surface-4/60 border border-white/5 relative z-10 group/preview hover:bg-surface-4 transition-premium overflow-hidden">
+            <div className="mt-3 px-3 py-2 rounded-xl bg-surface-4/60 border border-white/5 relative z-10 group/preview hover:bg-surface-4 transition-ui overflow-hidden">
               <p
                 className={cn(
                   "text-2xs font-mono tracking-tight",
@@ -254,7 +254,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               >
                 {resultPreview}
                 {status === "running" && (
-                  <span className="w-1 h-2.5 bg-primary/40 animate-pulse inline-block ml-1 align-middle" />
+                  <span className="w-1 h-2.5 bg-primary/40 inline-block ml-1 align-middle" />
                 )}
               </p>
             </div>
@@ -283,7 +283,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
               type="button"
               onClick={handleInspectClick}
               aria-label="Inspect node execution data"
-              className="absolute top-3 right-3 p-2 rounded-xl bg-surface-4/80 border border-white/10 text-primary opacity-0 group-hover:opacity-100 transition-premium hover:bg-primary hover:text-white shadow-xl z-30"
+              className="absolute top-3 right-3 p-2 rounded-xl bg-surface-4/80 border border-white/10 text-primary opacity-0 group-hover:opacity-100 transition-ui hover:bg-primary hover:text-white shadow-xl z-30"
             >
               <Search className="w-3.5 h-3.5" />
             </button>

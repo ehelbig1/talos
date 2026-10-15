@@ -58,7 +58,7 @@ export function InlineSecretCreator({
         <button
           type="button"
           onClick={() => setIsOpen(true)}
-          className="flex items-center text-sm px-3 py-1.5 border border-dashed border-primary/40 text-primary rounded-lg hover:bg-primary/5 hover:border-primary/60 transition-premium font-bold tracking-tight"
+          className="flex items-center text-sm px-3 py-1.5 border border-dashed border-primary/40 text-primary rounded-lg hover:bg-primary/5 hover:border-primary/60 transition-ui font-bold tracking-tight"
         >
           <Plus className="w-4 h-4 mr-2" />
           Create New Secret
@@ -75,7 +75,7 @@ export function InlineSecretCreator({
                 setIsOpen(false);
                 setError("");
               }}
-              className="flex items-center text-xs font-bold text-muted-foreground hover:text-foreground transition-premium"
+              className="flex items-center text-xs font-bold text-muted-foreground hover:text-foreground transition-ui"
             >
               <X className="w-3.5 h-3.5 mr-1" />
               Cancel
@@ -131,7 +131,7 @@ export function InlineSecretCreator({
               </Button>
               <a
                 href="#/secrets"
-                className="flex items-center gap-1.5 text-xs font-bold text-primary hover:text-primary/80 transition-premium px-2"
+                className="flex items-center gap-1.5 text-xs font-bold text-primary hover:text-primary/80 transition-ui px-2"
               >
                 <span>Full Form</span>
                 <ExternalLink className="w-3 h-3" />

@@ -14,7 +14,7 @@ export const DarkSelect = React.forwardRef<
     <select
       ref={ref}
       className={cn(
-        "bg-surface-4/60 border border-white/10 text-foreground rounded-xl px-4 text-sm h-10 transition-premium appearance-none leading-normal",
+        "bg-surface-4/60 border border-white/10 text-foreground rounded-xl px-4 text-sm h-10 transition-ui appearance-none leading-normal",
         "focus:outline-none focus:border-primary/40 focus:ring-2 focus:ring-primary/20",
         className,
       )}

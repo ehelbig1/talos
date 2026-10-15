@@ -120,7 +120,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
               <div
                 key={entry.id}
                 className={cn(
-                  "p-4 rounded-xl border transition-premium duration-200",
+                  "p-4 rounded-xl border transition-ui",
                   entry.success
                     ? "bg-card/40 border-border/80 hover:border-border hover:bg-muted/60"
                     : "bg-destructive/5 border-destructive/10 hover:border-destructive/20",
@@ -193,7 +193,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
         <div className="pt-6 border-t border-border/50 flex justify-end bg-muted/5 -mx-1 px-1 -mb-1 pb-1">
           <Button
             onClick={onClose}
-            className="bg-accent hover:bg-black/20 text-foreground font-semibold text-sm h-11 px-8 rounded-xl transition-premium border border-border/60 shadow-sm"
+            className="bg-accent hover:bg-black/20 text-foreground font-semibold text-sm h-11 px-8 rounded-xl transition-ui border border-border/60 shadow-sm"
           >
             Close Audit Trail
           </Button>

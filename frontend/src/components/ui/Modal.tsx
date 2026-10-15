@@ -27,7 +27,7 @@ export const Modal: React.FC<ModalProps> = ({
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 bg-black/50 animate-fade-in z-50 overflow-y-auto" />
         <Dialog.Content
-          className="fixed inset-0 flex items-center justify-center z-[60] animate-slide-up outline-none"
+          className="fixed inset-0 flex items-center justify-center z-[60] outline-none"
           onOpenAutoFocus={(e) => e.preventDefault()}
           aria-describedby={undefined}
         >

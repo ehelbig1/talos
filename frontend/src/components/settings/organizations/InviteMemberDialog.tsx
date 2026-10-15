@@ -51,7 +51,7 @@ export function InviteMemberDialog({
               placeholder="User ID"
               value={userId}
               onChange={(e) => onUserIdChange(e.target.value)}
-              className="h-14 bg-white/[0.03] border-white/10 focus:border-primary/50 focus:ring-primary/20 rounded-xl px-4 font-mono text-sm text-white placeholder:text-white/10 transition-premium"
+              className="h-14 bg-white/[0.03] border-white/10 focus:border-primary/50 focus:ring-primary/20 rounded-xl px-4 font-mono text-sm text-white placeholder:text-white/10 transition-ui"
             />
           </div>
 
@@ -65,7 +65,7 @@ export function InviteMemberDialog({
                   key={r}
                   onClick={() => onRoleChange(r)}
                   className={cn(
-                    "flex-1 py-3 px-4 rounded-xl text-sm font-semibold transition-premium",
+                    "flex-1 py-3 px-4 rounded-xl text-sm font-semibold transition-ui",
                     role === r
                       ? "bg-primary/20 border border-primary/40 text-primary"
                       : "text-muted-foreground/50 hover:text-white hover:bg-white/5 border border-transparent",

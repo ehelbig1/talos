@@ -20,7 +20,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
       key={module.id}
       onClick={() => onSelect(module.id)}
       className={cn(
-        "group cursor-pointer p-5 rounded-2xl border transition-premium relative overflow-hidden",
+        "group cursor-pointer p-5 rounded-2xl border transition-ui relative overflow-hidden",
         selected
           ? "bg-primary/10 border-primary/40"
           : "bg-surface-4/40 border-white/5 hover:border-white/20 hover:bg-surface-4/60",
@@ -31,7 +31,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
           <div className="flex items-center gap-3">
             <div
               className={cn(
-                "w-5 h-5 rounded-full border flex items-center justify-center transition-premium",
+                "w-5 h-5 rounded-full border flex items-center justify-center transition-ui",
                 selected
                   ? "border-primary bg-primary"
                   : "border-white/10 bg-surface-4",
@@ -41,7 +41,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
             </div>
             <span
               className={cn(
-                "font-semibold text-xs transition-premium font-outfit leading-none",
+                "font-semibold text-xs transition-ui font-outfit leading-none",
                 selected
                   ? "text-white"
                   : "text-muted-foreground/60 group-hover:text-white",
@@ -73,14 +73,14 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
 
             <div className="flex items-center gap-5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60">
               <div className="flex items-center gap-2 group/meta">
-                <HardDrive className="h-3.5 w-3.5 opacity-40 group-hover/meta:text-primary transition-premium" />
-                <span className="group-hover/meta:text-muted-foreground/60 transition-premium">
+                <HardDrive className="h-3.5 w-3.5 opacity-40 group-hover/meta:text-primary transition-ui" />
+                <span className="group-hover/meta:text-muted-foreground/60 transition-ui">
                   {formatSize(module.sizeBytes)}
                 </span>
               </div>
               <div className="flex items-center gap-2 group/meta">
-                <Calendar className="h-3.5 w-3.5 opacity-40 group-hover/meta:text-primary transition-premium" />
-                <span className="group-hover/meta:text-muted-foreground/60 transition-premium">
+                <Calendar className="h-3.5 w-3.5 opacity-40 group-hover/meta:text-primary transition-ui" />
+                <span className="group-hover/meta:text-muted-foreground/60 transition-ui">
                   {formatDate(module.compiledAt)}
                 </span>
               </div>
@@ -90,7 +90,7 @@ export const ModuleItem: React.FC<Props> = ({ module, selected, onSelect }) => {
         <div className="flex flex-col items-end gap-2">
           <Badge
             variant="outline"
-            className="text-2xs font-mono font-bold text-muted-foreground/50 border-white/5 bg-surface-4/60 px-2 py-0.5 flex items-center gap-1.5 rounded-lg group-hover:border-primary/20 transition-premium"
+            className="text-2xs font-mono font-bold text-muted-foreground/50 border-white/5 bg-surface-4/60 px-2 py-0.5 flex items-center gap-1.5 rounded-lg group-hover:border-primary/20 transition-ui"
           >
             <Fingerprint className="w-3 h-3 opacity-40" />
             {module.id.slice(0, 8).toUpperCase()}

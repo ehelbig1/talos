@@ -92,7 +92,7 @@ export function TemplateLibrary({
         <button
           onClick={() => setCategory(null)}
           className={cn(
-            "px-5 py-2.5 text-2xs font-semibold rounded-xl transition-premium active:scale-95",
+            "px-5 py-2.5 text-2xs font-semibold rounded-xl transition-ui",
             category === null
               ? "bg-primary text-white"
               : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
@@ -105,7 +105,7 @@ export function TemplateLibrary({
             key={cat}
             onClick={() => setCategory(cat)}
             className={cn(
-              "px-5 py-2.5 text-2xs font-semibold rounded-xl transition-premium active:scale-95",
+              "px-5 py-2.5 text-2xs font-semibold rounded-xl transition-ui",
               category === cat
                 ? "bg-primary text-white"
                 : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
@@ -175,7 +175,7 @@ export function TemplateLibrary({
               </div>
             )}
             {!!error && (
-              <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold col-span-full text-center animate-in shake duration-500">
+              <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold col-span-full text-center">
                 Registry Sync Failure:{" "}
                 {sanitizeErrorMessage((error as Error).message)}
               </div>
@@ -217,7 +217,7 @@ function TemplateCard({
 }) {
   return (
     <div
-      className="group relative flex flex-col p-6 rounded-2xl bg-surface-3/40 border border-white/5 transition-premium hover-elevation hover:bg-surface-3/60 focus-within:ring-2 focus-within:ring-primary/20 overflow-hidden cursor-pointer"
+      className="group relative flex flex-col p-6 rounded-2xl bg-surface-3/40 border border-white/5 transition-ui hover-elevation hover:bg-surface-3/60 focus-within:ring-2 focus-within:ring-primary/20 overflow-hidden cursor-pointer"
       onClick={onSelect}
     >
       {/* Favorite button */}
@@ -226,13 +226,13 @@ function TemplateCard({
           e.stopPropagation();
           onToggleFavorite();
         }}
-        className="absolute top-5 right-5 p-2 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/70 hover:text-amber-400 active:scale-90 transition-premium z-20"
+        className="absolute top-5 right-5 p-2 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/70 hover:text-amber-400 transition-ui z-20"
         title={isFavorite ? "Remove from favorites" : "Add to favorites"}
       >
         <Star
           size={16}
           className={cn(
-            "transition-premium",
+            "transition-ui",
             isFavorite
               ? "text-amber-400 fill-amber-400"
               : "group-hover:text-amber-400",
@@ -241,11 +241,11 @@ function TemplateCard({
       </button>
 
       <div className="relative z-10 flex flex-col h-full">
-        <div className="flex items-center justify-center w-14 h-14 bg-surface-4 border border-white/5 rounded-2xl group-hover:border-primary/20 transition-premium mb-6">
+        <div className="flex items-center justify-center w-14 h-14 bg-surface-4 border border-white/5 rounded-2xl group-hover:border-primary/20 transition-ui mb-6">
           <span className="text-3xl">{template.icon || "📦"}</span>
         </div>
 
-        <h3 className="text-sm font-semibold text-white tracking-tight group-hover:text-primary transition-premium font-outfit mb-1">
+        <h3 className="text-sm font-semibold text-white tracking-tight group-hover:text-primary transition-ui font-outfit mb-1">
           {template.name}
         </h3>
 
@@ -260,10 +260,10 @@ function TemplateCard({
         )}
 
         <div className="mt-6 flex items-center justify-between">
-          <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 group-hover:text-primary/70 transition-premium">
+          <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/50 group-hover:text-primary/70 transition-ui">
             Use template
           </span>
-          <div className="w-6 h-6 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-premium -translate-x-4 group-hover:translate-x-0">
+          <div className="w-6 h-6 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center opacity-0 group-hover:opacity-100 transition-ui -translate-x-4">
             <Star size={10} className="text-primary" />
           </div>
         </div>

@@ -137,7 +137,7 @@ export default function CapabilityCeilingManager() {
         <p className="text-sm text-destructive font-semibold mb-6">{error}</p>
         <button
           onClick={loadData}
-          className="inline-flex items-center gap-3 px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-sm font-semibold text-white hover:bg-white/10 transition-premium"
+          className="inline-flex items-center gap-3 px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-sm font-semibold text-white hover:bg-white/10 transition-ui"
         >
           <RefreshCw className="w-4 h-4" />
           Retry
@@ -161,7 +161,7 @@ export default function CapabilityCeilingManager() {
       {/* Header */}
       <div className="flex items-center justify-between mb-10 relative z-10">
         <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
+          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
             <Shield className="w-7 h-7 text-primary" />
           </div>
           <div>
@@ -176,7 +176,7 @@ export default function CapabilityCeilingManager() {
 
         <button
           onClick={loadData}
-          className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-2xs font-semibold text-muted-foreground hover:text-white transition-premium"
+          className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-2xs font-semibold text-muted-foreground hover:text-white transition-ui"
         >
           <RefreshCw className="w-3.5 h-3.5" />
           Synchronize
@@ -187,7 +187,7 @@ export default function CapabilityCeilingManager() {
       <div className="mb-10 relative z-10">
         <div
           className={cn(
-            "bg-black/40 border-2 rounded-2xl p-8 relative overflow-hidden transition-premium",
+            "bg-black/40 border-2 rounded-2xl p-8 relative overflow-hidden transition-ui",
             tierBorder(currentRank),
           )}
         >
@@ -195,7 +195,7 @@ export default function CapabilityCeilingManager() {
             <div className="flex items-center gap-6">
               <div
                 className={cn(
-                  "w-16 h-16 rounded-2xl border-2 flex items-center justify-center transition-premium",
+                  "w-16 h-16 rounded-2xl border-2 flex items-center justify-center transition-ui",
                   tierBorder(currentRank),
                   tierBg(currentRank),
                 )}
@@ -258,7 +258,7 @@ export default function CapabilityCeilingManager() {
               )}
               <button
                 onClick={handleRevoke}
-                className="ml-auto text-destructive/40 hover:text-destructive transition-premium font-semibold tracking-wider"
+                className="ml-auto text-destructive/40 hover:text-destructive transition-ui font-semibold tracking-wider"
               >
                 Revoke grant
               </button>
@@ -297,7 +297,7 @@ export default function CapabilityCeilingManager() {
                     <div
                       key={w.name}
                       className={cn(
-                        "flex-1 min-w-[240px] flex items-center gap-4 px-6 py-5 rounded-2xl border transition-premium group/world relative overflow-hidden",
+                        "flex-1 min-w-[240px] flex items-center gap-4 px-6 py-5 rounded-2xl border transition-ui group/world relative overflow-hidden",
                         isCurrent
                           ? cn("border-2", tierBg(rank), tierBorder(rank))
                           : isAccessible
@@ -330,7 +330,7 @@ export default function CapabilityCeilingManager() {
                         </p>
                       </div>
                       {isAccessible && !isCurrent && (
-                        <ChevronRight className="w-4 h-4 text-muted-foreground/50 shrink-0 group-hover/world:translate-x-1 transition-premium" />
+                        <ChevronRight className="w-4 h-4 text-muted-foreground/50 shrink-0 transition-ui" />
                       )}
                     </div>
                   );

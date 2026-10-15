@@ -70,12 +70,12 @@ export function IntegrationsManager() {
   };
 
   return (
-    <div className="max-w-6xl mx-auto space-y-12 animate-in fade-in slide-in-from-bottom-4 duration-1000">
+    <div className="max-w-6xl mx-auto space-y-12">
       <div className="relative group">
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative z-10">
           <div className="space-y-4">
             <div className="flex items-center gap-5">
-              <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-premium">
+              <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-ui">
                 <ExternalLink size={28} />
               </div>
               <div className="flex flex-col">
@@ -84,7 +84,7 @@ export function IntegrationsManager() {
                 </h2>
                 <div className="flex flex-wrap items-center gap-3 mt-2">
                   <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shrink-0">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary" />
                     <span className="text-2xs text-primary font-semibold uppercase tracking-wider leading-none">
                       Connected services
                     </span>
@@ -111,9 +111,7 @@ export function IntegrationsManager() {
             <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
             <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
           </div>
-          <p className="text-xs text-primary/60 font-semibold animate-status-pulse">
-            Loading…
-          </p>
+          <p className="text-xs text-primary/60 font-semibold">Loading…</p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
@@ -181,17 +179,17 @@ export function IntegrationsManager() {
       </div>
 
       {/* Per-channel management for Google Calendar */}
-      <div className="animate-in fade-in duration-700 delay-300">
+      <div>
         <GoogleCalendarWatchChannels />
       </div>
 
       {/* Gmail watch channels */}
-      <div className="animate-in fade-in duration-700 delay-500">
+      <div>
         <GmailWatchChannels />
       </div>
 
       {/* Google Cloud watch channels */}
-      <div className="animate-in fade-in duration-700 delay-500">
+      <div>
         <GoogleCloudWatchChannels />
       </div>
 
@@ -207,8 +205,8 @@ export function IntegrationsManager() {
         onConfirm={handleDisconnectService}
       />
 
-      <div className="p-10 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-premium">
-        <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 group-hover:rotate-6 transition-premium">
+      <div className="p-10 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-ui">
+        <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-ui">
           <HelpCircle size={32} />
         </div>
         <div className="space-y-2">

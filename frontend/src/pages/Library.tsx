@@ -6,19 +6,19 @@ const Catalog = lazy(() => import("./Catalog"));
 
 function TabLoading() {
   return (
-    <div className="flex flex-col items-center justify-center py-40 space-y-8 animate-in fade-in duration-700">
+    <div className="flex flex-col items-center justify-center py-40 space-y-8">
       <div className="relative">
         <div className="w-16 h-16 border-4 border-primary/10 rounded-full" />
         <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0" />
       </div>
       <div className="flex flex-col items-center gap-2">
-        <span className="text-xs font-semibold text-white/70 animate-pulse">
+        <span className="text-xs font-semibold text-white/70">
           Synchronizing Registry
         </span>
         <div className="flex gap-1">
-          <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.3s]" />
-          <div className="w-1 h-1 rounded-full bg-primary animate-bounce [animation-delay:-0.15s]" />
-          <div className="w-1 h-1 rounded-full bg-primary animate-bounce" />
+          <div className="w-1 h-1 rounded-full bg-primary" />
+          <div className="w-1 h-1 rounded-full bg-primary" />
+          <div className="w-1 h-1 rounded-full bg-primary" />
         </div>
       </div>
     </div>

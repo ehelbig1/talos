@@ -16,7 +16,7 @@ const STATUS_DOT: Record<NodeStatusType, string> = {
   success: "bg-green-500",
   failed: "bg-red-500",
   skipped: "bg-muted-foreground/50",
-  awaiting_approval: "bg-amber-400 animate-pulse",
+  awaiting_approval: "bg-amber-400",
 };
 
 export const StatusDot = React.memo(function StatusDot({

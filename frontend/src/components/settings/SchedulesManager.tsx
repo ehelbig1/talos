@@ -83,7 +83,7 @@ function AddScheduleDialog({
   return (
     <Dialog open={open} onClose={onClose}>
       <div
-        className="bg-surface-3/95 border border-white/10 rounded-2xl overflow-hidden w-[560px] animate-in zoom-in-95 fade-in duration-300 relative"
+        className="bg-surface-3/95 border border-white/10 rounded-2xl overflow-hidden w-[560px] relative"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -105,7 +105,7 @@ function AddScheduleDialog({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground hover:text-white transition-premium"
+            className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground hover:text-white transition-ui"
           >
             <X size={18} />
           </button>
@@ -122,7 +122,7 @@ function AddScheduleDialog({
               <select
                 value={workflowId}
                 onChange={(e) => setWorkflowId(e.target.value)}
-                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-premium appearance-none cursor-pointer"
+                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-ui appearance-none cursor-pointer"
               >
                 <option value="" disabled className="bg-surface-3">
                   Select a workflow…
@@ -160,7 +160,7 @@ function AddScheduleDialog({
                   key={ex.value}
                   onClick={() => setCron(ex.value)}
                   className={cn(
-                    "px-4 py-2 rounded-xl border text-2xs font-semibold transition-premium active:scale-95",
+                    "px-4 py-2 rounded-xl border text-2xs font-semibold transition-ui",
                     cron === ex.value
                       ? "bg-amber-500/10 border-amber-500/30 text-amber-400 shadow-amber-500/5"
                       : "bg-white/5 border-white/5 text-muted-foreground/70 hover:border-white/10 hover:text-white",
@@ -249,7 +249,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
   };
 
   return (
-    <div className="mt-6 pt-6 border-t border-white/5 space-y-5 animate-in slide-in-from-top-2 duration-300">
+    <div className="mt-6 pt-6 border-t border-white/5 space-y-5">
       <div className="grid grid-cols-2 gap-5">
         <div className="space-y-2">
           <label className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 ml-1">
@@ -351,7 +351,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
     <>
       <div
         className={cn(
-          "group bg-white/[0.02] border rounded-2xl p-8 hover:bg-white/[0.04] transition-premium relative overflow-hidden",
+          "group bg-white/[0.02] border rounded-2xl p-8 hover:bg-white/[0.04] transition-ui relative overflow-hidden",
           schedule.isEnabled
             ? "border-amber-500/10 hover:border-amber-500/30"
             : "border-white/5 opacity-60 hover:opacity-100",
@@ -362,7 +362,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
           <div className="flex items-start gap-6 min-w-0">
             <div
               className={cn(
-                "w-14 h-14 rounded-2xl flex items-center justify-center border shrink-0 transition-premium",
+                "w-14 h-14 rounded-2xl flex items-center justify-center border shrink-0 transition-ui",
                 schedule.isEnabled
                   ? "bg-amber-500/10 border-amber-500/20 text-amber-500"
                   : "bg-white/5 border-white/5 text-muted-foreground/60",
@@ -372,7 +372,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-4 flex-wrap">
-                <span className="text-xl font-semibold text-white font-outfit truncate group-hover:text-amber-400 transition-premium">
+                <span className="text-xl font-semibold text-white font-outfit truncate group-hover:text-amber-400 transition-ui">
                   {workflowName}
                 </span>
                 <span
@@ -406,7 +406,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               onClick={handleToggle}
               disabled={toggleMutation.isPending}
               className={cn(
-                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90",
+                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-ui",
                 schedule.isEnabled
                   ? "bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20"
                   : "bg-white/5 border-white/5 text-muted-foreground/60 hover:text-white hover:bg-white/10",
@@ -425,7 +425,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               type="button"
               onClick={() => setEditing((v) => !v)}
               className={cn(
-                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-premium active:scale-90",
+                "w-11 h-11 flex items-center justify-center rounded-2xl border transition-ui",
                 editing
                   ? "bg-white/10 border-white/20 text-white"
                   : "bg-white/5 border-white/5 text-muted-foreground/70 hover:text-white hover:bg-white/10",
@@ -437,7 +437,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
-              className="w-11 h-11 flex items-center justify-center rounded-2xl border bg-white/5 border-white/5 text-muted-foreground/60 hover:text-destructive hover:border-destructive/30 hover:bg-destructive/10 transition-premium active:scale-90"
+              className="w-11 h-11 flex items-center justify-center rounded-2xl border bg-white/5 border-white/5 text-muted-foreground/60 hover:text-destructive hover:border-destructive/30 hover:bg-destructive/10 transition-ui"
             >
               <Trash2 size={16} />
             </button>
@@ -516,7 +516,7 @@ export default function SchedulesManager() {
   }, [workflows]);
 
   return (
-    <div className="max-w-6xl mx-auto py-4 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
+    <div className="max-w-6xl mx-auto py-4 space-y-10">
       {/* Page header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-6">
@@ -549,7 +549,7 @@ export default function SchedulesManager() {
       {schedulesLoading ? (
         <div className="flex flex-col items-center justify-center py-32 gap-6">
           <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin" />
-          <p className="text-xs text-muted-foreground/70 font-semibold animate-status-pulse">
+          <p className="text-xs text-muted-foreground/70 font-semibold">
             Synchronizing Time-Stream...
           </p>
         </div>

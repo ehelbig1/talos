@@ -22,7 +22,7 @@ export function RevokeKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[400px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
@@ -52,7 +52,7 @@ export function RevokeKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white shadow-amber-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white shadow-amber-900/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? "Revoking..." : "Revoke Key"}
           </Button>
@@ -74,7 +74,7 @@ export function RotateKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-indigo-500/20 rounded-2xl overflow-hidden w-[460px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-indigo-500/20 rounded-2xl overflow-hidden w-[460px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
@@ -113,7 +113,7 @@ export function RotateKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? (
               <div className="flex items-center gap-2">
@@ -142,7 +142,7 @@ export function DeleteKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-red-500/20 rounded-2xl overflow-hidden w-[400px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-red-500/20 rounded-2xl overflow-hidden w-[400px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
@@ -172,7 +172,7 @@ export function DeleteKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-red-600 hover:bg-red-500 text-white shadow-red-900/20 font-bold h-12 rounded-xl transition-premium"
+            className="flex-1 bg-red-600 hover:bg-red-500 text-white shadow-red-900/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? "Deleting..." : "Delete Key"}
           </Button>

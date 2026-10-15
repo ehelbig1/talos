@@ -156,7 +156,7 @@ export function GoogleCalendarSelector({
 
   if (loading) {
     return (
-      <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4 animate-pulse">
+      <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4">
         <Loader2 className="h-5 w-5 animate-spin text-primary" />
         <p className="m-0 text-xs font-semibold text-muted-foreground/70">
           Loading Google accounts…
@@ -182,21 +182,21 @@ export function GoogleCalendarSelector({
           </div>
         </div>
         {setupComplete && (
-          <Badge className="bg-success/10 text-success border-success/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider animate-in zoom-in-95">
+          <Badge className="bg-success/10 text-success border-success/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
             <Check className="w-3 h-3 mr-1" /> Configured
           </Badge>
         )}
       </div>
 
       {displayError && (
-        <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
+        <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive">
           <AlertTriangle className="h-5 w-5 shrink-0" />
           <p className="m-0 text-xs font-semibold">{displayError}</p>
         </div>
       )}
 
       {integrations.length === 0 ? (
-        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center animate-in fade-in duration-700">
+        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center">
           <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-6 border border-white/10">
             <Calendar className="h-8 w-8 text-muted-foreground/50" />
           </div>
@@ -211,7 +211,7 @@ export function GoogleCalendarSelector({
             href="/settings"
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center justify-center rounded-xl font-semibold transition-premium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-30 disabled:pointer-events-none active:scale-95 select-none h-11 px-8 bg-primary hover:bg-primary/90 text-white text-sm transition-premium"
+            className="inline-flex items-center justify-center rounded-xl font-semibold transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/20 disabled:opacity-30 disabled:pointer-events-none select-none h-11 px-8 bg-primary hover:bg-primary/90 text-white text-sm transition-ui"
           >
             Initialize Connection <ArrowRight className="ml-2 w-3.5 h-3.5" />
           </a>
@@ -233,7 +233,7 @@ export function GoogleCalendarSelector({
                     key={integration.id}
                     onClick={() => handleSelectIntegration(integration.id)}
                     className={cn(
-                      "group relative p-4 text-left rounded-2xl border transition-premium hover:scale-[1.01] active:scale-[0.98] overflow-hidden",
+                      "group relative p-4 text-left rounded-2xl border transition-ui overflow-hidden",
                       isSelected
                         ? "bg-primary/10 border-primary"
                         : "bg-surface-3 border-white/5 hover:bg-surface-4 hover:border-white/20",
@@ -242,7 +242,7 @@ export function GoogleCalendarSelector({
                     <div className="flex items-center gap-4 relative z-10">
                       <div
                         className={cn(
-                          "w-10 h-10 rounded-xl flex items-center justify-center border transition-premium",
+                          "w-10 h-10 rounded-xl flex items-center justify-center border transition-ui",
                           isSelected
                             ? "bg-primary text-white border-primary"
                             : "bg-white/5 text-muted-foreground/70 border-white/10",
@@ -257,7 +257,7 @@ export function GoogleCalendarSelector({
                       <div className="flex-1 min-w-0">
                         <span
                           className={cn(
-                            "block text-xs font-semibold truncate transition-premium",
+                            "block text-xs font-semibold truncate transition-ui",
                             isSelected ? "text-white" : "text-white/60",
                           )}
                         >
@@ -271,7 +271,7 @@ export function GoogleCalendarSelector({
                         </span>
                       </div>
                       {isSelected && (
-                        <div className="animate-pulse">
+                        <div>
                           <div className="w-2 h-2 rounded-full bg-primary" />
                         </div>
                       )}
@@ -283,7 +283,7 @@ export function GoogleCalendarSelector({
           </div>
 
           {selectedIntegrationId && (
-            <div className="space-y-4 animate-in fade-in slide-in-from-top-4 duration-500">
+            <div className="space-y-4">
               <div className="flex items-center gap-2 px-1">
                 <Sparkles className="w-3.5 h-3.5 text-primary/60" />
                 <p className="m-0 text-2xs font-semibold text-white/70 uppercase tracking-wider">
@@ -312,7 +312,7 @@ export function GoogleCalendarSelector({
                         key={calendar.id}
                         onClick={() => handleToggleCalendar(calendar.id)}
                         className={cn(
-                          "w-full group p-4 text-left rounded-xl border transition-premium hover:bg-surface-4",
+                          "w-full group p-4 text-left rounded-xl border transition-ui hover:bg-surface-4",
                           isSelected
                             ? "bg-primary/5 border-primary/20"
                             : "bg-surface-3/60 border-white/5",
@@ -321,7 +321,7 @@ export function GoogleCalendarSelector({
                         <div className="flex items-start gap-4">
                           <div
                             className={cn(
-                              "mt-1 w-5 h-5 rounded-md border flex items-center justify-center transition-premium",
+                              "mt-1 w-5 h-5 rounded-md border flex items-center justify-center transition-ui",
                               isSelected
                                 ? "bg-primary border-primary text-white"
                                 : "bg-white/5 border-white/10 group-hover:border-white/30",
@@ -333,7 +333,7 @@ export function GoogleCalendarSelector({
                             <div className="flex items-center gap-3 mb-1">
                               <span
                                 className={cn(
-                                  "text-xs font-semibold truncate transition-premium",
+                                  "text-xs font-semibold truncate transition-ui",
                                   isSelected ? "text-white" : "text-white/70",
                                 )}
                               >
@@ -361,7 +361,7 @@ export function GoogleCalendarSelector({
               {selectedCalendars.length > 0 && !setupComplete && (
                 <Button
                   onClick={handleConfirmSelection}
-                  className="w-full h-12 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl active:scale-95 transition-premium mt-4"
+                  className="w-full h-12 bg-primary hover:bg-primary/90 text-white text-sm font-semibold rounded-2xl transition-ui mt-4"
                 >
                   Watch {selectedCalendars.length} calendar
                   {selectedCalendars.length > 1 ? "s" : ""}
@@ -369,7 +369,7 @@ export function GoogleCalendarSelector({
               )}
 
               {setupComplete && (
-                <div className="p-6 bg-emerald-500/5 border border-emerald-500/20 rounded-2xl mt-6 animate-in zoom-in-95 duration-500">
+                <div className="p-6 bg-emerald-500/5 border border-emerald-500/20 rounded-2xl mt-6">
                   <div className="flex items-center gap-3 mb-3">
                     <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
                       <CheckCircle className="h-5 w-5" />

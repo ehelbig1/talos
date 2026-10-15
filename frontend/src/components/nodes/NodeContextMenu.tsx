@@ -54,14 +54,14 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
       ref={menuRef}
       style={{ position: "fixed", top: pos.y, left: pos.x }}
       className="z-[9999] bg-surface-3 rounded-xl py-1.5 min-w-[190px] border border-white/10 overflow-hidden
-       animate-in fade-in zoom-in-95 duration-150 origin-top-left"
+       origin-top-left"
       role="menu"
       aria-label="Node context menu"
     >
       {/* Duplicate */}
       <button
         type="button"
-        className="w-full text-left px-3 py-2 text-xs font-semibold text-foreground hover:bg-white/10 transition-premium flex items-center justify-between gap-2 group"
+        className="w-full text-left px-3 py-2 text-xs font-semibold text-foreground hover:bg-white/10 transition-ui flex items-center justify-between gap-2 group"
         onClick={() => {
           onDuplicate();
           onClose();
@@ -69,7 +69,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
         role="menuitem"
       >
         <span className="flex items-center gap-2">
-          <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-indigo-400 transition-premium" />
+          <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-indigo-400 transition-ui" />
           Duplicate
         </span>
         <kbd className="text-xs text-muted-foreground font-mono bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
@@ -81,12 +81,12 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
       {nodeId && (
         <button
           type="button"
-          className="w-full text-left px-3 py-2 text-xs font-semibold text-foreground hover:bg-white/10 transition-premium flex items-center justify-between gap-2 group"
+          className="w-full text-left px-3 py-2 text-xs font-semibold text-foreground hover:bg-white/10 transition-ui flex items-center justify-between gap-2 group"
           onClick={handleCopyId}
           role="menuitem"
         >
           <span className="flex items-center gap-2">
-            <ClipboardCopy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-violet-400 transition-premium" />
+            <ClipboardCopy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-violet-400 transition-ui" />
             Copy Node ID
           </span>
         </button>
@@ -97,7 +97,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
       {/* Delete */}
       <button
         type="button"
-        className="w-full text-left px-3 py-2 text-xs font-semibold text-red-400 hover:bg-red-500/10 transition-premium flex items-center justify-between gap-2 group"
+        className="w-full text-left px-3 py-2 text-xs font-semibold text-red-400 hover:bg-red-500/10 transition-ui flex items-center justify-between gap-2 group"
         onClick={() => {
           onDelete();
           onClose();

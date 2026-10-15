@@ -50,14 +50,14 @@ export function DisconnectDialog({
           <button
             onClick={onClose}
             disabled={disconnecting}
-            className="px-8 py-4 text-sm font-semibold border border-white/5 hover:bg-white/5 rounded-2xl transition-premium active:scale-95 text-muted-foreground hover:text-white"
+            className="px-8 py-4 text-sm font-semibold border border-white/5 hover:bg-white/5 rounded-2xl transition-ui text-muted-foreground hover:text-white"
           >
             Cancel
           </button>
           <button
             onClick={onConfirm}
             disabled={disconnecting}
-            className="px-10 py-4 text-sm font-semibold bg-destructive text-white rounded-2xl transition-premium active:scale-95 hover:bg-destructive/90"
+            className="px-10 py-4 text-sm font-semibold bg-destructive text-white rounded-2xl transition-ui hover:bg-destructive/90"
           >
             {disconnecting ? (
               <div className="flex items-center gap-3">
