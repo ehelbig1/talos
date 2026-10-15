@@ -104,3 +104,12 @@ carried **E-8**), **E2-3**, **E2-5**, **E2-7** (Low/Info), **E2-6** (decision),
   interval's worth past the cap before it is stopped (the host functions
   refuse up front). A guest blocked in a host call is measured on its next tick.
 - E2-6 above.
+
+## Correction, 2026-10-15 (R11)
+
+The E2-6 key-family list above is incomplete: the worker also READS
+`wasm:{user}:{module}` (the module bytes the controller caches for a
+`redis:wasm:` URI) and WRITES `approval:{id}` (an approval's reply topic, which
+the controller reads). The per-role Redis user was then built
+(`2026-10-15-worker-redis-user.md`), from an inventory that covers both and
+pinned to the code by `worker/src/redis_acl_contract.rs`.

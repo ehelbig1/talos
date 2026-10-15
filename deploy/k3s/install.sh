@@ -51,6 +51,10 @@
 #                              source (compile, lint and hot update are refused). Requires
 #                              TALOS_REGISTRY_URL. Default: true.
 #   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
+#   TALOS_WORKER_REDIS_URL     the worker's OWN Redis user, e.g. rediss://talos-worker:pass@host:6379,
+#                              created on your Redis from deploy/redis/worker.acl-rules
+#                              (docs/redis-worker-user.md). Unset → the worker shares
+#                              TALOS_REDIS_URL's credential and warns at boot (E2-6).
 #   TALOS_WORKER_TRUST         RFC 0010 worker trust (Ed25519 dispatch signing, per-worker
 #                              result signing, per-execution envelope sealing). Default
 #                              "auto": a FRESH install gets the full posture (phase D);
@@ -468,6 +472,11 @@ if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
     # worker Deployment both mount it as REQUIRED keys.
     backfill_secret_key NATS_WORKER_USER "talos-worker"
     backfill_secret_key NATS_WORKER_PASSWORD "$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)"
+    # The worker's own Redis user (2026-10-15, E2-6): only when the operator
+    # gives one; an empty key counts as absent, so setting it later fills it.
+    if [[ -n "${TALOS_WORKER_REDIS_URL:-}" ]]; then
+        backfill_secret_key WORKER_REDIS_URL "$TALOS_WORKER_REDIS_URL"
+    fi
     backfill_secret_key PROMETHEUS_SCRAPE_TOKEN "$(openssl rand -hex 32)"
     # Worker-trust keypairs (2026-09-11). Seeds are minted ONCE and kept; the
     # public halves are stored beside them so every later run can render
@@ -574,6 +583,7 @@ else
         DATABASE_URL="$TALOS_POSTGRES_URL"
         TALOS_ADMIN_QUERY_DATABASE_URL="${TALOS_ADMIN_QUERY_DATABASE_URL:-}"
         REDIS_URL="$TALOS_REDIS_URL"
+        WORKER_REDIS_URL="${TALOS_WORKER_REDIS_URL:-}"
         NATS_USER="$NATS_USER"
         NATS_PASSWORD="$NATS_PASSWORD"
         NATS_CLUSTER_USER="$NATS_CLUSTER_USER"
@@ -718,6 +728,14 @@ fi
 WT_CTL_LINES="$(wt_render_controller_env "$WT_PHASE" "$(secret_get TALOS_WORKER_PUBLIC_KEY)")"
 WT_WRK_LINES="$(wt_render_worker_env "$WT_PHASE" "$(secret_get TALOS_CONTROLLER_PUBLIC_KEY)")"
 WT_CONTROLLER_ENV_BLOCK=""; [[ -n "$WT_CTL_LINES" ]] && WT_CONTROLLER_ENV_BLOCK=$(printf '  env:\n%s' "$WT_CTL_LINES")
+WT_WORKER_REDIS_KEY="REDIS_URL"
+if [[ -n "${TALOS_WORKER_REDIS_URL:-}" ]]; then
+    [[ "$TALOS_WORKER_REDIS_URL" != "$TALOS_REDIS_URL" ]] \
+        || die "TALOS_WORKER_REDIS_URL is TALOS_REDIS_URL — give the worker its own Redis user (docs/redis-worker-user.md)"
+    WT_WORKER_REDIS_KEY="WORKER_REDIS_URL"
+else
+    warn "TALOS_WORKER_REDIS_URL is unset: the worker shares the controller's Redis credential (E2-6, docs/redis-worker-user.md)"
+fi
 WT_WORKER_ENV_BLOCK="";     [[ -n "$WT_WRK_LINES" ]] && WT_WORKER_ENV_BLOCK=$(printf '  env:\n%s' "$WT_WRK_LINES")
 if wt_phase_at_least "$WT_PHASE" A && ! wt_is_hex64 "$(secret_get TALOS_WORKER_PUBLIC_KEY)"; then
     die "TALOS_WORKER_PUBLIC_KEY missing from $SECRET_NAME — cannot render worker-trust phase $WT_PHASE"
@@ -779,6 +797,7 @@ worker:
   image:
     repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-worker"
     digest: "${TALOS_WORKER_DIGEST}"
+  redisUrlSecretKey: "${WT_WORKER_REDIS_KEY}"
 ${WT_WORKER_ENV_BLOCK}
   # Sigstore enforcement for OCI template signatures — for BOTH processes:
   # the chart renders these onto the worker AND the controller (whose OCI

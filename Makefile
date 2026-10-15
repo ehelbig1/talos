@@ -83,6 +83,10 @@ up: ## Build + start the full dev stack, wait for health
 	    printf 'NATS_WORKER_USER=talos-worker\nNATS_WORKER_PASSWORD=%s\n' "$$(openssl rand -hex 16)" >> .env; \
 	    printf '\033[1;33m⚠ back-filled NATS_WORKER_USER / NATS_WORKER_PASSWORD into .env\033[0m (worker NATS credential, 2026-09-10)\n'; \
 	}
+	@grep -Eq '^REDIS_WORKER_PASSWORD=' .env || { \
+	    printf 'REDIS_WORKER_PASSWORD=%s\n' "$$(openssl rand -hex 16)" >> .env; \
+	    printf '\033[1;33m⚠ back-filled REDIS_WORKER_PASSWORD into .env\033[0m (the worker'"'"'s own Redis user, 2026-10-15)\n'; \
+	}
 	@# Refuse to build onto a full Docker VM disk: Postgres PANICs on ENOSPC
 	@# mid-checkpoint and crash-loops (2026-07-29). Advisory unless >=95% —
 	@# skips silently when docker is unavailable. TALOS_UP_SKIP_DISK_CHECK=1

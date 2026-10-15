@@ -1,0 +1,58 @@
+# The worker's Redis user: the key families it reads and writes, and the
+# commands it sends (security review 2026-10-15, E2-6). The ONE home of the
+# rules: both compose files' Redis loads them (deploy/redis/start.sh), an
+# operator with an external Redis creates the user from them (docs/redis-
+# worker-user.md), and scripts/tests/redis-worker-acl-test.sh drives every
+# family through a real Redis with them.
+#
+# One rule per line; `#` lines and blank lines are ignored. A worker key
+# family added in code without a line here is refused by Redis, and every
+# dispatch that needs it fails — add the line in the same change.
+#
+# Dispatch replay guard (worker/src/dispatch_replay.rs): SET NX PX.
+~talos:jobnonce:*
+# Job idempotency (talos-worker-runtime job_idempotency): GET, SET EX, DEL.
+~talos:idem:*
+# Sealed module results (runtime.rs): GET, TTL, SETEX.
+~wasm:result:*
+# Module bytes the CONTROLLER caches for a `redis:wasm:` URI: read only.
+%R~wasm:*
+# OCI layer cache (module_fetcher.rs): GET, SET EX, DEL.
+~oci_cache:*
+# The guest cache interface (host/cache.rs), user-prefixed by the host.
+~talos_cache:*
+# The tier-2 expose_secret daily cap (host/secrets.rs): EVAL INCR/EXPIRE.
+~talos:tier2_expose:*
+# Local-LLM fleet admission, shared with the controller (talos-local-inference).
+~talos:llm-admit:*
+# Approval reply topics (host/governance.rs), read by the controller.
+~approval:*
+resetchannels
+-@all
++get
++set
++setex
++del
++exists
++mget
++expire
++ttl
++multi
++exec
++eval
++evalsha
++script|load
++incr
++incrby
++pexpire
++time
++zadd
++zrem
++zscore
++zcard
++zrank
++zrangebyscore
++zremrangebyscore
++ping
++client|setinfo
++acl|whoami

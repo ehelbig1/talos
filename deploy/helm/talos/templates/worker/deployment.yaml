@@ -131,11 +131,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: NATS_WORKER_PASSWORD
+            # The worker's own Redis user when the bootstrap Secret carries one
+            # (worker.redisUrlSecretKey: WORKER_REDIS_URL — security review
+            # 2026-10-15, E2-6); the controller's REDIS_URL otherwise.
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
-                  key: REDIS_URL
+                  key: {{ .Values.worker.redisUrlSecretKey | default "REDIS_URL" }}
             - name: WORKER_SHARED_KEY
               valueFrom:
                 secretKeyRef:

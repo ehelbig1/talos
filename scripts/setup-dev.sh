@@ -49,6 +49,8 @@ TALOS_WORKER_REGISTRATION_TOKEN=$(openssl rand -hex 32)
 # ─── Datastore credentials ──────────────────────────────────────────────────
 POSTGRES_PASSWORD=$(openssl rand -hex 16)
 REDIS_PASSWORD=$(openssl rand -hex 16)
+# The worker's own Redis user (deploy/redis/worker.acl-rules).
+REDIS_WORKER_PASSWORD=$(openssl rand -hex 16)
 NATS_USER=talos
 NATS_PASSWORD=$(openssl rand -hex 16)
 # Worker NATS credential — a SEPARATE pair the broker binds to the worker
