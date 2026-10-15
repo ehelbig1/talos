@@ -46,7 +46,7 @@ function CopyButton({ value }: { value: string }) {
   return (
     <button
       onClick={handleCopy}
-      className="p-1 hover:bg-muted rounded transition-premium text-muted-foreground hover:text-foreground"
+      className="p-1 hover:bg-muted rounded transition-ui text-muted-foreground hover:text-foreground"
       title="Copy"
     >
       {copied ? (
@@ -89,7 +89,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
 
   if (result) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 animate-in fade-in duration-500">
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60">
         <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden">
           <div className="flex items-center gap-5 mb-10 relative z-10">
             <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-2xl flex items-center justify-center">
@@ -145,7 +145,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 animate-in fade-in duration-500">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60">
       <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-md relative overflow-hidden">
         <div className="flex items-center justify-between mb-10 relative z-10">
           <div className="space-y-1">
@@ -160,7 +160,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="p-2.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-premium text-muted-foreground hover:text-white"
+            className="p-2.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-ui text-muted-foreground hover:text-white"
           >
             <X className="w-4 h-4" />
           </button>
@@ -175,7 +175,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. GitHub push"
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui"
             />
           </div>
 
@@ -186,7 +186,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             <select
               value={moduleId}
               onChange={(e) => setModuleId(e.target.value)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer"
             >
               <option value="" className="bg-surface-3">
                 Select a workflow…
@@ -209,7 +209,7 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
               max={1000}
               value={rateLimit}
               onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium"
+              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui"
             />
           </div>
 
@@ -275,7 +275,7 @@ export default function WebhookManager() {
         {/* Header */}
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-12 relative z-10">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
+            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
               <Webhook className="w-8 h-8 text-primary" />
             </div>
             <div>
@@ -299,7 +299,7 @@ export default function WebhookManager() {
 
         {triggers.length === 0 ? (
           <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
-            <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-premium" />
+            <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-ui" />
             <p className="text-sm text-muted-foreground font-semibold">
               No webhooks yet
             </p>
@@ -319,20 +319,18 @@ export default function WebhookManager() {
               return (
                 <div
                   key={t.id}
-                  className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-premium group relative overflow-hidden"
+                  className="bg-white/[0.02] border border-white/5 rounded-2xl p-6 hover:bg-white/[0.04] hover:border-white/10 transition-ui group relative overflow-hidden"
                 >
                   <div className="flex items-start justify-between gap-6 mb-5 relative z-10">
                     <div className="flex items-center gap-4 min-w-0">
                       <div
                         className={cn(
                           "w-2.5 h-2.5 rounded-full shrink-0",
-                          t.enabled
-                            ? "bg-success animate-status-pulse"
-                            : "bg-muted-foreground/30",
+                          t.enabled ? "bg-success" : "bg-muted-foreground/30",
                         )}
                       />
                       <div className="min-w-0">
-                        <span className="text-lg font-semibold text-white tracking-tight font-outfit truncate group-hover:text-primary transition-premium">
+                        <span className="text-lg font-semibold text-white tracking-tight font-outfit truncate group-hover:text-primary transition-ui">
                           {t.name}
                         </span>
                         <div className="flex items-center gap-3 mt-1">
@@ -419,7 +417,7 @@ export default function WebhookManager() {
 
         <div className="mt-10 pt-6 border-t border-white/5 flex items-center justify-between relative z-10">
           <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+            <div className="w-2 h-2 rounded-full bg-success" />
             <span className="text-xs text-muted-foreground/70 font-semibold">
               Ingress Monitoring Active &bull; Polling 30s Intervals
             </span>

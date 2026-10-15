@@ -32,18 +32,18 @@ export function SetupPanel({
   onGoToActors: () => void;
 }) {
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
       {/* Workflow selector */}
       <div className="bg-surface-1/40 border border-white/5 rounded-2xl p-10 space-y-6 bg-surface-3 border border-white/10 relative overflow-hidden">
         <div className="absolute top-0 right-0 p-8 opacity-5">
           <Clock size={120} />
         </div>
         <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
-          <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
+          <div className="w-1.5 h-1.5 rounded-full bg-primary" />
           01. SELECT TARGET WORKFLOW
         </h2>
         {loadingWorkflows ? (
-          <div className="flex items-center gap-3 text-muted-foreground/60 animate-pulse py-4">
+          <div className="flex items-center gap-3 text-muted-foreground/60 py-4">
             <Loader2 className="w-4 h-4 animate-spin" />
             <span className="text-xs font-bold">Accessing Registry...</span>
           </div>
@@ -56,7 +56,7 @@ export function SetupPanel({
             <select
               value={selectedWorkflowId}
               onChange={(e) => onSelectWorkflow(e.target.value)}
-              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-premium appearance-none cursor-pointer relative z-10"
+              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-ui appearance-none cursor-pointer relative z-10"
             >
               <option value="" className="bg-surface-4">
                 Select a workflow…
@@ -80,14 +80,14 @@ export function SetupPanel({
           <Bot size={120} />
         </div>
         <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
-          <div className="w-1.5 h-1.5 rounded-full bg-primary animate-status-pulse" />
+          <div className="w-1.5 h-1.5 rounded-full bg-primary" />
           02. Choose actors
           <span className="text-muted-foreground/70 normal-case font-bold tracking-wider ml-auto">
             (at least 2)
           </span>
         </h2>
         {loadingActors ? (
-          <div className="flex items-center gap-3 text-muted-foreground/60 animate-pulse py-4">
+          <div className="flex items-center gap-3 text-muted-foreground/60 py-4">
             <Loader2 className="w-4 h-4 animate-spin" />
             <span className="text-xs font-bold">Loading actors…</span>
           </div>
@@ -96,7 +96,7 @@ export function SetupPanel({
             No active actors.{" "}
             <button
               onClick={onGoToActors}
-              className="text-primary hover:text-white transition-premium underline"
+              className="text-primary hover:text-white transition-ui underline"
             >
               Create one →
             </button>
@@ -109,7 +109,7 @@ export function SetupPanel({
                 <label
                   key={actor.id}
                   className={cn(
-                    "flex items-center gap-4 p-4 rounded-2xl cursor-pointer transition-premium group relative overflow-hidden",
+                    "flex items-center gap-4 p-4 rounded-2xl cursor-pointer transition-ui group relative overflow-hidden",
                     selected
                       ? "bg-primary/5 border-primary/20"
                       : "bg-surface-3/40 border border-white/5 hover:border-white/20",
@@ -117,7 +117,7 @@ export function SetupPanel({
                 >
                   <div
                     className={cn(
-                      "w-5 h-5 rounded-md border transition-premium flex items-center justify-center shrink-0",
+                      "w-5 h-5 rounded-md border transition-ui flex items-center justify-center shrink-0",
                       selected
                         ? "bg-primary border-primary"
                         : "border-white/10 group-hover:border-white/30",

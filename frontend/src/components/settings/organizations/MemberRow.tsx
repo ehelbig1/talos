@@ -23,9 +23,9 @@ export function MemberRow({
   onRemove: (userId: string) => void;
 }): React.ReactElement {
   return (
-    <div className="flex items-center justify-between p-4 bg-white/[0.02] hover:bg-white/[0.04] border border-white/5 hover:border-white/10 rounded-2xl transition-premium group">
+    <div className="flex items-center justify-between p-4 bg-white/[0.02] hover:bg-white/[0.04] border border-white/5 hover:border-white/10 rounded-2xl transition-ui group">
       <div className="flex items-center gap-4">
-        <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-white transition-premium">
+        <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-white transition-ui">
           {member.userId.charAt(0).toUpperCase()}
         </div>
         <div>
@@ -67,7 +67,7 @@ export function MemberRow({
                   })
                 }
                 className={cn(
-                  "text-2xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded-lg transition-premium",
+                  "text-2xs font-semibold uppercase tracking-wider px-3 py-1.5 rounded-lg transition-ui",
                   role === member.role
                     ? role === "admin"
                       ? "bg-success/20 border border-success/30 text-success"
@@ -85,7 +85,7 @@ export function MemberRow({
             type="button"
             aria-label={`Remove member ${member.userId} from organization`}
             onClick={() => onRemove(member.userId)}
-            className="p-2.5 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 rounded-xl transition-premium opacity-0 group-hover:opacity-100 border border-transparent hover:border-destructive/20"
+            className="p-2.5 text-muted-foreground/60 hover:text-destructive hover:bg-destructive/10 rounded-xl transition-ui opacity-0 group-hover:opacity-100 border border-transparent hover:border-destructive/20"
           >
             <Trash2 className="w-4 h-4" />
           </button>

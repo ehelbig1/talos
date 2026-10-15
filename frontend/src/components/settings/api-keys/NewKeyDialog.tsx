@@ -19,7 +19,7 @@ export function NewKeyDialog({
   return (
     <Dialog open={true} onClose={onClose}>
       <div
-        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-300"
+        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[520px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-8 py-6 border-b border-amber-500/10 flex items-center justify-between bg-amber-500/[0.03]">
@@ -59,7 +59,7 @@ export function NewKeyDialog({
               </pre>
               <Button
                 size="sm"
-                className="absolute top-3 right-3 h-8 px-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs rounded-lg transition-transform active:scale-95"
+                className="absolute top-3 right-3 h-8 px-3 bg-amber-500 hover:bg-amber-400 text-black font-bold text-xs rounded-lg transition-transform"
                 onClick={async () => {
                   try {
                     await navigator.clipboard.writeText(newKey);
@@ -81,7 +81,7 @@ export function NewKeyDialog({
         <div className="px-8 py-6 bg-white/[0.02] border-t border-white/5 flex justify-end">
           <Button
             onClick={onClose}
-            className="bg-white/10 hover:bg-white/10 text-foreground border border-white/10 px-8 h-11 rounded-xl font-bold transition-premium"
+            className="bg-white/10 hover:bg-white/10 text-foreground border border-white/10 px-8 h-11 rounded-xl font-bold transition-ui"
           >
             I've Saved It
           </Button>

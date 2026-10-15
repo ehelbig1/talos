@@ -30,7 +30,7 @@ export const PageHeader: React.FC<PageHeaderProps> = ({
     {backTo && (
       <Link
         to={backTo.to}
-        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-white transition-premium mb-3 -ml-1"
+        className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-white transition-ui mb-3 -ml-1"
       >
         <ChevronLeft className="w-4 h-4" />
         {backTo.label}

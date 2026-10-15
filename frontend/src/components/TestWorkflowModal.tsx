@@ -115,14 +115,14 @@ function NodeTraceCard({
   return (
     <div
       className={cn(
-        "rounded-2xl border overflow-hidden transition-premium",
+        "rounded-2xl border overflow-hidden transition-ui",
         trace.status === "failed"
           ? "border-destructive/30 bg-destructive/5"
           : "border-white/5 bg-white/[0.02]",
       )}
     >
       <button
-        className="w-full flex items-center gap-4 px-5 py-4 text-left hover:bg-white/5 transition-premium"
+        className="w-full flex items-center gap-4 px-5 py-4 text-left hover:bg-white/5 transition-ui"
         onClick={() => setExpanded((v) => !v)}
         disabled={!hasDetail}
       >
@@ -151,7 +151,7 @@ function NodeTraceCard({
           </span>
         )}
         {hasDetail && (
-          <div className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center transition-premium group-hover:bg-white/10">
+          <div className="w-6 h-6 rounded-lg bg-white/5 flex items-center justify-center transition-ui group-hover:bg-white/10">
             {expanded ? (
               <ChevronDown className="w-3.5 h-3.5 text-muted-foreground/50" />
             ) : (
@@ -162,7 +162,7 @@ function NodeTraceCard({
       </button>
 
       {expanded && hasDetail && (
-        <div className="border-t border-white/5 px-6 pb-6 space-y-5 pt-5 animate-in slide-in-from-top-2 duration-300">
+        <div className="border-t border-white/5 px-6 pb-6 space-y-5 pt-5">
           {trace.logMessage && (
             <div className="space-y-3">
               <p className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider ml-1">
@@ -380,7 +380,7 @@ export function TestWorkflowModal({
             {workflowName}
           </p>
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
             <span className="text-2xs font-semibold text-emerald-500/60 uppercase tracking-wider">
               Sandboxed
             </span>
@@ -394,7 +394,7 @@ export function TestWorkflowModal({
               Synthetic Trigger Ingress (JSON)
             </label>
             {jsonError && (
-              <span className="text-2xs font-semibold text-destructive uppercase tracking-wider animate-pulse">
+              <span className="text-2xs font-semibold text-destructive uppercase tracking-wider">
                 {jsonError}
               </span>
             )}
@@ -405,7 +405,7 @@ export function TestWorkflowModal({
             rows={4}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-premium",
+              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-ui",
               jsonError
                 ? "border-destructive/40 focus:border-destructive focus:ring-destructive/20"
                 : "border-white/5 focus:border-primary/40 focus:ring-primary/20",
@@ -422,7 +422,7 @@ export function TestWorkflowModal({
             <Button
               onClick={handleRun}
               disabled={!!jsonError || testMutation.isPending || isRunning}
-              className="bg-primary hover:bg-primary/90 text-white font-semibold px-10 h-14 rounded-2xl transition-premium flex items-center gap-3 text-sm border border-white/10 shrink-0"
+              className="bg-primary hover:bg-primary/90 text-white font-semibold px-10 h-14 rounded-2xl transition-ui flex items-center gap-3 text-sm border border-white/10 shrink-0"
             >
               {testMutation.isPending || isRunning ? (
                 <>
@@ -506,11 +506,11 @@ export function TestWorkflowModal({
                     </div>
                     <div className="h-1 w-full bg-white/5 rounded-full overflow-hidden flex">
                       <div
-                        className="bg-success h-full transition-premium"
+                        className="bg-success h-full transition-ui"
                         style={{ width: `${(succeeded / traceTotal) * 100}%` }}
                       />
                       <div
-                        className="bg-destructive h-full transition-premium"
+                        className="bg-destructive h-full transition-ui"
                         style={{ width: `${(failed / traceTotal) * 100}%` }}
                       />
                     </div>
@@ -558,7 +558,7 @@ export function TestWorkflowModal({
                 !isTerminal && (
                   <div className="flex flex-col items-center justify-center py-16 gap-6">
                     <LoadingSpinner className="w-10 h-10 text-primary" />
-                    <p className="text-xs font-semibold text-primary/70 animate-pulse">
+                    <p className="text-xs font-semibold text-primary/70">
                       Waiting for the first node…
                     </p>
                   </div>

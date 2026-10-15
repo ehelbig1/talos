@@ -50,11 +50,11 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
 
         <div className="relative z-10">
           {result ? (
-            <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+            <div className="space-y-8">
               <div className="bg-success/5 border border-success/20 rounded-2xl p-6 bg-white/[0.03] border border-white/5 relative group overflow-hidden">
-                <div className="absolute inset-0 bg-success/5 opacity-0 group-hover:opacity-100 transition-premium" />
+                <div className="absolute inset-0 bg-success/5 opacity-0 group-hover:opacity-100 transition-ui" />
                 <div className="flex items-center gap-3 mb-3">
-                  <div className="w-2 h-2 rounded-full bg-success animate-status-pulse" />
+                  <div className="w-2 h-2 rounded-full bg-success" />
                   <p className="text-success text-xs font-semibold">
                     Run started
                   </p>
@@ -70,7 +70,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
               </div>
               <button
                 onClick={onClose}
-                className="w-full py-4 text-sm font-semibold text-white bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/20 transition-premium active:scale-95 bg-white/[0.03] border border-white/5"
+                className="w-full py-4 text-sm font-semibold text-white bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/20 transition-ui bg-white/[0.03] border border-white/5"
               >
                 Abort Viewport
               </button>
@@ -97,7 +97,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                     <select
                       value={selectedWorkflowId}
                       onChange={(e) => setSelectedWorkflowId(e.target.value)}
-                      className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium appearance-none relative z-10 font-medium"
+                      className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui appearance-none relative z-10 font-medium"
                     >
                       <option value="" className="bg-surface-3">
                         Select a workflow…
@@ -124,7 +124,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                   selectedWorkflowId && triggerMut.mutate(selectedWorkflowId)
                 }
                 disabled={!selectedWorkflowId || triggerMut.isPending}
-                className="w-full flex items-center justify-center gap-4 bg-primary hover:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed text-white text-sm font-semibold py-5 rounded-2xl transition-premium active:scale-95 border border-white/20"
+                className="w-full flex items-center justify-center gap-4 bg-primary hover:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed text-white text-sm font-semibold py-5 rounded-2xl transition-ui border border-white/20"
               >
                 {triggerMut.isPending ? (
                   <>

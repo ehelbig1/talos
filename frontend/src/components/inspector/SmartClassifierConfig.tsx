@@ -79,9 +79,9 @@ interface SmartClassifierConfigProps {
 const labelStyle =
   "text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1";
 const inputBase =
-  "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium placeholder:text-muted-foreground/50";
+  "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui placeholder:text-muted-foreground/50";
 const textareaBase =
-  "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed custom-scrollbar";
+  "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-ui resize-none leading-relaxed custom-scrollbar";
 
 /**
  * First-class configuration surface for a `smart-classifier` module node.
@@ -252,7 +252,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
   };
 
   return (
-    <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
+    <div className="space-y-8">
       {/* Header */}
       <div className="flex items-center gap-3">
         <div className="p-2 rounded-xl bg-primary/10 border border-primary/20 text-primary">
@@ -288,7 +288,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           {!!liveModel && liveModel.pendingDisagreements > 0 && (
             <Link
               to="/models"
-              className="flex items-center gap-1.5 text-xs font-bold text-warning hover:text-warning/80 transition-premium"
+              className="flex items-center gap-1.5 text-xs font-bold text-warning hover:text-warning/80 transition-ui"
             >
               <AlertTriangle className="w-3 h-3" />
               {liveModel.pendingDisagreements} to review
@@ -304,7 +304,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               updateNodeData(nodeId, { config: rest });
               setName("");
             }}
-            className="text-2xs font-bold text-muted-foreground/70 hover:text-muted-foreground uppercase tracking-wider transition-premium"
+            className="text-2xs font-bold text-muted-foreground/70 hover:text-muted-foreground uppercase tracking-wider transition-ui"
           >
             Re-configure classifier…
           </button>
@@ -342,7 +342,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <Button
             onClick={handleProvision}
             disabled={!canProvision}
-            className="w-full h-11 text-sm font-semibold rounded-2xl bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 disabled:opacity-40 disabled:cursor-not-allowed transition-premium"
+            className="w-full h-11 text-sm font-semibold rounded-2xl bg-primary/20 border border-primary/30 text-primary hover:bg-primary/30 disabled:opacity-40 disabled:cursor-not-allowed transition-ui"
           >
             {isProvisioning ? (
               <>
@@ -390,7 +390,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               <button
                 onClick={() => removeLabel(l)}
                 aria-label={`Remove ${l}`}
-                className="text-muted-foreground/70 hover:text-destructive transition-premium"
+                className="text-muted-foreground/70 hover:text-destructive transition-ui"
               >
                 <X className="w-3 h-3" />
               </button>
@@ -413,7 +413,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <Button
             onClick={addLabel}
             aria-label="Add label"
-            className="h-11 px-4 rounded-2xl bg-white/5 border border-white/5 text-white/60 hover:text-white hover:bg-white/10 transition-premium shrink-0"
+            className="h-11 px-4 rounded-2xl bg-white/5 border border-white/5 text-white/60 hover:text-white hover:bg-white/10 transition-ui shrink-0"
           >
             <Plus className="w-4 h-4" />
           </Button>
@@ -430,7 +430,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
       <div className="space-y-3">
         <button
           onClick={() => setAdvancedOpen((v) => !v)}
-          className="flex items-center gap-2 text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider hover:text-white transition-premium"
+          className="flex items-center gap-2 text-2xs font-semibold text-muted-foreground/70 uppercase tracking-wider hover:text-white transition-ui"
         >
           <ChevronDown
             className={cn(
@@ -441,7 +441,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           LLM Fallback
         </button>
         {advancedOpen && (
-          <div className="space-y-4 animate-in slide-in-from-top-2 duration-300">
+          <div className="space-y-4">
             <div className="space-y-3">
               <label className={labelStyle}>Provider</label>
               <DarkSelect

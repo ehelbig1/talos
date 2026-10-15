@@ -41,7 +41,7 @@ export function KeysTable({
         {isLoading ? (
           <div className="p-24 flex flex-col items-center justify-center gap-4">
             <LoadingSpinner className="w-8 h-8 text-indigo-500" />
-            <p className="text-xs text-muted-foreground font-bold animate-pulse">
+            <p className="text-xs text-muted-foreground font-bold">
               Loading Keys...
             </p>
           </div>
@@ -75,7 +75,7 @@ export function KeysTable({
                     return (
                       <tr
                         key={k.id}
-                        className="group hover:bg-indigo-500/[0.02] transition-premium"
+                        className="group hover:bg-indigo-500/[0.02] transition-ui"
                       >
                         <td className="px-8 py-5">
                           <div className="flex items-center gap-3">
@@ -124,12 +124,12 @@ export function KeysTable({
                           )}
                         </td>
                         <td className="px-8 py-5 text-right">
-                          <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-premium">
+                          <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-ui">
                             <Button
                               variant="ghost"
                               size="sm"
                               onClick={() => onRotate(k.id)}
-                              className="text-muted-foreground hover:text-indigo-400 hover:bg-indigo-400/10 h-9 px-3 font-bold transition-premium text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-indigo-400 hover:bg-indigo-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <RefreshCw className="w-4 h-4" />
                               Rotate
@@ -138,7 +138,7 @@ export function KeysTable({
                               variant="ghost"
                               size="sm"
                               onClick={() => onRevoke(k.id)}
-                              className="text-muted-foreground hover:text-amber-400 hover:bg-amber-400/10 h-9 px-3 font-bold transition-premium text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-amber-400 hover:bg-amber-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <Shield className="w-4 h-4" />
                               Revoke
@@ -147,7 +147,7 @@ export function KeysTable({
                               variant="ghost"
                               size="sm"
                               onClick={() => onDelete(k.id)}
-                              className="text-muted-foreground hover:text-red-400 hover:bg-red-400/10 h-9 px-3 font-bold transition-premium text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-red-400 hover:bg-red-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <Trash2 className="w-4 h-4" />
                               Delete

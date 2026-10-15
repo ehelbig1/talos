@@ -65,7 +65,7 @@ function StatCard({
 }: StatCardProps) {
   const Icon = icon as React.ReactElement<{ size?: number }>;
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 transition-premium hover-elevation relative overflow-hidden group">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 transition-ui hover-elevation relative overflow-hidden group">
       <div className="absolute top-0 right-0 p-4 opacity-5 group-hover:opacity-10 transition-opacity">
         {React.cloneElement(Icon, { size: 48 })}
       </div>
@@ -121,7 +121,7 @@ function RateBar({ rate }: { rate: number }) {
       <div className="flex-1 bg-white/5 rounded-full h-1.5 overflow-hidden">
         <div
           className={cn(
-            "h-full rounded-full transition-all duration-1000",
+            "h-full rounded-full transition-[width] duration-300",
             color,
             glow,
           )}
@@ -249,7 +249,7 @@ function ActorBreakdown() {
                   key={r.label}
                   onClick={() => navigate("/actors")}
                   className={cn(
-                    "w-full flex items-center gap-4 p-4 rounded-2xl border transition-premium group active:scale-95",
+                    "w-full flex items-center gap-4 p-4 rounded-2xl border transition-ui group",
                     r.bg,
                   )}
                 >
@@ -352,7 +352,7 @@ function UpcomingSchedules() {
             return (
               <div
                 key={s.id}
-                className="flex items-center gap-4 p-4 bg-surface-4/40 border border-white/5 rounded-2xl transition-premium hover:bg-surface-4/60 group"
+                className="flex items-center gap-4 p-4 bg-surface-4/40 border border-white/5 rounded-2xl transition-ui hover:bg-surface-4/60 group"
               >
                 <div
                   className={cn(
@@ -373,9 +373,7 @@ function UpcomingSchedules() {
                 <span
                   className={cn(
                     "text-xs font-semibold shrink-0",
-                    isOverdue
-                      ? "text-destructive animate-status-pulse"
-                      : "text-primary",
+                    isOverdue ? "text-destructive" : "text-primary",
                   )}
                 >
                   {futureTime(s.nextTriggerAt)}
@@ -484,7 +482,7 @@ function WorkflowHealth() {
                   return (
                     <tr
                       key={s.id}
-                      className="group/row hover:bg-white/5 transition-premium"
+                      className="group/row hover:bg-white/5 transition-ui"
                     >
                       <td className="py-4 pl-4">
                         <div className="flex items-center gap-3">

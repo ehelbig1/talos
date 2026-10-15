@@ -175,7 +175,7 @@ export function ModuleBuilder({
     <Dialog open={true} onClose={onClose} title="Module builder">
       <div className="space-y-8">
         {!selectedTemplateId ? (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-700">
+          <div>
             <Suspense
               fallback={
                 <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
@@ -199,7 +199,7 @@ export function ModuleBuilder({
             <p className="text-xs font-semibold">Loading template…</p>
           </div>
         ) : templateError ? (
-          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive animate-in shake duration-500 bg-surface-3 border border-white/10">
+          <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive bg-surface-3 border border-white/10">
             <div className="flex items-start gap-4">
               <Shield className="w-6 h-6 shrink-0" />
               <div className="space-y-1">
@@ -215,7 +215,7 @@ export function ModuleBuilder({
               type="button"
               variant="outline"
               onClick={() => setSelectedTemplateId(null)}
-              className="mt-8 w-full h-12 border-destructive/20 text-destructive hover:bg-destructive/10 rounded-2xl font-semibold text-sm transition-premium active:scale-95"
+              className="mt-8 w-full h-12 border-destructive/20 text-destructive hover:bg-destructive/10 rounded-2xl font-semibold text-sm transition-ui"
             >
               <ArrowLeft className="h-3.5 w-3.5 mr-2" /> Return to Library
             </Button>
@@ -227,14 +227,14 @@ export function ModuleBuilder({
             onClose={resetAndClose}
           />
         ) : selectedTemplate ? (
-          <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
+          <div className="space-y-10">
             {/* Template Identity */}
             <div className="flex items-center gap-6 pb-8 border-b border-white/5 relative">
               <Button
                 variant="ghost"
                 size="icon"
                 onClick={() => setSelectedTemplateId(null)}
-                className="shrink-0 h-12 w-12 rounded-2xl bg-surface-2/60 border border-white/5 hover:bg-surface-3 transition-premium active:scale-90 relative z-10"
+                className="shrink-0 h-12 w-12 rounded-2xl bg-surface-2/60 border border-white/5 hover:bg-surface-3 transition-ui relative z-10"
                 aria-label="Back to Templates"
               >
                 <ArrowLeft className="h-4 w-4 text-muted-foreground/70" />
@@ -283,7 +283,7 @@ export function ModuleBuilder({
               {/* Integration Specifics */}
               {selectedTemplate.category === "calendar" &&
                 selectedTemplate.name.includes("Calendar") && (
-                  <div className="animate-in fade-in slide-in-from-top-4">
+                  <div>
                     <GoogleCalendarSelector
                       onSelect={(calendarConfig) => {
                         setConfig((prev) => ({ ...prev, ...calendarConfig }));
@@ -397,7 +397,7 @@ export function ModuleBuilder({
                                 setIpInput("");
                               }
                             }}
-                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl active:scale-95 transition-premium"
+                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl transition-ui"
                           >
                             Add
                           </Button>
@@ -407,7 +407,7 @@ export function ModuleBuilder({
                             {webhookSettings.allowedIps.map((ip, index) => (
                               <span
                                 key={ip}
-                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400 animate-in zoom-in-95 duration-200"
+                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400"
                               >
                                 {ip}
                                 <button
@@ -421,7 +421,7 @@ export function ModuleBuilder({
                                         ),
                                     });
                                   }}
-                                  className="text-white/50 hover:text-white transition-premium"
+                                  className="text-white/50 hover:text-white transition-ui"
                                 >
                                   <X className="h-3 w-3" />
                                 </button>
@@ -441,7 +441,7 @@ export function ModuleBuilder({
               <Button
                 variant="ghost"
                 onClick={onClose}
-                className="h-14 px-10 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2/60 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+                className="h-14 px-10 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2/60 hover:bg-surface-3 rounded-2xl border border-white/5"
               >
                 Abort Architect
               </Button>
@@ -457,7 +457,7 @@ export function ModuleBuilder({
                 }
                 disabled={!moduleName || createModuleMutation.isPending}
                 className={cn(
-                  "h-14 px-12 text-sm font-semibold transition-premium active:scale-[0.98] rounded-2xl",
+                  "h-14 px-12 text-sm font-semibold transition-ui rounded-2xl",
                   "bg-primary hover:bg-primary/90 text-white border-none",
                   (!moduleName || createModuleMutation.isPending) &&
                     "opacity-50 grayscale cursor-not-allowed",
@@ -475,7 +475,7 @@ export function ModuleBuilder({
             </div>
 
             {createModuleMutation.isError && (
-              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold text-center animate-in shake duration-500 bg-surface-3 border border-white/10">
+              <div className="p-6 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold text-center bg-surface-3 border border-white/10">
                 Critical Deployment Failure:{" "}
                 {sanitizeErrorMessage(
                   createModuleMutation.error instanceof Error
@@ -536,7 +536,7 @@ function WebhookSuccessView({
   const isSlackWebhook = templateName.toLowerCase().includes("slack");
 
   return (
-    <div className="space-y-10 animate-in fade-in slide-in-from-bottom-8 duration-1000">
+    <div className="space-y-10">
       <div className="text-center relative">
         <div className="inline-flex items-center justify-center w-24 h-24 rounded-2xl bg-success/10 border border-success/20 mb-10 relative z-10">
           <CheckCircle className="h-12 w-12 text-success" />
@@ -581,17 +581,17 @@ function WebhookSuccessView({
               },
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-ui">
                   {idx + 1}
                 </span>
-                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
+                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-ui">
                   {step.text}{" "}
                   {step.link && (
                     <a
                       href={`https://${step.link}`}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-indigo-400 underline decoration-indigo-400/20 underline-offset-4 hover:decoration-indigo-400 transition-premium ml-1"
+                      className="text-indigo-400 underline decoration-indigo-400/20 underline-offset-4 hover:decoration-indigo-400 transition-ui ml-1"
                     >
                       {step.link}
                     </a>
@@ -619,10 +619,10 @@ function WebhookSuccessView({
               "Send a test request to confirm it arrives",
             ].map((step, idx) => (
               <li key={idx} className="flex gap-6 items-start group">
-                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-premium">
+                <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-ui">
                   {idx + 1}
                 </span>
-                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-premium">
+                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-ui">
                   {step}
                 </p>
               </li>
@@ -644,7 +644,7 @@ function WebhookSuccessView({
       <Button
         type="button"
         onClick={onClose}
-        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-premium active:scale-[0.98]"
+        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-ui"
       >
         Acknowledge Deployment
       </Button>

@@ -58,7 +58,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
     <Dialog open={true} onClose={onClose} title="Add existing module">
       <div className="space-y-8">
         <div className="relative overflow-hidden p-6 bg-primary/5 border border-white/5 rounded-2xl bg-white/[0.03] border border-white/5 group">
-          <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-premium">
+          <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-ui">
             <Library className="w-12 h-12 text-primary" />
           </div>
           <div className="flex items-start gap-5 relative z-10">
@@ -78,7 +78,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
         </div>
 
         <div className="relative group/search">
-          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 group-focus-within/search:text-primary transition-premium z-10" />
+          <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
           <DarkInput
             type="text"
             placeholder="Search modules…"
@@ -92,12 +92,12 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
 
         <div className="min-h-[300px] flex flex-col">
           {loading ? (
-            <div className="flex-1 flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50 animate-status-pulse">
+            <div className="flex-1 flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
               <div className="w-10 h-10 border-4 border-primary/10 border-t-primary rounded-full animate-spin" />
               <p className="text-xs font-semibold">Loading…</p>
             </div>
           ) : error ? (
-            <div className="animate-in fade-in slide-in-from-top-2">
+            <div>
               <ErrorBanner message={error} />
             </div>
           ) : filteredModules.length === 0 ? (
@@ -136,7 +136,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
             <Button
               variant="ghost"
               onClick={onClose}
-              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+              className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
             >
               Abort
             </Button>

@@ -108,7 +108,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                   {p.id ? (
                     <button
                       onClick={() => navigate(`/actors/${p.id}`)}
-                      className="text-sm text-violet-300 hover:text-violet-200 transition-premium truncate"
+                      className="text-sm text-violet-300 hover:text-violet-200 transition-ui truncate"
                     >
                       {p.name}
                     </button>
@@ -158,7 +158,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                     {id ? (
                       <button
                         onClick={() => navigate(`/actors/${id}`)}
-                        className="text-violet-300 hover:text-violet-200 transition-premium"
+                        className="text-violet-300 hover:text-violet-200 transition-ui"
                       >
                         {name}
                       </button>
@@ -198,7 +198,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                     {id ? (
                       <button
                         onClick={() => navigate(`/actors/${id}`)}
-                        className="text-emerald-300 hover:text-emerald-200 transition-premium"
+                        className="text-emerald-300 hover:text-emerald-200 transition-ui"
                       >
                         {name}
                       </button>

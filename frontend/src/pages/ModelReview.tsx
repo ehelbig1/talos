@@ -111,7 +111,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
     return (
       <div className="px-6 py-5 bg-white/[0.02] border border-primary/20 rounded-2xl">
         <div className="flex items-center gap-2 mb-3">
-          <GraduationCap className="w-4 h-4 text-primary animate-pulse" />
+          <GraduationCap className="w-4 h-4 text-primary" />
           <span className="text-2xs text-primary/80 font-semibold uppercase tracking-wider">
             Teacher ceiling — auditing
           </span>
@@ -121,7 +121,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
         </div>
         <div className="h-1.5 bg-white/5 rounded-full overflow-hidden">
           <div
-            className="h-full bg-primary transition-all duration-500 ease-premium-out"
+            className="h-full bg-primary transition-[width] duration-300"
             style={{ width: `${progressPct}%` }}
           />
         </div>
@@ -178,7 +178,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
                 </span>
                 <div className="flex-1 h-1.5 bg-white/5 rounded-full overflow-hidden">
                   <div
-                    className="h-full bg-primary/70 transition-all duration-500 ease-premium-out"
+                    className="h-full bg-primary/70 transition-[width] duration-300"
                     style={{ width: `${classPct}%` }}
                   />
                 </div>
@@ -304,7 +304,7 @@ export default function ModelReview() {
                     type="button"
                     onClick={() => setPicked(m.name)}
                     className={cn(
-                      "text-left w-72 rounded-2xl p-6 border transition-premium relative overflow-hidden group",
+                      "text-left w-72 rounded-2xl p-6 border transition-ui relative overflow-hidden group",
                       isActive
                         ? "bg-primary/[0.06] border-primary/30"
                         : "bg-white/[0.02] border-white/5 hover:bg-white/[0.04] hover:border-white/10",
@@ -395,14 +395,14 @@ export default function ModelReview() {
                   </p>
                   <button
                     onClick={() => refetchFeed()}
-                    className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-premium"
+                    className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-ui"
                   >
                     Retry
                   </button>
                 </div>
               ) : pending.length === 0 ? (
                 <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl group">
-                  <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-premium" />
+                  <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-ui" />
                   <p className="text-sm text-muted-foreground font-semibold">
                     All caught up
                   </p>
@@ -418,7 +418,7 @@ export default function ModelReview() {
                       <div
                         key={d.id}
                         className={cn(
-                          "bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium relative overflow-hidden",
+                          "bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-ui relative overflow-hidden",
                           rowBusy && "opacity-50 pointer-events-none",
                         )}
                       >
@@ -483,7 +483,7 @@ export default function ModelReview() {
                                   })
                                 }
                                 className={cn(
-                                  "h-9 rounded-xl font-semibold text-xs border transition-premium",
+                                  "h-9 rounded-xl font-semibold text-xs border transition-ui",
                                   suggested
                                     ? "bg-primary/10 hover:bg-primary text-primary hover:text-black border-primary/30"
                                     : "bg-white/[0.03] hover:bg-white/10 text-white/80 border-white/10",

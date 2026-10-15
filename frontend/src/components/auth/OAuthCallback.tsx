@@ -150,7 +150,7 @@ export function OAuthCallback() {
             <p className="text-muted-foreground text-sm mb-6">{message}</p>
             <button
               onClick={() => navigate("/")}
-              className="px-6 py-2.5 bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium rounded-lg transition-premium"
+              className="px-6 py-2.5 bg-violet-600 hover:bg-violet-500 text-white text-sm font-medium rounded-lg transition-ui"
             >
               Back to Login
             </button>

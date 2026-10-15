@@ -100,12 +100,12 @@ export function CompilationStatus() {
   if (activeJobs.length === 0) return null;
 
   return (
-    <div className="fixed bottom-8 right-8 z-[100] flex flex-col gap-4 max-w-sm w-full animate-in slide-in-from-right-8 duration-500 ease-premium">
+    <div className="fixed bottom-8 right-8 z-[100] flex flex-col gap-4 max-w-sm w-full">
       {activeJobs.map((job) => (
         <div
           key={job.jobId}
           className={cn(
-            "p-6 rounded-2xl border bg-surface-3 flex flex-col gap-4 relative overflow-hidden transition-premium",
+            "p-6 rounded-2xl border bg-surface-3 flex flex-col gap-4 relative overflow-hidden transition-ui",
             job.status === "failed"
               ? "border-destructive/20 bg-destructive/5"
               : "border-white/5",
@@ -113,7 +113,7 @@ export function CompilationStatus() {
         >
           {/* Animated Background Gradient for Active Jobs */}
           {job.status !== "success" && job.status !== "failed" && (
-            <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-primary/5 animate-pulse pointer-events-none" />
+            <div className="absolute inset-0 bg-gradient-to-r from-primary/5 via-transparent to-primary/5 pointer-events-none" />
           )}
 
           {/* Progress Bar Track */}
@@ -122,7 +122,7 @@ export function CompilationStatus() {
           {/* Active Progress Bar */}
           <div
             className={cn(
-              "absolute bottom-0 left-0 h-1 transition-all duration-1000 ease-premium-out",
+              "absolute bottom-0 left-0 h-1 transition-[width] duration-300",
               job.status === "success"
                 ? "bg-success"
                 : job.status === "failed"
@@ -136,7 +136,7 @@ export function CompilationStatus() {
             {/* Status Icon Container */}
             <div
               className={cn(
-                "w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 border relative transition-premium",
+                "w-12 h-12 rounded-2xl flex items-center justify-center shrink-0 border relative transition-ui",
                 job.status === "success"
                   ? "bg-success/10 border-success/20 text-success"
                   : job.status === "failed"
@@ -154,7 +154,7 @@ export function CompilationStatus() {
 
               {/* Micro-glow for active state */}
               {job.status !== "success" && job.status !== "failed" && (
-                <div className="absolute -inset-2 bg-primary/20 rounded-full blur-xl animate-pulse" />
+                <div className="absolute -inset-2 bg-primary/20 rounded-full blur-xl" />
               )}
             </div>
 
@@ -165,7 +165,7 @@ export function CompilationStatus() {
                 </span>
                 {job.status !== "success" && job.status !== "failed" && (
                   <div className="flex items-center gap-1.5">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-ping" />
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary" />
                     <span className="text-2xs font-semibold text-primary uppercase tracking-tighter">
                       Live
                     </span>
@@ -202,7 +202,7 @@ export function CompilationStatus() {
             {(job.status === "success" || job.status === "failed") && (
               <button
                 onClick={() => removeJob(job.jobId)}
-                className="text-white/50 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-premium active:scale-90"
+                className="text-white/50 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-ui"
               >
                 <X className="w-4 h-4" />
               </button>

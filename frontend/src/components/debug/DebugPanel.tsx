@@ -287,7 +287,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
                   <button
                     type="button"
                     disabled
-                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-cyan-500/20 bg-cyan-500/5 text-cyan-400/50 text-xs font-bold cursor-not-allowed transition-premium"
+                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-cyan-500/20 bg-cyan-500/5 text-cyan-400/50 text-xs font-bold cursor-not-allowed transition-ui"
                   >
                     <Play className="w-3.5 h-3.5" />
                     Replay from here
@@ -324,7 +324,7 @@ const CopyButton: React.FC<{
   <button
     type="button"
     onClick={onClick}
-    className="p-1 hover:bg-white/5 rounded transition-premium"
+    className="p-1 hover:bg-white/5 rounded transition-ui"
     aria-label="Copy JSON"
   >
     {copied ? (

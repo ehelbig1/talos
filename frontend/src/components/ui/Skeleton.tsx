@@ -40,7 +40,7 @@ export const SkeletonCard: React.FC<SkeletonProps> = ({ className = "" }) => (
   <div
     className={cn(
       "bg-surface-3/60 border border-white/5 border-l-4 border-l-secondary",
-      "rounded-lg p-4 flex flex-col gap-3 animate-fade-in-up",
+      "rounded-lg p-4 flex flex-col gap-3",
       className,
     )}
     aria-hidden="true"
@@ -143,7 +143,7 @@ export const SkeletonInspector: React.FC<SkeletonProps> = ({
   className = "",
 }) => (
   <div
-    className={cn("space-y-4 p-3 animate-fade-in-up", className)}
+    className={cn("space-y-4 p-3", className)}
     aria-hidden="true"
     data-testid="skeleton-inspector"
   >

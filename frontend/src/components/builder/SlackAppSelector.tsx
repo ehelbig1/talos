@@ -159,7 +159,7 @@ export function SlackAppSelector({
 
   if (loading) {
     return (
-      <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4 animate-pulse">
+      <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4">
         <Loader2 className="h-5 w-5 animate-spin text-[#4A154B]" />
         <p className="m-0 text-xs font-semibold text-muted-foreground/70">
           Loading Slack workspaces…
@@ -209,7 +209,7 @@ export function SlackAppSelector({
             <Button
               onClick={() => setShowCreator(true)}
               variant="outline"
-              className="h-9 px-4 bg-purple-500/5 hover:bg-purple-500/10 text-purple-400 border-purple-500/20 text-2xs font-semibold rounded-xl transition-premium"
+              className="h-9 px-4 bg-purple-500/5 hover:bg-purple-500/10 text-purple-400 border-purple-500/20 text-2xs font-semibold rounded-xl transition-ui"
             >
               <Rocket className="w-3.5 h-3.5 mr-2" /> Manifest App
             </Button>
@@ -217,7 +217,7 @@ export function SlackAppSelector({
               onClick={handleConnect}
               disabled={connecting}
               variant="ghost"
-              className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-2xs font-semibold rounded-xl border border-white/5 transition-premium"
+              className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-2xs font-semibold rounded-xl border border-white/5 transition-ui"
             >
               {connecting ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
@@ -231,14 +231,14 @@ export function SlackAppSelector({
       </div>
 
       {displayError && (
-        <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive animate-in shake duration-500">
+        <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl flex items-center gap-4 text-destructive">
           <AlertTriangle className="h-5 w-5 shrink-0" />
           <p className="m-0 text-xs font-semibold">{displayError}</p>
         </div>
       )}
 
       {integrations.length === 0 ? (
-        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center animate-in fade-in duration-700">
+        <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center">
           <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-6 border border-white/10">
             <Hash className="h-8 w-8 text-muted-foreground/50" />
           </div>
@@ -252,7 +252,7 @@ export function SlackAppSelector({
           <Button
             onClick={handleConnect}
             disabled={connecting}
-            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-sm font-semibold rounded-xl active:scale-95 transition-premium"
+            className="h-11 px-8 bg-[#4A154B] hover:bg-[#4A154B]/90 text-white text-sm font-semibold rounded-xl transition-ui"
           >
             {connecting ? (
               <div className="flex items-center gap-3">
@@ -279,7 +279,7 @@ export function SlackAppSelector({
                   key={integration.id}
                   onClick={() => handleSelect(integration)}
                   className={cn(
-                    "group relative p-4 text-left rounded-2xl border transition-premium hover:scale-[1.01] active:scale-[0.98] overflow-hidden",
+                    "group relative p-4 text-left rounded-2xl border transition-ui overflow-hidden",
                     isSelected
                       ? "bg-[#4A154B]/10 border-[#4A154B]"
                       : "bg-surface-3 border-white/5 hover:bg-surface-4 hover:border-white/20",
@@ -288,7 +288,7 @@ export function SlackAppSelector({
                   <div className="flex items-center gap-4 relative z-10">
                     <div
                       className={cn(
-                        "w-10 h-10 rounded-xl flex items-center justify-center border transition-premium",
+                        "w-10 h-10 rounded-xl flex items-center justify-center border transition-ui",
                         isSelected
                           ? "bg-[#4A154B] text-white border-[#4A154B]"
                           : "bg-white/5 text-muted-foreground/70 border-white/10",
@@ -303,7 +303,7 @@ export function SlackAppSelector({
                     <div className="flex-1 min-w-0">
                       <span
                         className={cn(
-                          "block text-xs font-semibold truncate transition-premium",
+                          "block text-xs font-semibold truncate transition-ui",
                           isSelected ? "text-white" : "text-white/60",
                         )}
                       >
@@ -316,7 +316,7 @@ export function SlackAppSelector({
                       </span>
                     </div>
                     {isSelected && (
-                      <div className="animate-pulse">
+                      <div>
                         <div className="w-2 h-2 rounded-full bg-[#4A154B]" />
                       </div>
                     )}

@@ -127,7 +127,7 @@ function SecretsManager() {
   };
 
   return (
-    <div className="space-y-12 max-w-6xl mx-auto animate-in fade-in slide-in-from-bottom-4 duration-1000">
+    <div className="space-y-12 max-w-6xl mx-auto">
       <ConfirmDialog
         open={secretToDelete !== null}
         title="Delete secret"
@@ -164,7 +164,7 @@ function SecretsManager() {
 
       {/* Edit secret value dialog */}
       {secretToEdit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 animate-in fade-in duration-300">
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80">
           <div className="bg-surface-3/60 border border-white/5 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden group">
             <div className="flex items-center justify-between mb-8 relative z-10">
               <div className="flex items-center gap-5">
@@ -186,7 +186,7 @@ function SecretsManager() {
                   setSecretToEdit(null);
                   setEditValue("");
                 }}
-                className="p-2.5 hover:bg-white/5 rounded-xl transition-premium active:scale-90 text-muted-foreground/70 hover:text-white"
+                className="p-2.5 hover:bg-white/5 rounded-xl transition-ui text-muted-foreground/70 hover:text-white"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -204,14 +204,14 @@ function SecretsManager() {
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
                     placeholder="Enter the new secret value"
-                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-premium placeholder:text-muted-foreground/50"
+                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui placeholder:text-muted-foreground/50"
                   />
                 </div>
               </div>
 
               <div className="flex gap-4">
                 <button
-                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-premium active:scale-95 disabled:opacity-50 disabled:grayscale"
+                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-ui disabled:opacity-50 disabled:grayscale"
                   disabled={!editValue.trim() || updateSecretMutation.isPending}
                   onClick={() =>
                     updateSecretMutation.mutate({
@@ -225,7 +225,7 @@ function SecretsManager() {
                   {updateSecretMutation.isPending ? "Saving…" : "Save"}
                 </button>
                 <button
-                  className="px-8 py-4 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-premium active:scale-95"
+                  className="px-8 py-4 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-ui"
                   onClick={() => {
                     setSecretToEdit(null);
                     setEditValue("");
@@ -241,7 +241,7 @@ function SecretsManager() {
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
         <div className="flex items-center gap-6 relative z-10">
-          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
+          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
             <Key className="w-8 h-8 text-primary" />
           </div>
           <div className="flex flex-col">
@@ -257,7 +257,7 @@ function SecretsManager() {
 
         <button
           onClick={() => setShowCreate(true)}
-          className="relative z-10 bg-primary text-white font-semibold px-5 h-11 rounded-xl flex items-center gap-2 transition-premium active:scale-[0.98] hover:bg-primary/90 whitespace-nowrap"
+          className="relative z-10 bg-primary text-white font-semibold px-5 h-11 rounded-xl flex items-center gap-2 transition-ui hover:bg-primary/90 whitespace-nowrap"
         >
           <Plus className="w-4 h-4" />
           <span className="text-sm">New secret</span>
@@ -271,7 +271,7 @@ function SecretsManager() {
               <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
               <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
             </div>
-            <p className="text-xs text-primary/60 font-semibold animate-status-pulse">
+            <p className="text-xs text-primary/60 font-semibold">
               Deciphering Registry...
             </p>
           </div>
@@ -282,7 +282,7 @@ function SecretsManager() {
           </div>
         ) : secrets && secrets.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-48 text-center px-10 space-y-8">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-premium duration-700">
+            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-ui">
               <LockIcon size={40} />
             </div>
             <div className="space-y-3">
@@ -296,7 +296,7 @@ function SecretsManager() {
             </div>
             <button
               onClick={() => setShowCreate(true)}
-              className="px-8 py-4 border border-primary/20 text-primary text-sm font-semibold rounded-2xl hover:bg-primary/10 transition-premium active:scale-95"
+              className="px-8 py-4 border border-primary/20 text-primary text-sm font-semibold rounded-2xl hover:bg-primary/10 transition-ui"
             >
               Add secret
             </button>
@@ -324,7 +324,7 @@ function SecretsManager() {
                 {secrets?.map((secret) => (
                   <tr
                     key={secret.id}
-                    className="group hover:bg-white/[0.02] transition-premium"
+                    className="group hover:bg-white/[0.02] transition-ui"
                   >
                     <td className="px-10 py-8">
                       <div className="flex flex-col gap-1.5">
@@ -350,25 +350,25 @@ function SecretsManager() {
                         {revealedSecretId === secret.id ? (
                           <button
                             onClick={() => setRevealedSecretId(null)}
-                            className="p-2.5 text-muted-foreground/70 hover:text-white transition-premium rounded-xl hover:bg-white/5 active:scale-90"
+                            className="p-2.5 text-muted-foreground/70 hover:text-white transition-ui rounded-xl hover:bg-white/5"
                             title="Obscure Payload"
                           >
                             <EyeOff size={16} />
                           </button>
                         ) : confirmReveal === secret.id ? (
-                          <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/20 px-4 py-2 rounded-2xl animate-in zoom-in-95">
+                          <div className="flex items-center gap-3 bg-amber-500/10 border border-amber-500/20 px-4 py-2 rounded-2xl">
                             <span className="text-2xs font-semibold text-amber-500 uppercase tracking-wider">
                               Reveal value?
                             </span>
                             <button
                               onClick={() => revealSecret(secret.id)}
-                              className="text-2xs font-semibold text-amber-400 hover:text-white transition-premium underline underline-offset-4 uppercase"
+                              className="text-2xs font-semibold text-amber-400 hover:text-white transition-ui underline underline-offset-4 uppercase"
                             >
                               YES
                             </button>
                             <button
                               onClick={() => setConfirmReveal(null)}
-                              className="p-1 text-muted-foreground/70 hover:text-white transition-premium"
+                              className="p-1 text-muted-foreground/70 hover:text-white transition-ui"
                             >
                               <X size={14} />
                             </button>
@@ -376,7 +376,7 @@ function SecretsManager() {
                         ) : (
                           <button
                             onClick={() => setConfirmReveal(secret.id)}
-                            className="p-2.5 text-primary/60 hover:text-primary transition-premium rounded-xl hover:bg-primary/10 active:scale-90"
+                            className="p-2.5 text-primary/60 hover:text-primary transition-ui rounded-xl hover:bg-primary/10"
                             title="Reveal Payload"
                           >
                             <Eye size={16} />
@@ -408,7 +408,7 @@ function SecretsManager() {
                             setSelectedSecret(secret);
                             setShowAuditLog(true);
                           }}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/5 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/5 border border-white/5 transition-ui rounded-xl"
                           title="Audit log"
                         >
                           <History size={18} />
@@ -418,14 +418,14 @@ function SecretsManager() {
                             setSecretToEdit(secret);
                             setEditValue("");
                           }}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-primary hover:bg-primary/10 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-primary hover:bg-primary/10 border border-white/5 transition-ui rounded-xl"
                           title="Reconfigure Payload"
                         >
                           <Pencil size={18} />
                         </button>
                         <button
                           onClick={() => handleDelete(secret)}
-                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-white/5 transition-premium rounded-xl active:scale-90"
+                          className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-white/5 transition-ui rounded-xl"
                           title="Purge Entity"
                         >
                           <Trash2 size={18} />
@@ -441,11 +441,11 @@ function SecretsManager() {
       </div>
 
       {/* Advanced Security Section */}
-      <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-12 group relative overflow-hidden transition-premium hover:border-amber-500/40">
+      <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-12 group relative overflow-hidden transition-ui hover:border-amber-500/40">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-12 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-6">
-              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center group-hover:rotate-6 transition-premium duration-500">
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center transition-ui">
                 <ShieldCheck className="w-8 h-8 text-amber-500" />
               </div>
               <div className="flex flex-col">
@@ -454,7 +454,7 @@ function SecretsManager() {
                 </h4>
                 <div className="flex items-center gap-3 mt-1.5">
                   <div className="flex items-center gap-2 bg-amber-500/10 border border-amber-500/20 px-3 py-1 rounded-full">
-                    <div className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+                    <div className="w-1.5 h-1.5 rounded-full bg-amber-500" />
                     <span className="text-2xs text-amber-500 font-semibold uppercase tracking-wider leading-none">
                       High impact
                     </span>
@@ -477,15 +477,14 @@ function SecretsManager() {
           </div>
 
           <button
-            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-premium active:scale-95 flex items-center gap-4 shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
+            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-ui flex items-center gap-4 shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
             onClick={() => {
               setConfirmRotateKey(true);
             }}
           >
-            <div className="absolute inset-0 bg-white/20 translate-y-full group-hover/rotate:translate-y-0 transition-transform duration-300" />
             <RefreshCw
               className={cn(
-                "w-5 h-5 relative z-10 transition-transform duration-1000 group-hover/rotate:rotate-180",
+                "w-5 h-5 relative z-10 transition-transform",
                 rotateKeyMutation.isPending && "animate-spin",
               )}
             />

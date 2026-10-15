@@ -32,7 +32,7 @@ export function ServiceIntegrationSection({
       <CollapsibleTrigger asChild>
         <button
           type="button"
-          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-xs font-semibold text-white flex items-center justify-between transition-premium group-hover/collapsible:border-primary/20"
+          className="w-full p-4 bg-surface-3 hover:bg-surface-4 border border-white/5 rounded-2xl cursor-pointer text-xs font-semibold text-white flex items-center justify-between transition-ui group-hover/collapsible:border-primary/20"
         >
           <div className="flex items-center gap-3">
             <div className="p-1.5 rounded-lg bg-primary/10 text-primary">
@@ -40,10 +40,10 @@ export function ServiceIntegrationSection({
             </div>
             <span>Configure Unified Integration</span>
           </div>
-          <ChevronDown className="h-4 w-4 text-muted-foreground/70 group-data-[state=open]/collapsible:rotate-180 transition-transform duration-500" />
+          <ChevronDown className="h-4 w-4 text-muted-foreground/70 group-data-[state=open]/collapsible:rotate-180 transition-transform" />
         </button>
       </CollapsibleTrigger>
-      <CollapsibleContent className="mt-4 space-y-4 animate-in fade-in slide-in-from-top-2 duration-500">
+      <CollapsibleContent className="mt-4 space-y-4">
         {templateName && templateName.toLowerCase().includes("slack") && (
           <SlackAppSelector
             onSelect={(slackConfig) => onChange({ ...value, ...slackConfig })}

@@ -55,7 +55,7 @@ function isHomeOf(item: (typeof NAV_ITEMS)[number], pathname: string): boolean {
 function LoadingScreen() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-background">
-      <div className="flex flex-col items-center gap-5 animate-in fade-in duration-500">
+      <div className="flex flex-col items-center gap-5">
         <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
           <Zap size={28} className="text-primary" fill="currentColor" />
         </div>
@@ -83,7 +83,7 @@ function AuthenticatedApp() {
 
   const navLinkClass = ({ isActive }: { isActive: boolean }) =>
     cn(
-      "relative px-3 py-1.5 text-sm font-medium rounded-lg transition-premium",
+      "relative px-3 py-1.5 text-sm font-medium rounded-lg transition-ui",
       isActive
         ? "text-white bg-white/5"
         : "text-muted-foreground hover:text-white hover:bg-white/5",
@@ -165,7 +165,7 @@ function AuthenticatedApp() {
 
             <button
               onClick={logout}
-              className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-white hover:bg-white/5 rounded-lg transition-premium"
+              className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-white hover:bg-white/5 rounded-lg transition-ui"
             >
               Sign out
             </button>

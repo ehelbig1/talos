@@ -113,7 +113,7 @@ export default function ActorCompare() {
         {lanes.length > 0 && (
           <div
             className={cn(
-              "grid gap-8 animate-in fade-in zoom-in-95 duration-700",
+              "grid gap-8",
               lanes.length === 2
                 ? "grid-cols-1 lg:grid-cols-2"
                 : lanes.length === 3
@@ -129,7 +129,7 @@ export default function ActorCompare() {
 
         {/* Empty prompt */}
         {lanes.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-20 gap-8 text-center animate-in fade-in duration-1000">
+          <div className="flex flex-col items-center justify-center py-20 gap-8 text-center">
             <div className="relative">
               <GitCompare className="w-24 h-24 text-white/5 relative z-10" />
             </div>

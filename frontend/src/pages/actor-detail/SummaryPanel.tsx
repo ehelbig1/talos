@@ -133,7 +133,7 @@ export function SummaryPanel({
         : `${ageDaysNum} days`;
 
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+    <div className="space-y-8">
       <ConfirmDialog
         open={showTerminateConfirm}
         title="Delete actor"
@@ -165,7 +165,7 @@ export function SummaryPanel({
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
                         maxLength={100}
-                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium"
+                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui"
                       />
                     </div>
                     <div className="space-y-2">
@@ -175,7 +175,7 @@ export function SummaryPanel({
                       <select
                         value={editWorld}
                         onChange={(e) => setEditWorld(e.target.value)}
-                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium appearance-none cursor-pointer"
+                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui appearance-none cursor-pointer"
                       >
                         {editOptions.map(({ world, permitted }) => (
                           <option
@@ -202,7 +202,7 @@ export function SummaryPanel({
                       onChange={(e) => setEditDesc(e.target.value)}
                       rows={3}
                       placeholder="What does this actor do?"
-                      className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium resize-none"
+                      className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui resize-none"
                     />
                   </div>
 
@@ -210,7 +210,7 @@ export function SummaryPanel({
                     <button
                       onClick={() => doUpdate()}
                       disabled={updatePending || !editName.trim()}
-                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-premium active:scale-95 disabled:opacity-50"
+                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-ui disabled:opacity-50"
                     >
                       <Save className="w-4 h-4" />
                       {updatePending ? "Saving…" : "Save"}
@@ -222,7 +222,7 @@ export function SummaryPanel({
                         setEditDesc(actor.description ?? "");
                         setEditWorld(actor.maxCapabilityWorld);
                       }}
-                      className="text-sm font-semibold text-muted-foreground bg-white/5 px-6 py-3 rounded-xl hover:bg-white/10 hover:text-foreground transition-premium active:scale-95"
+                      className="text-sm font-semibold text-muted-foreground bg-white/5 px-6 py-3 rounded-xl hover:bg-white/10 hover:text-foreground transition-ui"
                     >
                       Cancel
                     </button>
@@ -241,7 +241,7 @@ export function SummaryPanel({
                           </span>
                         )}
                       </div>
-                      <h2 className="text-4xl font-semibold text-white tracking-tight leading-none group-hover:text-primary transition-colors duration-500">
+                      <h2 className="text-4xl font-semibold text-white tracking-tight leading-none group-hover:text-primary transition-colors">
                         {actor.name}
                       </h2>
                       {actor.description ? (
@@ -283,7 +283,7 @@ export function SummaryPanel({
                     <div className="mt-8 flex items-center gap-4">
                       <button
                         onClick={() => setEditing(true)}
-                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-primary hover:bg-surface-4 hover:border-primary/20 transition-premium group/btn"
+                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-primary hover:bg-surface-4 hover:border-primary/20 transition-ui group/btn"
                         title="Edit actor"
                       >
                         <Pencil className="w-4 h-4 transition-transform" />
@@ -291,7 +291,7 @@ export function SummaryPanel({
                       <button
                         onClick={() => doClone()}
                         disabled={clonePending}
-                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-sky-400 hover:bg-surface-4 hover:border-sky-400/20 transition-premium group/btn disabled:opacity-30"
+                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-sky-400 hover:bg-surface-4 hover:border-sky-400/20 transition-ui group/btn disabled:opacity-30"
                         title="Duplicate actor"
                       >
                         <Copy className="w-4 h-4 transition-transform" />
@@ -299,7 +299,7 @@ export function SummaryPanel({
                       <div className="h-6 w-px bg-white/5 mx-2" />
                       <button
                         onClick={() => setShowTerminateConfirm(true)}
-                        className="p-3 rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/60 hover:text-destructive hover:bg-destructive/10 transition-premium group/btn"
+                        className="p-3 rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/60 hover:text-destructive hover:bg-destructive/10 transition-ui group/btn"
                         title="Delete actor"
                       >
                         <Square className="w-4 h-4 transition-transform" />
@@ -345,7 +345,7 @@ export function SummaryPanel({
               <h3 className="text-xs font-semibold text-white">
                 Recent activity
               </h3>
-              <Activity className="w-4 h-4 text-primary animate-status-pulse" />
+              <Activity className="w-4 h-4 text-primary" />
             </div>
 
             {recentEntries.length === 0 ? (
@@ -364,7 +364,7 @@ export function SummaryPanel({
                     key={entry.id}
                     className="flex items-start gap-4 group/entry"
                   >
-                    <div className="w-8 h-8 rounded-xl bg-surface-4/60 border border-white/5 flex items-center justify-center text-primary shrink-0 transition-premium group-hover/entry:bg-primary/10 group-hover/entry:border-primary/20">
+                    <div className="w-8 h-8 rounded-xl bg-surface-4/60 border border-white/5 flex items-center justify-center text-primary shrink-0 transition-ui group-hover/entry:bg-primary/10 group-hover/entry:border-primary/20">
                       {ACTION_ICONS[entry.actionType.toLowerCase()] ?? (
                         <Activity className="w-3.5 h-3.5" />
                       )}
@@ -391,7 +391,7 @@ export function SummaryPanel({
                   onClick={onToggle}
                   disabled={togglePending}
                   className={cn(
-                    "w-full flex items-center justify-between p-4 rounded-2xl border transition-premium active:scale-[0.98] disabled:opacity-30",
+                    "w-full flex items-center justify-between p-4 rounded-2xl border transition-ui disabled:opacity-30",
                     actor.status === "active"
                       ? "bg-warning/5 border-warning/10 text-warning hover:bg-warning/10"
                       : "bg-success/5 border-success/10 text-success hover:bg-success/10",

@@ -64,7 +64,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
               key={opt.id}
               onClick={() => setFilter(opt.id)}
               className={cn(
-                "px-2.5 py-1 text-xs rounded-lg border transition-premium",
+                "px-2.5 py-1 text-xs rounded-lg border transition-ui",
                 filter === opt.id
                   ? "bg-violet-500/20 border-violet-500/30 text-violet-300"
                   : "border-white/5 text-muted-foreground hover:text-white hover:bg-surface-3/60",
@@ -87,7 +87,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
           {entries.length > 0 && (
             <button
               onClick={() => downloadLogCsv(entries)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground bg-surface-3/60 border border-white/5 rounded-lg hover:text-white hover:bg-surface-4/60 transition-premium"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground bg-surface-3/60 border border-white/5 rounded-lg hover:text-white hover:bg-surface-4/60 transition-ui"
             >
               <Download className="w-3.5 h-3.5" />
               CSV
@@ -111,7 +111,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
           {filtered.length > visibleCount && (
             <button
               onClick={() => setVisibleCount((v) => v + VISIBLE_PAGE_SIZE)}
-              className="w-full py-2.5 text-xs text-muted-foreground hover:text-white hover:bg-[rgba(255,255,255,0.03)] transition-premium border-t border-[rgba(255,255,255,0.04)]"
+              className="w-full py-2.5 text-xs text-muted-foreground hover:text-white hover:bg-[rgba(255,255,255,0.03)] transition-ui border-t border-[rgba(255,255,255,0.04)]"
             >
               Show more ({filtered.length - visibleCount} remaining)
             </button>
@@ -123,7 +123,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
         <div className="text-center">
           <button
             onClick={() => setLimit((l) => l + 50)}
-            className="text-sm text-muted-foreground hover:text-white transition-premium px-4 py-2 flex items-center gap-2 mx-auto"
+            className="text-sm text-muted-foreground hover:text-white transition-ui px-4 py-2 flex items-center gap-2 mx-auto"
           >
             <RefreshCw className="w-3.5 h-3.5" />
             Load more from server

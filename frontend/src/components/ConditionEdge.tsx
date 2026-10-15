@@ -69,7 +69,7 @@ export function ConditionEdge({
           fill="none"
           stroke={glowColor}
           strokeWidth={6}
-          className="animate-pulse"
+
           style={{
             filter: "blur(4px)",
             transition: "stroke 300ms",
@@ -119,10 +119,10 @@ export function ConditionEdge({
             onMouseLeave={() => setIsHovered(false)}
           >
             {isHovered && result ? (
-              <div className="bg-background/95 backdrop-blur-2xl border border-primary/30 rounded-xl p-3 shadow-[0_12px_40px_rgba(0,0,0,0.6)] max-w-sm overflow-hidden animate-in fade-in zoom-in duration-200">
+              <div className="bg-background/95 backdrop-blur-2xl border border-primary/30 rounded-xl p-3 shadow-[0_12px_40px_rgba(0,0,0,0.6)] max-w-sm overflow-hidden">
                 <div className="flex items-center justify-between mb-2">
                   <div className="flex items-center gap-2">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary" />
                     <span className="text-xs font-bold text-primary">
                       Output Data
                     </span>
@@ -140,24 +140,19 @@ export function ConditionEdge({
             ) : isOnFailure ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
+                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-ui backdrop-blur-md",
                   selected
                     ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110"
                     : "bg-background/80 border-destructive/40 text-destructive hover:border-destructive",
                 )}
               >
-                <div
-                  className={cn(
-                    "w-1 h-1 rounded-full bg-current",
-                    selected && "animate-ping",
-                  )}
-                />
+                <div className={cn("w-1 h-1 rounded-full bg-current")} />
                 FAIL
               </div>
             ) : isErrorEdge ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md",
+                  "flex items-center gap-1.5 px-2 py-1 rounded-full border text-xs font-bold shadow-lg transition-ui backdrop-blur-md",
                   selected
                     ? "bg-destructive border-destructive-foreground text-destructive-foreground scale-110"
                     : "bg-background/80 border-destructive/40 text-destructive hover:border-destructive",
@@ -169,7 +164,7 @@ export function ConditionEdge({
             ) : hasCondition ? (
               <div
                 className={cn(
-                  "flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-bold shadow-lg transition-premium duration-300 backdrop-blur-md group cursor-help",
+                  "flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs font-bold shadow-lg transition-ui backdrop-blur-md group cursor-help",
                   selected || isHovered
                     ? "bg-primary border-primary-foreground text-primary-foreground scale-110"
                     : "bg-background/80 border-warning/40 text-warning hover:border-warning",
@@ -177,13 +172,13 @@ export function ConditionEdge({
               >
                 <Zap
                   className={cn(
-                    "w-3 h-3 transition-transform duration-300",
+                    "w-3 h-3 transition-transform",
                     isHovered && "rotate-12",
                   )}
                 />
                 IF
                 {data?.condition && isHovered && (
-                  <span className="ml-1 pl-1.5 border-l border-white/20 text-xs text-white/90 font-mono font-medium hidden group-hover:block transition-premium max-w-[150px] truncate drop-shadow-sm">
+                  <span className="ml-1 pl-1.5 border-l border-white/20 text-xs text-white/90 font-mono font-medium hidden group-hover:block transition-ui max-w-[150px] truncate drop-shadow-sm">
                     {data.condition}
                   </span>
                 )}

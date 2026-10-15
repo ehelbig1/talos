@@ -262,7 +262,7 @@ export default function Actors() {
                 </span>
                 <div className="flex items-center gap-3">
                   {stat.dot && (
-                    <div className="w-2 h-2 rounded-full bg-success animate-status-pulse" />
+                    <div className="w-2 h-2 rounded-full bg-success" />
                   )}
                   <span
                     className={cn(
@@ -282,13 +282,13 @@ export default function Actors() {
         {actors.length > 0 && (
           <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 border border-white/5 rounded-2xl">
             <div className="relative flex-1 w-full group/search">
-              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-premium z-10" />
+              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
               <input
                 type="text"
                 placeholder="Search actors…"
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-premium placeholder:text-muted-foreground/50 relative z-0"
+                className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui placeholder:text-muted-foreground/50 relative z-0"
               />
             </div>
 
@@ -303,7 +303,7 @@ export default function Actors() {
                       key={opt.key}
                       onClick={() => setSortKey(opt.key)}
                       className={cn(
-                        "px-6 py-2.5 text-2xs font-semibold rounded-xl transition-premium whitespace-nowrap active:scale-95",
+                        "px-6 py-2.5 text-2xs font-semibold rounded-xl transition-ui whitespace-nowrap",
                         sortKey === opt.key
                           ? "bg-primary text-white"
                           : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
@@ -332,7 +332,7 @@ export default function Actors() {
               ))}
             </div>
           ) : error ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10 animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
+            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10 max-w-4xl mx-auto">
               <div className="w-24 h-24 rounded-2xl bg-destructive/10 border border-destructive/20 flex items-center justify-center mb-10 relative">
                 <X className="w-12 h-12 text-destructive relative z-10" />
               </div>
@@ -348,9 +348,9 @@ export default function Actors() {
               </p>
             </div>
           ) : actors.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 border-dashed border-2 rounded-2xl bg-surface-3 border border-white/10 animate-in fade-in zoom-in-95 duration-700 max-w-4xl mx-auto">
+            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 border-dashed border-2 rounded-2xl bg-surface-3 border border-white/10 max-w-4xl mx-auto">
               <div className="w-24 h-24 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-10 relative group">
-                <Bot className="w-12 h-12 text-primary relative z-10 transition-premium" />
+                <Bot className="w-12 h-12 text-primary relative z-10 transition-ui" />
               </div>
               <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit mb-6">
                 No actors yet
@@ -361,7 +361,7 @@ export default function Actors() {
               </p>
               <button
                 onClick={() => setShowCreate(true)}
-                className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-premium active:scale-95 border border-white/20"
+                className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-ui border border-white/20"
               >
                 <Plus className="w-5 h-5" /> Create your first actor
               </button>
@@ -410,9 +410,9 @@ export default function Actors() {
               )}
 
               {terminatedActors.length > 0 && (
-                <details className="group border-t border-white/5 pt-20 animate-in fade-in slide-in-from-bottom-8 duration-1000">
-                  <summary className="flex items-center gap-6 text-muted-foreground/60 hover:text-white transition-premium cursor-pointer list-none group/summary">
-                    <div className="w-12 h-12 rounded-2xl bg-surface-3/40 border border-white/5 flex items-center justify-center group-open:rotate-90 group-hover/summary:border-white/20 transition-premium">
+                <details className="group border-t border-white/5 pt-20">
+                  <summary className="flex items-center gap-6 text-muted-foreground/60 hover:text-white transition-ui cursor-pointer list-none group/summary">
+                    <div className="w-12 h-12 rounded-2xl bg-surface-3/40 border border-white/5 flex items-center justify-center group-open:rotate-90 group-hover/summary:border-white/20 transition-ui">
                       <ChevronDown className="w-5 h-5" />
                     </div>
                     <div className="flex flex-col">
@@ -425,7 +425,7 @@ export default function Actors() {
                       </span>
                     </div>
                   </summary>
-                  <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10 opacity-40 hover:opacity-100 transition-premium grayscale group-hover:grayscale-0">
+                  <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10 opacity-40 hover:opacity-100 transition-ui grayscale group-hover:grayscale-0">
                     {terminatedActors.map((actor) => (
                       <ActorCard
                         key={actor.id}

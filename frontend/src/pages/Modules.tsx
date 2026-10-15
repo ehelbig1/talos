@@ -85,10 +85,10 @@ function ModuleCard({
   const lang = mod.language ?? "rust";
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-2xl overflow-hidden hover:border-primary/20 transition-premium group relative">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl overflow-hidden hover:border-primary/20 transition-ui group relative">
       {/* Header row */}
       <div
-        className="w-full flex items-center gap-6 p-6 text-left hover:bg-white/[0.02] transition-premium cursor-pointer relative z-10"
+        className="w-full flex items-center gap-6 p-6 text-left hover:bg-white/[0.02] transition-ui cursor-pointer relative z-10"
         onClick={() => setExpanded((v) => !v)}
         role="button"
         tabIndex={0}
@@ -96,7 +96,7 @@ function ModuleCard({
           if (e.key === "Enter" || e.key === " ") setExpanded((v) => !v);
         }}
       >
-        <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shrink-0 transition-premium group-hover:border-primary/30 relative">
+        <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shrink-0 transition-ui group-hover:border-primary/30 relative">
           <Cpu className="w-6 h-6 text-primary relative z-10" />
         </div>
 
@@ -107,7 +107,7 @@ function ModuleCard({
             </h3>
             <span
               className={cn(
-                "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border shrink-0 transition-premium shadow-sm",
+                "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border shrink-0 transition-ui shadow-sm",
                 langColor(lang),
               )}
             >
@@ -115,7 +115,7 @@ function ModuleCard({
             </span>
             <span
               className={cn(
-                "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border shrink-0 transition-premium shadow-sm",
+                "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border shrink-0 transition-ui shadow-sm",
                 worldColor(mod.capabilityWorld),
               )}
             >
@@ -130,7 +130,7 @@ function ModuleCard({
             </p>
           )}
 
-          <div className="flex items-center gap-5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 group-hover:text-muted-foreground/50 transition-premium">
+          <div className="flex items-center gap-5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground/60 group-hover:text-muted-foreground/50 transition-ui">
             <span className="flex items-center gap-2">
               <HardDrive className="w-3.5 h-3.5 opacity-40" />
               {formatBytes(mod.sizeBytes)}
@@ -159,12 +159,12 @@ function ModuleCard({
               e.stopPropagation();
               onUseInEditor();
             }}
-            className="text-sm font-semibold text-primary bg-primary/5 border border-primary/20 rounded-xl px-6 py-3 hover:bg-primary hover:text-white transition-premium active:scale-95 flex items-center gap-2 group/btn"
+            className="text-sm font-semibold text-primary bg-primary/5 border border-primary/20 rounded-xl px-6 py-3 hover:bg-primary hover:text-white transition-ui flex items-center gap-2 group/btn"
           >
-            <ExternalLink className="w-4 h-4 transition-transform group-hover/btn:-translate-y-0.5 group-hover/btn:translate-x-0.5" />
+            <ExternalLink className="w-4 h-4 transition-transform" />
             Initialize
           </button>
-          <div className="p-3 rounded-xl bg-white/5 border border-white/5 text-muted-foreground group-hover:text-white group-hover:bg-white/10 transition-premium">
+          <div className="p-3 rounded-xl bg-white/5 border border-white/5 text-muted-foreground group-hover:text-white group-hover:bg-white/10 transition-ui">
             {expanded ? (
               <ChevronDown className="w-4 h-4" />
             ) : (
@@ -176,7 +176,7 @@ function ModuleCard({
 
       {/* Expanded details */}
       {expanded && (
-        <div className="border-t border-white/5 px-8 py-8 space-y-8 bg-surface-4/40 animate-in slide-in-from-top-4 duration-500 bg-surface-3 border border-white/10">
+        <div className="border-t border-white/5 px-8 py-8 space-y-8 bg-surface-4/40 bg-surface-3 border border-white/10">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-10">
             <div className="space-y-3">
               <p className="text-xs font-semibold text-muted-foreground/60">
@@ -205,7 +205,7 @@ function ModuleCard({
                 {mod.importedInterfaces.map((iface: string) => (
                   <span
                     key={iface}
-                    className="px-4 py-2 rounded-xl text-xs font-semibold font-mono text-muted-foreground/60 bg-surface-4/60 border border-white/5 hover:border-primary/40 hover:text-white transition-premium cursor-default shadow-sm"
+                    className="px-4 py-2 rounded-xl text-xs font-semibold font-mono text-muted-foreground/60 bg-surface-4/60 border border-white/5 hover:border-primary/40 hover:text-white transition-ui cursor-default shadow-sm"
                   >
                     {iface}
                   </span>
@@ -223,7 +223,7 @@ function ModuleCard({
                 {configFields.map((f) => (
                   <span
                     key={f}
-                    className="px-4 py-2 rounded-xl text-xs font-semibold font-mono text-primary/60 bg-primary/5 border border-primary/20 hover:border-primary/50 hover:text-primary transition-premium cursor-default shadow-sm"
+                    className="px-4 py-2 rounded-xl text-xs font-semibold font-mono text-primary/60 bg-primary/5 border border-primary/20 hover:border-primary/50 hover:text-primary transition-ui cursor-default shadow-sm"
                   >
                     {f}
                   </span>
@@ -243,7 +243,7 @@ function ModuleCard({
 
 function EmptyState({ hasSearch }: { hasSearch: boolean }) {
   return (
-    <div className="flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10 animate-in fade-in zoom-in-95 duration-700">
+    <div className="flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10">
       <div className="w-24 h-24 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-10 relative">
         <Box className="w-12 h-12 text-muted-foreground/50 relative z-10" />
       </div>
@@ -324,7 +324,7 @@ export default function Modules() {
 
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">
-            <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 pointer-events-none group-focus-within/search:text-primary transition-premium z-10" />
+            <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 pointer-events-none group-focus-within/search:text-primary transition-ui z-10" />
             <DarkInput
               type="text"
               placeholder="Search modules…"
@@ -344,7 +344,7 @@ export default function Modules() {
           <button
             onClick={() => setWorldFilter(null)}
             className={cn(
-              "px-6 py-3 text-2xs font-semibold rounded-xl border transition-premium active:scale-95",
+              "px-6 py-3 text-2xs font-semibold rounded-xl border transition-ui",
               worldFilter === null
                 ? "bg-white/10 text-white border-white/30"
                 : "text-muted-foreground/70 border-white/5 hover:text-white hover:bg-white/5",
@@ -360,7 +360,7 @@ export default function Modules() {
                 key={w}
                 onClick={() => setWorldFilter(isActive ? null : w)}
                 className={cn(
-                  "inline-flex items-center gap-3 px-6 py-3 text-2xs font-semibold rounded-xl border transition-premium active:scale-95",
+                  "inline-flex items-center gap-3 px-6 py-3 text-2xs font-semibold rounded-xl border transition-ui",
                   isActive
                     ? worldColor(w)
                         .replace("border-", "border-")

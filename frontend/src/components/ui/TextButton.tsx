@@ -17,7 +17,7 @@ export const TextButton: React.FC<{
     onClick={onClick}
     aria-label={ariaLabel}
     className={cn(
-      "bg-transparent border-none text-primary hover:text-primary/80 cursor-pointer text-sm underline transition-premium p-0 font-medium",
+      "bg-transparent border-none text-primary hover:text-primary/80 cursor-pointer text-sm underline transition-ui p-0 font-medium",
       className,
     )}
   >

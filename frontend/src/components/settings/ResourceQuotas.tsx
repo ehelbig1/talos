@@ -167,7 +167,7 @@ export function ResourceQuotas() {
     <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
       <div className="flex items-center justify-between mb-10 relative z-10">
         <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-premium">
+          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
             <Gauge className="w-7 h-7 text-primary" />
           </div>
           <div>
@@ -187,7 +187,7 @@ export function ResourceQuotas() {
             <>
               <button
                 onClick={() => setIsEditing(false)}
-                className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-muted-foreground transition-premium"
+                className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-muted-foreground transition-ui"
                 disabled={isUpdating}
               >
                 <X className="w-4 h-4" />
@@ -196,7 +196,7 @@ export function ResourceQuotas() {
               <button
                 onClick={handleSave}
                 disabled={isUpdating}
-                className="flex items-center gap-3 px-8 py-3 bg-primary hover:bg-primary/90 text-black rounded-2xl text-sm font-semibold transition-premium disabled:opacity-50"
+                className="flex items-center gap-3 px-8 py-3 bg-primary hover:bg-primary/90 text-black rounded-2xl text-sm font-semibold transition-ui disabled:opacity-50"
               >
                 <Save className="w-4 h-4" />
                 {isUpdating ? "Saving…" : "Save limits"}
@@ -205,9 +205,9 @@ export function ResourceQuotas() {
           ) : (
             <button
               onClick={() => setIsEditing(true)}
-              className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-white transition-premium group/edit"
+              className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-white transition-ui group/edit"
             >
-              <Edit2 className="w-4 h-4 text-primary transition-premium" />
+              <Edit2 className="w-4 h-4 text-primary transition-ui" />
               Edit limits
             </button>
           )}
@@ -222,7 +222,7 @@ export function ResourceQuotas() {
             <div
               key={item.metric}
               className={cn(
-                "bg-black/40 border rounded-2xl p-8 transition-premium group/item relative overflow-hidden",
+                "bg-black/40 border rounded-2xl p-8 transition-ui group/item relative overflow-hidden",
                 isEditing
                   ? "border-primary/40"
                   : "border-white/5 hover:border-white/10",
@@ -230,7 +230,7 @@ export function ResourceQuotas() {
             >
               <div className="flex items-center justify-between mb-8 relative z-10">
                 <div className="flex items-center gap-5">
-                  <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-premium">
+                  <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-ui">
                     <Icon
                       className={cn(
                         "w-6 h-6",
@@ -273,7 +273,7 @@ export function ResourceQuotas() {
                           [item.key]: e.target.value,
                         }))
                       }
-                      className="w-full h-14 px-6 bg-black/60 border border-white/5 rounded-2xl text-xl font-semibold text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium font-mono pr-24"
+                      className="w-full h-14 px-6 bg-black/60 border border-white/5 rounded-2xl text-xl font-semibold text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui font-mono pr-24"
                       min="0"
                     />
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground/70 pointer-events-none">
@@ -292,7 +292,7 @@ export function ResourceQuotas() {
                   <div className="h-3 w-full bg-white/5 rounded-full overflow-hidden border border-white/5 p-0.5">
                     <div
                       className={cn(
-                        "h-full rounded-full transition-premium duration-1000 ease-out",
+                        "h-full rounded-full transition-ui ease-out",
                         usageColor(pct),
                       )}
                       style={{ width: `${pct}%` }}
@@ -307,7 +307,7 @@ export function ResourceQuotas() {
                       </span>
                     </div>
                     {pct > 80 && (
-                      <div className="flex items-center gap-2 text-destructive animate-pulse bg-destructive/10 px-3 py-1 rounded-full border border-destructive/20">
+                      <div className="flex items-center gap-2 text-destructive bg-destructive/10 px-3 py-1 rounded-full border border-destructive/20">
                         <AlertTriangle className="w-3 h-3" />
                         <span>Near limit</span>
                       </div>
@@ -322,7 +322,7 @@ export function ResourceQuotas() {
 
       <div className="mt-12 pt-8 border-t border-white/5 flex items-center justify-between relative z-10">
         <div className="flex items-center gap-4">
-          <div className="w-2 h-2 rounded-full bg-success animate-pulse" />
+          <div className="w-2 h-2 rounded-full bg-success" />
           <p className="text-xs text-muted-foreground/50 font-semibold flex items-center gap-3">
             Updated {new Date().toLocaleTimeString()}
           </p>
@@ -330,10 +330,10 @@ export function ResourceQuotas() {
         {!isEditing && (
           <button
             type="button"
-            className="text-xs font-semibold text-primary hover:text-white transition-premium flex items-center gap-3 group/btn"
+            className="text-xs font-semibold text-primary hover:text-white transition-ui flex items-center gap-3 group/btn"
           >
             Usage report
-            <div className="w-5 h-5 rounded-lg bg-primary/10 flex items-center justify-center group-hover/btn:bg-primary group-hover/btn:text-black transition-premium">
+            <div className="w-5 h-5 rounded-lg bg-primary/10 flex items-center justify-center group-hover/btn:bg-primary group-hover/btn:text-black transition-ui">
               <BarChart3 className="w-3 h-3" />
             </div>
           </button>

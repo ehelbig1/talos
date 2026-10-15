@@ -42,7 +42,7 @@ export function OrgDetailsPanel({
   onRemoveMember: (userId: string) => void;
 }): React.ReactElement {
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-right-4 duration-700">
+    <div className="space-y-8">
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-10 relative z-10">
           <div className="flex items-center gap-6">
@@ -69,7 +69,7 @@ export function OrgDetailsPanel({
           <div className="flex gap-4 w-full md:w-auto">
             <Button
               variant="outline"
-              className="flex-1 md:flex-none h-12 px-6 border-white/10 hover:bg-white/5 text-destructive/80 hover:text-destructive border-destructive/20 hover:border-destructive/40 rounded-xl font-semibold text-sm transition-premium"
+              className="flex-1 md:flex-none h-12 px-6 border-white/10 hover:bg-white/5 text-destructive/80 hover:text-destructive border-destructive/20 hover:border-destructive/40 rounded-xl font-semibold text-sm transition-ui"
               onClick={onShowTransfer}
             >
               <ArrowRightLeft className="w-4 h-4 mr-3" /> Transfer ownership

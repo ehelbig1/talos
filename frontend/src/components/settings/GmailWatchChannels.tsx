@@ -550,7 +550,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
               : `${watches.length} active · rotated automatically every 7 days`}
             {watchesQuery.isFetching && !watchesQuery.isLoading && (
               <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground/70">
-                <span className="w-2 h-2 bg-primary/50 rounded-full animate-pulse" />
+                <span className="w-2 h-2 bg-primary/50 rounded-full" />
                 refreshing
               </span>
             )}
@@ -670,7 +670,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                   <tr
                     key={w.channel_uuid}
                     className={cn(
-                      "border-t border-border/30 transition-premium duration-700",
+                      "border-t border-border/30 transition-ui",
                       flashing && "bg-primary/5",
                       dim && "opacity-60",
                       !flashing && !dim && "hover:bg-muted/20",

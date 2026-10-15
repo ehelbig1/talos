@@ -23,7 +23,7 @@ export const CopyField = ({
   <FormField label={label}>
     <div
       className={cn(
-        "flex items-center gap-2 bg-surface-4/60 border border-white/5 rounded-xl p-1.5 transition-premium focus-within:border-primary/40",
+        "flex items-center gap-2 bg-surface-4/60 border border-white/5 rounded-xl p-1.5 transition-ui focus-within:border-primary/40",
         className,
       )}
     >

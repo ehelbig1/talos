@@ -41,7 +41,7 @@ export function KeyboardShortcutsHelp() {
     return (
       <button
         onClick={() => setIsOpen(true)}
-        className="fixed bottom-4 right-4 p-2 bg-primary text-primary-foreground rounded-full shadow-lg hover:bg-primary/90 transition-premium z-50 flex items-center justify-center border border-border/50"
+        className="fixed bottom-4 right-4 p-2 bg-primary text-primary-foreground rounded-full shadow-lg hover:bg-primary/90 transition-ui z-50 flex items-center justify-center border border-border/50"
         title="Keyboard Shortcuts (?)"
       >
         <Keyboard size={20} />

@@ -165,17 +165,17 @@ export const NodeConfigForm = React.memo(
     );
 
     const inputBase =
-      "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium selection:bg-primary/30 placeholder:text-muted-foreground/50";
+      "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30 placeholder:text-muted-foreground/50";
     const selectBase =
-      "w-full h-12 px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-premium cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
+      "w-full h-12 px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
     const textareaBase =
-      "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-premium resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar";
+      "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-ui resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar";
 
     // Render specialized UI per node type (legacy support for hardcoded types).
     switch (type) {
       case "http-request":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Request Method
@@ -239,7 +239,7 @@ export const NodeConfigForm = React.memo(
         );
       case "llm-inference":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Model
@@ -269,7 +269,7 @@ export const NodeConfigForm = React.memo(
         );
       case "json-parse":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 JSONPath Data Extraction
@@ -294,7 +294,7 @@ export const NodeConfigForm = React.memo(
         );
       case "foreach":
         return (
-          <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-8">
             <div className="space-y-4">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Collection Source (Rhai)
@@ -303,7 +303,7 @@ export const NodeConfigForm = React.memo(
                 <div className="relative flex-1 group/input">
                   <div
                     className={cn(
-                      "absolute -inset-0.5 rounded-2xl blur opacity-0 transition-premium",
+                      "absolute -inset-0.5 rounded-2xl blur opacity-0 transition-ui",
                       rhaiError
                         ? "bg-destructive/20 group-hover/input:opacity-100"
                         : "bg-primary/10 group-hover/input:opacity-100",
@@ -329,13 +329,13 @@ export const NodeConfigForm = React.memo(
                 </div>
                 <Button
                   onClick={() => setTestModalOpen(true)}
-                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-white/5 border border-white/5 text-white/70 hover:text-white hover:bg-white/10 transition-premium active:scale-95"
+                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-white/5 border border-white/5 text-white/70 hover:text-white hover:bg-white/10 transition-ui"
                 >
                   Test expression
                 </Button>
               </div>
               {rhaiError && (
-                <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl animate-in slide-in-from-top-2">
+                <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl">
                   <p className="text-xs text-destructive flex items-center gap-2 font-bold">
                     <AlertCircle className="w-4 h-4 shrink-0" />
                     FAULT: {rhaiError}
@@ -384,7 +384,7 @@ export const NodeConfigForm = React.memo(
       case "WhileLoop":
       case "Loop":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-4">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Termination Condition (Rhai)
@@ -427,7 +427,7 @@ export const NodeConfigForm = React.memo(
         );
       case "RepeatLoop":
         return (
-          <div className="space-y-4 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-4">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Static Cycle Count
@@ -446,7 +446,7 @@ export const NodeConfigForm = React.memo(
         );
       case "FanIn":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Aggregation Mode
@@ -469,7 +469,7 @@ export const NodeConfigForm = React.memo(
               </div>
             </div>
             {config.joinMode === "N" && (
-              <div className="space-y-3 animate-in fade-in zoom-in-95">
+              <div className="space-y-3">
                 <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                   Threshold Count (N)
                 </label>
@@ -506,7 +506,7 @@ export const NodeConfigForm = React.memo(
         );
       case "ErrorHandler":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Exception Pattern (Regex)
@@ -529,7 +529,7 @@ export const NodeConfigForm = React.memo(
         );
       case "SubWorkflow":
         return (
-          <div className="space-y-6 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-6">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Sub-workflow ID
@@ -548,7 +548,7 @@ export const NodeConfigForm = React.memo(
         );
       case "Wait":
         return (
-          <div className="space-y-8 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-8">
             <div className="space-y-3">
               <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
                 Manual Intervention Label
@@ -561,7 +561,7 @@ export const NodeConfigForm = React.memo(
               />
             </div>
             <div className="flex items-center gap-4 px-6 py-5 bg-amber-500/5 border border-amber-500/20 rounded-2xl relative overflow-hidden group">
-              <div className="p-3 bg-amber-500/10 rounded-2xl text-amber-500 transition-premium relative z-10">
+              <div className="p-3 bg-amber-500/10 rounded-2xl text-amber-500 transition-ui relative z-10">
                 <Clock className="w-5 h-5" />
               </div>
               <div className="flex flex-col gap-1 relative z-10">
@@ -579,14 +579,14 @@ export const NodeConfigForm = React.memo(
       default:
         // Fallback: generic JSON editor with error handling
         return (
-          <div className="space-y-4 animate-in slide-in-from-top-4 duration-500">
+          <div className="space-y-4">
             <label className="text-2xs text-muted-foreground/60 uppercase tracking-wider font-semibold ml-1">
               Advanced Object Configuration
             </label>
             <div className="relative group/json">
               <div
                 className={cn(
-                  "absolute -inset-1 rounded-2xl blur opacity-0 transition-premium",
+                  "absolute -inset-1 rounded-2xl blur opacity-0 transition-ui",
                   jsonError
                     ? "bg-destructive/10 group-hover/json:opacity-100"
                     : "bg-primary/5 group-hover/json:opacity-100",
@@ -607,7 +607,7 @@ export const NodeConfigForm = React.memo(
             </div>
 
             {jsonError && (
-              <div className="p-5 bg-destructive/5 border border-destructive/20 rounded-2xl animate-in slide-in-from-top-2">
+              <div className="p-5 bg-destructive/5 border border-destructive/20 rounded-2xl">
                 <p className="text-xs text-destructive flex items-center gap-3 font-bold">
                   <AlertCircle className="w-4 h-4 shrink-0" />
                   Invalid JSON: {jsonError}

@@ -61,7 +61,7 @@ export function ChannelTable({
               <tr
                 key={ch.channel_uuid}
                 className={cn(
-                  "border-t border-border/30 transition-premium duration-700",
+                  "border-t border-border/30 transition-ui",
                   flashing && "bg-primary/5",
                   rowDim && "opacity-60",
                   !flashing && !rowDim && "hover:bg-muted/20",

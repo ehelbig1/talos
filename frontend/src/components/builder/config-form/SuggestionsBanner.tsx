@@ -29,7 +29,7 @@ export function SuggestionsBanner({
   return (
     <div
       className={cn(
-        "relative group/suggestions p-6 rounded-2xl border transition-premium overflow-hidden",
+        "relative group/suggestions p-6 rounded-2xl border transition-ui overflow-hidden",
         showSuggestions
           ? "bg-primary/5 border-primary/20"
           : "bg-primary/5 border-primary/10 hover:border-primary/30",
@@ -40,7 +40,7 @@ export function SuggestionsBanner({
       </div>
       <div className="flex items-center justify-between mb-4 relative z-10">
         <div className="flex items-center gap-3">
-          <div className="p-1.5 rounded-lg bg-primary/20 text-primary animate-pulse">
+          <div className="p-1.5 rounded-lg bg-primary/20 text-primary">
             <Zap className="h-4 w-4" />
           </div>
           <span className="text-xs font-semibold text-white">
@@ -51,14 +51,14 @@ export function SuggestionsBanner({
         {!showSuggestions ? (
           <button
             onClick={onShow}
-            className="text-2xs font-semibold text-primary uppercase tracking-wider hover:text-white transition-premium"
+            className="text-2xs font-semibold text-primary uppercase tracking-wider hover:text-white transition-ui"
           >
             Review Analysis
           </button>
         ) : (
           <button
             onClick={onHide}
-            className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-premium"
+            className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
           >
             <X className="h-4 w-4" />
           </button>
@@ -66,11 +66,11 @@ export function SuggestionsBanner({
       </div>
 
       {showSuggestions && (
-        <div className="space-y-6 relative z-10 animate-in fade-in slide-in-from-top-2">
+        <div className="space-y-6 relative z-10">
           <ul className="space-y-3">
             {suggestions.map((s) => (
               <li key={s.field} className="flex gap-4 items-start group/s">
-                <div className="mt-1 w-1.5 h-1.5 rounded-full bg-primary/40 group-hover/s:bg-primary transition-premium" />
+                <div className="mt-1 w-1.5 h-1.5 rounded-full bg-primary/40 group-hover/s:bg-primary transition-ui" />
                 <div className="space-y-1">
                   <p className="text-xs font-bold text-white/60">
                     Override <span className="text-primary">{s.field}</span>{" "}
@@ -89,13 +89,13 @@ export function SuggestionsBanner({
           <div className="flex items-center gap-3 pt-4 border-t border-white/5">
             <button
               onClick={onApply}
-              className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-2xs font-semibold rounded-xl transition-premium"
+              className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-2xs font-semibold rounded-xl transition-ui"
             >
               Apply Optimization
             </button>
             <button
               onClick={onDiscard}
-              className="px-6 h-9 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-2xs font-semibold rounded-xl transition-premium border border-white/5"
+              className="px-6 h-9 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-2xs font-semibold rounded-xl transition-ui border border-white/5"
             >
               Discard
             </button>

@@ -53,7 +53,6 @@ module.exports = {
         'accordion-down': { from: { height: '0' }, to: { height: 'var(--radix-accordion-content-height)' } },
         'accordion-up': { from: { height: 'var(--radix-accordion-content-height)' }, to: { height: '0' } },
         'fade-in': { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
-        'slide-up': { '0%': { opacity: '0', transform: 'translateY(10px)' }, '100%': { opacity: '1', transform: 'translateY(0)' } },
         'shimmer': {
           '0%': { backgroundPosition: '-200% 0' },
           '100%': { backgroundPosition: '200% 0' }
@@ -63,7 +62,6 @@ module.exports = {
         'accordion-down': 'accordion-down 0.2s ease-out',
         'accordion-up': 'accordion-up 0.2s ease-out',
         'fade-in': 'fade-in 0.2s ease-out',
-        'slide-up': 'slide-up 0.25s ease-out',
         'shimmer': 'shimmer 2s linear infinite',
       },
     },

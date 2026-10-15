@@ -78,7 +78,7 @@ export function WatchPanelHeader({
             {subtitle}
             {isFetching && !isLoading && (
               <span className="ml-2 inline-flex items-center gap-1 text-xs text-muted-foreground/70">
-                <span className="w-2 h-2 bg-primary/50 rounded-full animate-pulse" />
+                <span className="w-2 h-2 bg-primary/50 rounded-full" />
                 refreshing
               </span>
             )}

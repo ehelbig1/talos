@@ -87,11 +87,11 @@ export default function AuditSettings() {
     );
 
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-700">
+    <div className="space-y-8">
       {/* Header */}
       <div className="flex items-center gap-6">
         <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center group">
-          <Shield className="w-8 h-8 text-primary transition-premium" />
+          <Shield className="w-8 h-8 text-primary transition-ui" />
         </div>
         <div>
           <SectionHeader
@@ -118,12 +118,12 @@ export default function AuditSettings() {
             Every run is signed and non-repudiable.
           </p>
 
-          <div className="bg-black/40 border border-white/5 rounded-2xl p-8 transition-premium group/box">
+          <div className="bg-black/40 border border-white/5 rounded-2xl p-8 transition-ui group/box">
             <div className="flex items-center justify-between mb-10">
               <div className="flex items-center gap-6">
                 <div
                   className={cn(
-                    "w-14 h-14 rounded-2xl flex items-center justify-center transition-premium",
+                    "w-14 h-14 rounded-2xl flex items-center justify-center transition-ui",
                     enabled
                       ? "bg-success/10 border border-success/20 text-success"
                       : "bg-white/5 border border-white/10 text-muted-foreground/50",
@@ -148,7 +148,7 @@ export default function AuditSettings() {
                 aria-label="Toggle audit log streaming"
                 onClick={() => setEnabled(!enabled)}
                 className={cn(
-                  "relative inline-flex h-8 w-14 items-center rounded-full transition-premium focus:outline-none ring-offset-black",
+                  "relative inline-flex h-8 w-14 items-center rounded-full transition-ui focus:outline-none ring-offset-black",
                   enabled ? "bg-success" : "bg-white/10",
                 )}
               >
@@ -162,7 +162,7 @@ export default function AuditSettings() {
             </div>
 
             {enabled && (
-              <div className="space-y-8 animate-in fade-in slide-in-from-top-4 duration-500">
+              <div className="space-y-8">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8 pt-8 border-t border-white/5">
                   <div className="space-y-3">
                     <Label className="text-xs font-semibold text-muted-foreground/70 flex items-center gap-2 ml-1">
@@ -173,7 +173,7 @@ export default function AuditSettings() {
                       value={endpoint}
                       onChange={(e) => setEndpoint(e.target.value)}
                       placeholder="https://otel-collector.internal:4317"
-                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:ring-primary/20 transition-premium"
+                      className="h-14 bg-black/40 border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:ring-primary/20 transition-ui"
                     />
                   </div>
 
@@ -186,7 +186,7 @@ export default function AuditSettings() {
                       <select
                         value={protocol}
                         onChange={(e) => setProtocol(e.target.value)}
-                        className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer hover:bg-black/60"
+                        className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer hover:bg-black/60"
                       >
                         {/* MCP-866 (2026-05-14): only gRPC is wired through
                             talos-audit-ledger today. HTTP/Protobuf was offered
@@ -211,10 +211,10 @@ export default function AuditSettings() {
                     value={headers}
                     onChange={(e) => setHeaders(e.target.value)}
                     placeholder='{ "Authorization": "Bearer ...", "x-team-id": "..." }'
-                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/50 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-premium border-dashed p-6"
+                    className="bg-black/40 border-white/5 text-white placeholder:text-muted-foreground/50 rounded-2xl min-h-[120px] font-mono text-xs resize-none focus:ring-primary/20 transition-ui border-dashed p-6"
                   />
                   <div className="flex items-center gap-3 px-1 mt-2">
-                    <div className="w-2 h-2 rounded-full bg-primary animate-pulse" />
+                    <div className="w-2 h-2 rounded-full bg-primary" />
                     <p className="text-xs text-muted-foreground/50 font-semibold">
                       Headers are AES-256-GCM encrypted before vault commit.
                     </p>
@@ -253,8 +253,8 @@ export default function AuditSettings() {
       </div>
 
       {/* Info Box */}
-      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 flex items-start gap-6 hover:border-white/10 transition-premium group">
-        <div className="w-14 h-14 bg-primary/5 border border-primary/10 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-premium">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-8 flex items-start gap-6 hover:border-white/10 transition-ui group">
+        <div className="w-14 h-14 bg-primary/5 border border-primary/10 rounded-2xl flex items-center justify-center shrink-0 group-hover:bg-primary/10 transition-ui">
           <Database className="w-7 h-7 text-primary" />
         </div>
         <div className="space-y-2">

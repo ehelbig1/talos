@@ -38,7 +38,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
   }, [edge.data?.condition]);
 
   return (
-    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5 animate-in slide-in-from-right duration-500">
+    <div className="flex flex-col h-full bg-surface-2/80 relative border-l border-white/5">
       <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-surface-2/40 relative z-10">
         <div className="flex items-center gap-4">
           <div className="w-10 h-10 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
@@ -57,14 +57,14 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
           type="button"
           onClick={onClose}
           aria-label="Close edge properties"
-          className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/70 hover:text-white transition-premium"
+          className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/70 hover:text-white transition-ui"
         >
           <X className="h-4 w-4" />
         </button>
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto custom-scrollbar relative z-10">
-        <div className="p-6 space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="p-6 space-y-10">
           <div className="space-y-4">
             <label className="text-xs text-muted-foreground/70 font-semibold ml-1">
               Edge type
@@ -105,14 +105,14 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                     })
                   }
                   className={cn(
-                    "flex items-center gap-3 p-4 rounded-2xl border text-left transition-premium group relative overflow-hidden",
+                    "flex items-center gap-3 p-4 rounded-2xl border text-left transition-ui group relative overflow-hidden",
                     edge.data?.edgeType === type.value
                       ? "bg-white/[0.03] border-white/20"
                       : "bg-surface-3/20 border-white/5 hover:bg-white/[0.03] hover:border-white/10",
                   )}
                 >
                   <type.icon
-                    className={cn("w-5 h-5 transition-premium", type.color)}
+                    className={cn("w-5 h-5 transition-ui", type.color)}
                   />
                   <span
                     className={cn(
@@ -149,7 +149,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                 <Textarea
                   placeholder="ctx.result.score > 0.8"
                   className={cn(
-                    "bg-surface-4/40 border-white/5 focus:border-primary/50 font-mono text-xs min-h-[120px] rounded-xl transition-premium selection:bg-primary/30 leading-relaxed",
+                    "bg-surface-4/40 border-white/5 focus:border-primary/50 font-mono text-xs min-h-[120px] rounded-xl transition-ui selection:bg-primary/30 leading-relaxed",
                     syntaxError &&
                       "border-destructive/50 focus:border-destructive",
                   )}
@@ -160,7 +160,7 @@ export const EdgeInspector: React.FC<EdgeInspectorProps> = ({
                 />
               </FormField>
               {syntaxError && (
-                <div className="flex items-center gap-3 px-4 py-2 bg-destructive/10 border border-destructive/20 rounded-xl animate-in slide-in-from-top-2">
+                <div className="flex items-center gap-3 px-4 py-2 bg-destructive/10 border border-destructive/20 rounded-xl">
                   <ShieldAlert className="w-4 h-4 text-destructive shrink-0" />
                   <span className="text-xs font-semibold text-destructive">
                     {syntaxError}

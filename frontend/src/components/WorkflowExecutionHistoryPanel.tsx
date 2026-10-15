@@ -77,7 +77,7 @@ function StatusPill({ status }: { status: string }) {
   return (
     <span
       className={cn(
-        "px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-premium",
+        "px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-ui",
         cls,
       )}
     >
@@ -123,7 +123,7 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
   return (
     <span
       className={cn(
-        "flex items-center gap-2 px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-premium",
+        "flex items-center gap-2 px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border transition-ui",
         cls,
       )}
     >
@@ -166,7 +166,7 @@ function ExecutionRow({
   return (
     <div
       className={cn(
-        "group border border-white/5 bg-surface-3/30 rounded-2xl overflow-hidden transition-premium relative",
+        "group border border-white/5 bg-surface-3/30 rounded-2xl overflow-hidden transition-ui relative",
         isExpanded
           ? "border-primary/30 bg-surface-3/60"
           : "hover:bg-surface-3/50 hover:border-white/10",
@@ -174,11 +174,11 @@ function ExecutionRow({
     >
       {/* Row header */}
       <button
-        className="w-full flex items-center gap-6 text-xs p-6 transition-premium text-left focus:outline-none relative z-10"
+        className="w-full flex items-center gap-6 text-xs p-6 transition-ui text-left focus:outline-none relative z-10"
         onClick={onToggle}
         aria-expanded={isExpanded}
       >
-        <div className="shrink-0 flex items-center justify-center w-12 h-12 rounded-2xl bg-black/20 border border-white/5 transition-premium relative overflow-hidden">
+        <div className="shrink-0 flex items-center justify-center w-12 h-12 rounded-2xl bg-black/20 border border-white/5 transition-ui relative overflow-hidden">
           <StatusIcon status={exec.status} />
         </div>
 
@@ -209,7 +209,7 @@ function ExecutionRow({
           </span>
           <ChevronRight
             className={cn(
-              "w-5 h-5 text-muted-foreground/50 shrink-0 transition-transform duration-500",
+              "w-5 h-5 text-muted-foreground/50 shrink-0 transition-transform",
               isExpanded && "rotate-90 text-primary",
             )}
           />
@@ -219,11 +219,11 @@ function ExecutionRow({
       {/* Expand panel */}
       <div
         className={cn(
-          "overflow-hidden transition-all duration-700 ease-in-out relative z-10",
+          "overflow-hidden transition-ui relative z-10",
           isExpanded ? "max-h-[800px] opacity-100" : "max-h-0 opacity-0",
         )}
       >
-        <div className="px-8 pb-8 space-y-8 animate-in slide-in-from-top-4 duration-500">
+        <div className="px-8 pb-8 space-y-8">
           <div className="h-px bg-white/5 mx-[-2rem]" />
 
           {/* Action buttons */}
@@ -237,7 +237,7 @@ function ExecutionRow({
                       onRetry(exec.id);
                     }}
                     disabled={isRetrying}
-                    className="h-11 px-6 text-sm font-semibold rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 active:scale-95 transition-premium"
+                    className="h-11 px-6 text-sm font-semibold rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 transition-ui"
                   >
                     {isRetrying ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -254,7 +254,7 @@ function ExecutionRow({
                     onResume(exec.id);
                   }}
                   disabled={isResuming}
-                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 active:scale-95 transition-premium"
+                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 transition-ui"
                 >
                   {isResuming ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -300,7 +300,7 @@ function ExecutionRow({
                     navigator.clipboard.writeText(outputText);
                     toast.success("Output copied to clipboard");
                   }}
-                  className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white transition-premium"
+                  className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white transition-ui"
                   title="Copy Output"
                 >
                   <Copy className="w-4 h-4" />
@@ -415,18 +415,13 @@ export const WorkflowExecutionHistoryPanel = React.memo(
     }, [workflowId, queryClient]);
 
     const content = (
-      <div
-        className={cn(
-          "space-y-8 animate-in fade-in duration-700",
-          onClose && "mt-0 p-2",
-        )}
-      >
+      <div className={cn("space-y-8", onClose && "mt-0 p-2")}>
         {/* Header */}
         <div className="flex items-center justify-between px-4">
           <div className="flex items-center gap-6">
             <div
               className={cn(
-                "flex items-center justify-center w-12 h-12 rounded-2xl bg-surface-3/60 border border-white/5 transition-premium relative overflow-hidden",
+                "flex items-center justify-center w-12 h-12 rounded-2xl bg-surface-3/60 border border-white/5 transition-ui relative overflow-hidden",
                 hasRunning && "border-primary/40",
               )}
             >
@@ -446,7 +441,7 @@ export const WorkflowExecutionHistoryPanel = React.memo(
                 </span>
                 {hasRunning && (
                   <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                    <div className="w-1.5 h-1.5 rounded-full bg-primary" />
                     <span className="text-2xs font-semibold text-primary tracking-wider uppercase">
                       Running
                     </span>
@@ -458,7 +453,7 @@ export const WorkflowExecutionHistoryPanel = React.memo(
           <Button
             onClick={() => refetch()}
             disabled={isFetching}
-            className="flex items-center gap-3 text-sm font-semibold text-white/70 hover:text-white bg-white/5 hover:bg-white/10 px-6 h-12 rounded-2xl transition-premium active:scale-95 disabled:opacity-50 border border-white/5"
+            className="flex items-center gap-3 text-sm font-semibold text-white/70 hover:text-white bg-white/5 hover:bg-white/10 px-6 h-12 rounded-2xl transition-ui disabled:opacity-50 border border-white/5"
           >
             <RefreshCw
               className={cn("w-4 h-4", isFetching && "animate-spin")}
@@ -469,7 +464,7 @@ export const WorkflowExecutionHistoryPanel = React.memo(
 
         {/* Content */}
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/50 animate-in fade-in duration-1000">
+          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/50">
             <div className="relative">
               <Loader2 className="w-12 h-12 animate-spin text-primary/70" />
             </div>
@@ -485,7 +480,7 @@ export const WorkflowExecutionHistoryPanel = React.memo(
             </p>
           </div>
         ) : (
-          <div className="grid gap-4 animate-in fade-in slide-in-from-bottom-6 duration-1000">
+          <div className="grid gap-4">
             {history.map((exec) => (
               <ExecutionRow
                 key={exec.id}

@@ -69,7 +69,7 @@ export function CreateKeyDialog({
   return (
     <Dialog open={true} onClose={onClose}>
       <div
-        className="bg-surface-3/90 border border-white/5 rounded-2xl overflow-hidden w-[520px] animate-in zoom-in-95 duration-200"
+        className="bg-surface-3/90 border border-white/5 rounded-2xl overflow-hidden w-[520px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-8 py-6 border-b border-white/5 flex items-center justify-between bg-white/[0.02]">
@@ -89,7 +89,7 @@ export function CreateKeyDialog({
           <button
             type="button"
             onClick={onClose}
-            className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/5 text-muted-foreground hover:text-white transition-premium"
+            className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/5 text-muted-foreground hover:text-white transition-ui"
           >
             <X size={20} />
           </button>
@@ -101,7 +101,7 @@ export function CreateKeyDialog({
               Key name
             </label>
             <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-premium">
+              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-ui">
                 <Fingerprint size={18} />
               </div>
               <Input
@@ -110,7 +110,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onNameChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-ui h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -120,7 +120,7 @@ export function CreateKeyDialog({
               Expiration Policy
             </label>
             <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-premium">
+              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-ui">
                 <Calendar size={18} />
               </div>
               <Input
@@ -130,7 +130,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onExpiresInChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-premium h-12 text-sm font-medium rounded-xl"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-ui h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -145,7 +145,7 @@ export function CreateKeyDialog({
                   key={s.value}
                   onClick={() => onToggleScope(s.value)}
                   className={cn(
-                    "flex flex-col items-start p-4 rounded-xl border transition-premium text-left group/scope",
+                    "flex flex-col items-start p-4 rounded-xl border transition-ui text-left group/scope",
                     selectedScopes.includes(s.value)
                       ? "bg-indigo-500/10 border-indigo-500/40 text-indigo-100"
                       : "bg-surface-4/60 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]",
@@ -164,7 +164,7 @@ export function CreateKeyDialog({
                     </span>
                     <div
                       className={cn(
-                        "w-4 h-4 rounded-full border transition-premium flex items-center justify-center",
+                        "w-4 h-4 rounded-full border transition-ui flex items-center justify-center",
                         selectedScopes.includes(s.value)
                           ? "bg-indigo-500 border-indigo-500"
                           : "bg-surface-3/60 border-white/5",
@@ -181,7 +181,7 @@ export function CreateKeyDialog({
                   <div className="text-xs font-bold leading-tight mb-1">
                     {s.label}
                   </div>
-                  <div className="text-xs text-muted-foreground font-medium leading-tight group-hover/scope:text-muted-foreground transition-premium">
+                  <div className="text-xs text-muted-foreground font-medium leading-tight group-hover/scope:text-muted-foreground transition-ui">
                     {s.desc}
                   </div>
                 </button>
@@ -202,7 +202,7 @@ export function CreateKeyDialog({
           <Button
             onClick={onCreate}
             disabled={isPending || !name || selectedScopes.length === 0}
-            className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20 px-8 h-11 rounded-xl font-bold transition-premium"
+            className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20 px-8 h-11 rounded-xl font-bold transition-ui"
           >
             {isPending ? (
               <div className="flex items-center gap-2">

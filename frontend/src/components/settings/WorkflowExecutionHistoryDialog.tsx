@@ -82,7 +82,7 @@ const STATUS_STYLES: Record<
   },
   running: {
     badge: "bg-indigo-500/10 border-indigo-500/25 text-indigo-400",
-    dot: "bg-indigo-400 animate-pulse",
+    dot: "bg-indigo-400",
     label: "Running",
   },
   paused: {
@@ -188,7 +188,7 @@ export default function WorkflowExecutionHistoryDialog({
             onClick={() => refetch()}
             disabled={isFetching}
             className={cn(
-              "w-8 h-8 flex items-center justify-center rounded-lg border border-white/5 text-muted-foreground hover:text-primary hover:border-primary/30 hover:bg-primary/5 transition-premium",
+              "w-8 h-8 flex items-center justify-center rounded-lg border border-white/5 text-muted-foreground hover:text-primary hover:border-primary/30 hover:bg-primary/5 transition-ui",
               isFetching && "animate-spin text-primary",
             )}
             title="Refresh"
@@ -202,7 +202,7 @@ export default function WorkflowExecutionHistoryDialog({
           {isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
               <LoadingSpinner className="w-8 h-8 text-primary" />
-              <p className="text-xs text-muted-foreground/60 font-semibold animate-pulse">
+              <p className="text-xs text-muted-foreground/60 font-semibold">
                 Loading History...
               </p>
             </div>
@@ -246,7 +246,7 @@ export default function WorkflowExecutionHistoryDialog({
 
                     return (
                       <React.Fragment key={exec.id}>
-                        <tr className="group hover:bg-primary/[0.015] transition-premium">
+                        <tr className="group hover:bg-primary/[0.015] transition-ui">
                           <td className="px-6 py-4">
                             <div className="flex items-center gap-2">
                               <span
@@ -267,7 +267,7 @@ export default function WorkflowExecutionHistoryDialog({
                                 <button
                                   type="button"
                                   onClick={() => toggleError(exec.id)}
-                                  className="text-muted-foreground/70 hover:text-destructive transition-premium"
+                                  className="text-muted-foreground/70 hover:text-destructive transition-ui"
                                   title="Toggle error details"
                                 >
                                   {isErrorExpanded ? (
@@ -309,7 +309,7 @@ export default function WorkflowExecutionHistoryDialog({
                                       type: "retry",
                                     })
                                   }
-                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary hover:bg-primary/10 h-7 px-3 font-semibold transition-premium text-2xs gap-1.5"
+                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-primary hover:bg-primary/10 h-7 px-3 font-semibold transition-ui text-2xs gap-1.5"
                                 >
                                   <RotateCcw className="w-3 h-3" />
                                   Retry
@@ -325,7 +325,7 @@ export default function WorkflowExecutionHistoryDialog({
                                       type: "resume",
                                     })
                                   }
-                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-warning hover:bg-warning/10 h-7 px-3 font-semibold transition-premium text-2xs gap-1.5"
+                                  className="opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-warning hover:bg-warning/10 h-7 px-3 font-semibold transition-ui text-2xs gap-1.5"
                                 >
                                   <Play className="w-3 h-3" />
                                   Resume
@@ -366,7 +366,7 @@ export default function WorkflowExecutionHistoryDialog({
               variant="ghost"
               size="sm"
               onClick={() => setLimit((prev) => prev + 50)}
-              className="text-muted-foreground/70 hover:text-primary hover:bg-primary/5 font-semibold text-2xs gap-1.5 h-10 px-8 rounded-2xl border border-white/5 transition-premium"
+              className="text-muted-foreground/70 hover:text-primary hover:bg-primary/5 font-semibold text-2xs gap-1.5 h-10 px-8 rounded-2xl border border-white/5 transition-ui"
             >
               <ChevronDown className="w-3 h-3" />
               Load more
@@ -420,7 +420,7 @@ export default function WorkflowExecutionHistoryDialog({
                 onClick={handleConfirm}
                 disabled={actionPending}
                 className={cn(
-                  "flex-1 text-sm font-semibold h-12 rounded-2xl transition-premium border border-white/10",
+                  "flex-1 text-sm font-semibold h-12 rounded-2xl transition-ui border border-white/10",
                   confirmAction.type === "retry"
                     ? "bg-primary hover:bg-primary/90"
                     : "bg-warning hover:bg-warning/90 text-background",

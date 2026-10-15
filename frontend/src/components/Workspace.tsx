@@ -157,7 +157,7 @@ function Workspace() {
             nodeDragThreshold={1}
             defaultEdgeOptions={{
               style: { strokeWidth: 3, stroke: "hsla(var(--primary), 0.5)" },
-              animated: true,
+              animated: false,
             }}
             proOptions={proOptions}
             className="bg-transparent"
@@ -173,7 +173,7 @@ function Workspace() {
             <div className="absolute bottom-8 left-8 z-20">
               <Controls
                 showInteractive={false}
-                className="!m-0 !bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl overflow-hidden [&>button]:!bg-transparent [&>button]:!border-white/10 [&>button]:!text-muted-foreground [&>button:hover]:!text-foreground [&>button:hover]:!bg-white/5 [&>button]:!transition-premium"
+                className="!m-0 !bg-surface-3/40 !backdrop-blur-2xl !border-white/5 !rounded-2xl overflow-hidden [&>button]:!bg-transparent [&>button]:!border-white/10 [&>button]:!text-muted-foreground [&>button:hover]:!text-foreground [&>button:hover]:!bg-white/5 [&>button]:!transition-ui"
               />
             </div>
 
@@ -197,7 +197,7 @@ function Workspace() {
             <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-30 px-6">
               <div className="text-center pointer-events-auto bg-surface-3/40 border border-white/10 p-16 rounded-2xl max-w-xl w-full relative">
                 <div className="relative z-10">
-                  <div className="w-24 h-24 mx-auto mb-10 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-premium duration-700">
+                  <div className="w-24 h-24 mx-auto mb-10 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center shadow-2xl transition-ui">
                     <Zap className="w-12 h-12 text-primary fill-primary/10" />
                   </div>
 
@@ -213,14 +213,14 @@ function Workspace() {
                       onClick={() =>
                         useUIStore.getState().setToolbarModal("addExisting")
                       }
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-primary text-white rounded-2xl transition-premium shadow-xl active:scale-95"
+                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-primary text-white rounded-2xl transition-ui shadow-xl"
                     >
                       <FolderPlus className="w-4 h-4" />
                       Add a module
                     </button>
                     <button
                       onClick={() => navigate("/library#templates")}
-                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-white/5 text-muted-foreground border border-white/10 hover:text-white hover:bg-white/10 rounded-2xl transition-premium active:scale-95"
+                      className="w-full sm:w-auto flex items-center justify-center gap-2.5 px-8 py-4 text-sm font-semibold bg-white/5 text-muted-foreground border border-white/10 hover:text-white hover:bg-white/10 rounded-2xl transition-ui"
                     >
                       <BookOpen className="w-4 h-4" />
                       Browse templates
@@ -235,7 +235,7 @@ function Workspace() {
         {/* Right Inspector - Slide in/out */}
         <div
           className={cn(
-            "border-l border-white/5 bg-surface-1/60 backdrop-blur-3xl transition-premium z-20",
+            "border-l border-white/5 bg-surface-1/60 backdrop-blur-3xl transition-[width] duration-200 z-20",
           )}
           style={{ width: showInspector ? "420px" : "0px" }}
         >
@@ -256,7 +256,7 @@ function Workspace() {
       {/* Bottom Terminal - Drawer */}
       <div
         className={cn(
-          "border-t border-white/5 bg-surface-1/60 backdrop-blur-3xl text-foreground transition-premium z-30",
+          "border-t border-white/5 bg-surface-1/60 backdrop-blur-3xl text-foreground z-30",
         )}
         style={{ height: `${terminalHeight}px` }}
       >

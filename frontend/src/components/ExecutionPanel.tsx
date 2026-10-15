@@ -218,7 +218,7 @@ export default function ExecutionPanel() {
   );
 
   return (
-    <div className="flex flex-col bg-surface-1/60 border-l border-white/5 text-foreground relative overflow-hidden transition-premium">
+    <div className="flex flex-col bg-surface-1/60 border-l border-white/5 text-foreground relative overflow-hidden transition-ui">
       <ConfirmDialog
         open={confirmPending !== null}
         title={confirmPending?.title ?? "Confirm"}
@@ -251,7 +251,7 @@ export default function ExecutionPanel() {
 
       {/* Main Content Area — Only visible when telemetry is toggled */}
       {showTimeline && (
-        <div className="border-t border-white/5 overflow-hidden flex flex-col bg-surface-2/60 animate-in slide-in-from-top-4 duration-500 relative z-20">
+        <div className="border-t border-white/5 overflow-hidden flex flex-col bg-surface-2/60 relative z-20">
           {executionId && (
             <div className="px-6 py-2 bg-white/5 border-b border-white/5 flex items-center justify-between">
               <div className="flex items-center gap-4">
@@ -266,7 +266,7 @@ export default function ExecutionPanel() {
                     variant="ghost"
                     size="icon"
                     onClick={() => copyId(executionId)}
-                    className="h-7 w-7 text-muted-foreground/70 hover:text-primary hover:bg-primary/10 transition-premium rounded-lg"
+                    className="h-7 w-7 text-muted-foreground/70 hover:text-primary hover:bg-primary/10 transition-ui rounded-lg"
                   >
                     <Copy className="h-3.5 w-3.5" />
                   </Button>
@@ -293,7 +293,7 @@ export default function ExecutionPanel() {
                   min={0}
                   max={events.length - 1}
                   defaultValue={events.length - 1}
-                  className="w-32 h-1 bg-white/5 rounded-full accent-primary cursor-pointer transition-premium hover:accent-primary-foreground"
+                  className="w-32 h-1 bg-white/5 rounded-full accent-primary cursor-pointer transition-ui hover:accent-primary-foreground"
                   onChange={(e) => {
                     const idx = Number(e.target.value);
                     const container =
@@ -319,7 +319,7 @@ export default function ExecutionPanel() {
                   key={mode}
                   onClick={() => setViewMode(mode)}
                   className={cn(
-                    "px-4 py-1.5 text-2xs font-semibold uppercase tracking-wider rounded-lg transition-premium",
+                    "px-4 py-1.5 text-2xs font-semibold uppercase tracking-wider rounded-lg transition-ui",
                     viewMode === mode
                       ? "bg-primary text-primary-foreground"
                       : "text-muted-foreground/70 hover:text-white",
@@ -336,8 +336,8 @@ export default function ExecutionPanel() {
             {events.length === 0 ? (
               <div className="py-20 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
-                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 transition-premium group-hover:border-primary/20">
-                    <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-premium stroke-[1px]" />
+                  <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 transition-ui group-hover:border-primary/20">
+                    <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-ui stroke-[1px]" />
                   </div>
                 </div>
                 <div className="space-y-3 max-w-[280px]">

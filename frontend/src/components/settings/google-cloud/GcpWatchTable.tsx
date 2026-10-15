@@ -51,7 +51,7 @@ export function GcpWatchTable({
               <tr
                 key={w.channel_uuid}
                 className={cn(
-                  "border-t border-border/30 transition-premium duration-700",
+                  "border-t border-border/30 transition-ui",
                   flashing && "bg-primary/5",
                   dim && "opacity-60",
                   !flashing && !dim && "hover:bg-muted/20",

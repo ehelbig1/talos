@@ -137,7 +137,7 @@ export default function WorkflowVersionsPanel({
           </p>
           <Button
             onClick={() => setShowPublishForm((v) => !v)}
-            className="bg-primary hover:bg-primary/90 text-white font-semibold px-4 h-9 rounded-xl transition-premium hover:scale-[1.02] text-xs gap-1.5 border border-white/10"
+            className="bg-primary hover:bg-primary/90 text-white font-semibold px-4 h-9 rounded-xl transition-ui text-xs gap-1.5 border border-white/10"
           >
             <Plus className="w-3.5 h-3.5" />
             Snapshot Current
@@ -152,7 +152,7 @@ export default function WorkflowVersionsPanel({
                 key={tab}
                 onClick={() => setActiveTab(tab)}
                 className={cn(
-                  "px-6 py-3 text-2xs font-semibold rounded-t-xl transition-premium border-b-2 -mb-px",
+                  "px-6 py-3 text-2xs font-semibold rounded-t-xl transition-ui border-b-2 -mb-px",
                   activeTab === tab
                     ? "text-primary border-primary bg-primary/5"
                     : "text-muted-foreground/70 border-transparent hover:text-white hover:bg-white/5",
@@ -171,9 +171,9 @@ export default function WorkflowVersionsPanel({
         </div>
 
         {showPublishForm && (
-          <div className="p-6 border border-primary/20 bg-primary/5 rounded-2xl space-y-4 animate-in slide-in-from-top-4 duration-500 bg-white/[0.03] border border-white/5">
+          <div className="p-6 border border-primary/20 bg-primary/5 rounded-2xl space-y-4 bg-white/[0.03] border border-white/5">
             <div className="flex items-center gap-2">
-              <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+              <div className="w-1.5 h-1.5 rounded-full bg-primary" />
               <p className="text-xs font-semibold text-primary">
                 Publishing version
               </p>
@@ -183,7 +183,7 @@ export default function WorkflowVersionsPanel({
               value={publishDescription}
               onChange={(e) => setPublishDescription(e.target.value)}
               rows={2}
-              className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/20 rounded-xl px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 resize-none transition-premium font-medium"
+              className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/20 rounded-xl px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 resize-none transition-ui font-medium"
             />
             <div className="flex justify-end gap-3">
               <Button
@@ -202,7 +202,7 @@ export default function WorkflowVersionsPanel({
                 size="sm"
                 onClick={handlePublish}
                 disabled={publishMutation.isPending}
-                className="bg-primary hover:bg-primary/90 text-white font-semibold px-8 h-9 rounded-xl text-2xs transition-premium border border-white/10"
+                className="bg-primary hover:bg-primary/90 text-white font-semibold px-8 h-9 rounded-xl text-2xs transition-ui border border-white/10"
               >
                 {publishMutation.isPending ? (
                   <div className="flex items-center gap-2">
@@ -280,7 +280,7 @@ export default function WorkflowVersionsPanel({
                       <div
                         key={label}
                         className={cn(
-                          "rounded-2xl border p-5 flex flex-col gap-2 transition-premium",
+                          "rounded-2xl border p-5 flex flex-col gap-2 transition-ui",
                           color,
                         )}
                       >
@@ -322,11 +322,11 @@ export default function WorkflowVersionsPanel({
                       key={entry.versionNumber}
                       className="flex gap-6 pb-8 last:pb-0 group"
                     >
-                      <div className="w-9 h-9 rounded-full bg-surface-3 border border-white/10 flex items-center justify-center shrink-0 z-10 text-2xs font-semibold text-primary transition-premium">
+                      <div className="w-9 h-9 rounded-full bg-surface-3 border border-white/10 flex items-center justify-center shrink-0 z-10 text-2xs font-semibold text-primary transition-ui">
                         v{entry.versionNumber}
                       </div>
                       <div className="flex-1 pt-1.5 min-w-0">
-                        <p className="text-sm font-bold text-white group-hover:text-primary transition-premium">
+                        <p className="text-sm font-bold text-white group-hover:text-primary transition-ui">
                           {entry.summary}
                         </p>
                         {entry.description && (
@@ -348,7 +348,7 @@ export default function WorkflowVersionsPanel({
           {activeTab === "versions" && isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
               <LoadingSpinner className="w-8 h-8 text-primary" />
-              <p className="text-xs text-muted-foreground/60 font-semibold animate-pulse">
+              <p className="text-xs text-muted-foreground/60 font-semibold">
                 Loading Versions...
               </p>
             </div>
@@ -369,7 +369,7 @@ export default function WorkflowVersionsPanel({
                   <div
                     key={v.id}
                     className={cn(
-                      "px-8 py-6 flex items-center justify-between gap-6 group transition-premium",
+                      "px-8 py-6 flex items-center justify-between gap-6 group transition-ui",
                       v.isActive
                         ? "bg-primary/[0.03]"
                         : "hover:bg-white/[0.015]",
@@ -378,7 +378,7 @@ export default function WorkflowVersionsPanel({
                     <div className="flex items-center gap-6 min-w-0">
                       <div
                         className={cn(
-                          "w-10 h-10 rounded-xl flex items-center justify-center text-xs font-semibold shrink-0 border transition-premium",
+                          "w-10 h-10 rounded-xl flex items-center justify-center text-xs font-semibold shrink-0 border transition-ui",
                           v.isActive
                             ? "bg-primary/10 border-primary/30 text-primary"
                             : "bg-surface-3 border-white/5 text-muted-foreground/70 group-hover:border-white/10",
@@ -389,7 +389,7 @@ export default function WorkflowVersionsPanel({
                       <div className="min-w-0">
                         <div className="flex items-center gap-3 mb-1.5">
                           {v.isActive && (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-primary/10 border border-primary/20 text-2xs font-semibold text-primary rounded-md uppercase tracking-wider animate-status-pulse">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-primary/10 border border-primary/20 text-2xs font-semibold text-primary rounded-md uppercase tracking-wider">
                               <CheckCircle2 className="w-2.5 h-2.5" />
                               Live
                             </span>
@@ -423,7 +423,7 @@ export default function WorkflowVersionsPanel({
                           size="sm"
                           onClick={() => setRollbackTargetId(v.id)}
                           disabled={rollbackMutation.isPending}
-                          className="opacity-0 group-hover:opacity-100 text-muted-foreground/70 hover:text-primary hover:bg-primary/5 h-9 px-5 font-semibold transition-premium text-2xs gap-2 border border-white/5 rounded-xl hover:border-primary/20"
+                          className="opacity-0 group-hover:opacity-100 text-muted-foreground/70 hover:text-primary hover:bg-primary/5 h-9 px-5 font-semibold transition-ui text-2xs gap-2 border border-white/5 rounded-xl hover:border-primary/20"
                         >
                           <RotateCcw className="w-3.5 h-3.5" />
                           Rollback
@@ -461,7 +461,7 @@ export default function WorkflowVersionsPanel({
                       value={concurrencyInput}
                       onChange={(e) => setConcurrencyInput(e.target.value)}
                       placeholder="No limit"
-                      className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/40 rounded-xl px-5 py-3 text-sm text-white placeholder:text-muted-foreground/50 transition-premium relative z-10 font-medium"
+                      className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/40 rounded-xl px-5 py-3 text-sm text-white placeholder:text-muted-foreground/50 transition-ui relative z-10 font-medium"
                     />
                   </div>
                   <Button
@@ -475,7 +475,7 @@ export default function WorkflowVersionsPanel({
                       })
                     }
                     disabled={concurrencyMutation.isPending}
-                    className="bg-primary hover:bg-primary/90 text-white font-semibold px-8 rounded-xl text-sm h-12 transition-premium border border-white/10"
+                    className="bg-primary hover:bg-primary/90 text-white font-semibold px-8 rounded-xl text-sm h-12 transition-ui border border-white/10"
                   >
                     {concurrencyMutation.isPending ? "Saving…" : "Save limit"}
                   </Button>
@@ -536,7 +536,7 @@ export default function WorkflowVersionsPanel({
               <Button
                 onClick={handleRollback}
                 disabled={rollbackMutation.isPending}
-                className="flex-1 bg-warning hover:bg-warning/90 text-background font-semibold h-12 rounded-2xl transition-premium border border-white/10 text-sm"
+                className="flex-1 bg-warning hover:bg-warning/90 text-background font-semibold h-12 rounded-2xl transition-ui border border-white/10 text-sm"
               >
                 {rollbackMutation.isPending ? (
                   <div className="flex items-center gap-2">

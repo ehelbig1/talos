@@ -126,7 +126,7 @@ export default function AlertTriage() {
               {[1, 2, 3].map((i) => (
                 <div
                   key={i}
-                  className="h-8 w-28 bg-white/[0.02] border border-white/5 rounded-lg animate-pulse"
+                  className="h-8 w-28 bg-white/[0.02] border border-white/5 rounded-lg"
                 />
               ))}
             </div>
@@ -162,7 +162,7 @@ export default function AlertTriage() {
                 type="button"
                 onClick={() => setFilter(f)}
                 className={cn(
-                  "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-xs font-semibold transition-premium",
+                  "inline-flex items-center justify-center whitespace-nowrap rounded-lg px-4 py-1.5 text-xs font-semibold transition-ui",
                   filter === f
                     ? "bg-white/10 text-foreground shadow-sm border border-white/10"
                     : "text-muted-foreground/60 hover:text-foreground",
@@ -264,7 +264,7 @@ export default function AlertTriage() {
                               correct.mutate({ alertId: a.id, severity: sev })
                             }
                             className={cn(
-                              "h-8 px-3 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-premium disabled:cursor-default",
+                              "h-8 px-3 rounded-lg text-2xs font-semibold uppercase tracking-wider border transition-ui disabled:cursor-default",
                               isCurrent
                                 ? severityStyle(sev)
                                 : "bg-transparent text-muted-foreground/50 border-white/10 hover:bg-white/5 hover:text-foreground",

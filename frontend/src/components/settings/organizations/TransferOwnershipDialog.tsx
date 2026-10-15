@@ -62,7 +62,7 @@ export function TransferOwnershipDialog({
               placeholder="User ID"
               value={newOwnerId}
               onChange={(e) => onNewOwnerIdChange(e.target.value)}
-              className="h-14 bg-white/[0.03] border-white/10 focus:border-destructive/50 focus:ring-destructive/20 rounded-xl px-4 font-mono text-sm text-white placeholder:text-white/10 transition-premium"
+              className="h-14 bg-white/[0.03] border-white/10 focus:border-destructive/50 focus:ring-destructive/20 rounded-xl px-4 font-mono text-sm text-white placeholder:text-white/10 transition-ui"
             />
           </div>
 
@@ -80,7 +80,7 @@ export function TransferOwnershipDialog({
                 value={confirmName}
                 onChange={(e) => onConfirmNameChange(e.target.value)}
                 className={cn(
-                  "h-14 bg-white/[0.03] border-white/10 rounded-xl px-4 text-sm transition-premium",
+                  "h-14 bg-white/[0.03] border-white/10 rounded-xl px-4 text-sm transition-ui",
                   confirmName && !isTransferConfirmed
                     ? "border-destructive/50 focus:ring-destructive/20 text-destructive"
                     : "focus:border-primary/50 focus:ring-primary/20 text-white",

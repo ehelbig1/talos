@@ -21,7 +21,7 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
   >
     <div className="relative">
       <svg
-        className="animate-spin h-10 w-10 text-primary relative z-10 icon-glow"
+        className="animate-spin h-10 w-10 text-primary relative z-10"
         xmlns="http://www.w3.org/2000/svg"
         fill="none"
         viewBox="0 0 24 24"
@@ -42,9 +42,7 @@ export const LoadingSpinner: React.FC<LoadingSpinnerProps> = ({
       </svg>
     </div>
     <div className="flex flex-col items-center gap-1">
-      <span className="text-xs font-semibold text-white animate-pulse">
-        Loading
-      </span>
+      <span className="text-xs font-semibold text-white">Loading</span>
       <span className="text-2xs font-bold text-muted-foreground/70 uppercase tracking-wider">
         Please wait
       </span>

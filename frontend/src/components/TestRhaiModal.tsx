@@ -143,7 +143,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           {result && (
             <div
               className={cn(
-                "p-8 rounded-2xl border text-xs font-mono overflow-hidden animate-in slide-in-from-top-4 duration-500 relative",
+                "p-8 rounded-2xl border text-xs font-mono overflow-hidden relative",
                 result.success
                   ? "bg-success/5 border-success/20 text-success"
                   : "bg-destructive/5 border-destructive/20 text-destructive",
@@ -186,7 +186,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           <Button
             variant="ghost"
             onClick={handleClose}
-            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-premium bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5 active:scale-95"
+            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
           >
             Close Diagnostics
           </Button>

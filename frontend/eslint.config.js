@@ -146,6 +146,18 @@ export default [
                     message:
                         "Retired type token. Floor: text-2xs, font-semibold, tracking-wider, text-muted-foreground/60. See src/components/ui.",
                 },
+                {
+                    selector:
+                        "Literal[value=/(^|\\s)(animate-in|animate-out|slide-in-from-[a-z]+(-(\\d+|full))?|zoom-in(-\\d+)?|zoom-out(-\\d+)?|transition-premium|transition-all|active:scale-\\S+|hover:scale-\\S+|hover:-?translate-\\S+|hover:rotate-\\S+|group-hover(\\/[\\w-]+)?:(-?translate|rotate|scale)-\\S+|animate-bounce|animate-ping|duration-(500|700|1000)|delay-\\d+)(\\s|$)/]",
+                    message:
+                        "Retired motion token. One transition utility (transition-ui), no entrance animations, no press or hover transforms, durations at most 300 ms; a pulse means a run is in progress. See src/index.css.",
+                },
+                {
+                    selector:
+                        "TemplateElement[value.raw=/(^|\\s)(animate-in|animate-out|slide-in-from-[a-z]+(-(\\d+|full))?|zoom-in(-\\d+)?|zoom-out(-\\d+)?|transition-premium|transition-all|active:scale-\\S+|hover:scale-\\S+|hover:-?translate-\\S+|hover:rotate-\\S+|group-hover(\\/[\\w-]+)?:(-?translate|rotate|scale)-\\S+|animate-bounce|animate-ping|duration-(500|700|1000)|delay-\\d+)(\\s|$)/]",
+                    message:
+                        "Retired motion token. One transition utility (transition-ui), no entrance animations, no press or hover transforms, durations at most 300 ms; a pulse means a run is in progress. See src/index.css.",
+                },
             ],
         },
     },

@@ -143,13 +143,13 @@ function Inspector() {
           <TabsList className="w-full justify-start rounded-none border-b border-white/5 bg-surface-2/40 px-4 gap-2 shrink-0 relative z-10">
             <TabsTrigger
               value="inspector"
-              className="text-sm font-semibold data-[state=active]:text-primary data-[state=active]:bg-primary/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-premium"
+              className="text-sm font-semibold data-[state=active]:text-primary data-[state=active]:bg-primary/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-ui"
             >
               Inspector
             </TabsTrigger>
             <TabsTrigger
               value="debug"
-              className="text-sm font-semibold data-[state=active]:text-warning data-[state=active]:bg-warning/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-premium"
+              className="text-sm font-semibold data-[state=active]:text-warning data-[state=active]:bg-warning/5 text-muted-foreground/70 rounded-xl py-2 px-6 transition-ui"
             >
               Debug
             </TabsTrigger>

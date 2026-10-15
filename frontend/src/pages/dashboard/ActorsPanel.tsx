@@ -38,7 +38,7 @@ export default function ActorsPanel() {
         </div>
         <button
           onClick={() => navigate("/actors")}
-          className="w-8 h-8 flex items-center justify-center text-muted-foreground hover:text-primary hover:bg-primary/10 rounded-lg transition-premium"
+          className="w-8 h-8 flex items-center justify-center text-muted-foreground hover:text-primary hover:bg-primary/10 rounded-lg transition-ui"
           title="All actors"
           aria-label="All actors"
         >

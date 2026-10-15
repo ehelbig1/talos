@@ -112,10 +112,15 @@
 }
 
 /* Performance Optimizations */
-@utility transition-premium {
-  transition-property: all;
-  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
-  transition-duration: 300ms;
+/* The one transition for interactive UI: colour, opacity and transform only,
+   150 ms. Layout properties never transition; a panel that needs its width
+   or height to move says so with transition-[width] / transition-[height]. */
+@utility transition-ui {
+  transition-property:
+    color, background-color, border-color, outline-color, fill, stroke, opacity,
+    box-shadow, transform;
+  transition-timing-function: ease-out;
+  transition-duration: 150ms;
 }
 
 @utility surface-elevation {
@@ -187,7 +192,9 @@
   background: transparent;
   border-bottom: 1px solid hsla(var(--foreground), 0.04);
   color: hsl(var(--muted-foreground));
-  transition: all 0.2s ease;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease;
 }
 .react-flow__controls button:hover {
   background: hsla(var(--primary), 0.1);
@@ -230,8 +237,9 @@
   animation: shimmer 2s infinite linear;
 }
 
-/* Glassmorphism primitives */
 /* ─── Accessibility: Reduced Motion ─────────────────────────────── */
+/* Transitions and decorative animation stop. A spinner keeps turning: it is
+   the one animation that carries information a static icon cannot. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
@@ -243,10 +251,16 @@
   }
 
   .animate-pulse,
-  .animate-spin,
   .animate-shimmer,
-  .animate-status-pulse {
+  .animate-status-pulse,
+  .animate-progress-bar,
+  .react-flow__edge-path {
     animation: none !important;
+  }
+
+  .animate-spin {
+    animation-duration: 1.5s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 
@@ -262,37 +276,6 @@
 }
 
 /* ─── Premium UI Extensions ───────────────────────────────────────── */
-@utility premium-gradient {
-  background: linear-gradient(
-    135deg,
-    hsla(var(--primary), 0.15) 0%,
-    hsla(var(--primary), 0.05) 25%,
-    transparent 50%,
-    hsla(var(--primary), 0.05) 75%,
-    hsla(var(--primary), 0.15) 100%
-  );
-  background-size: 200% 200%;
-  animation: shimmer 10s infinite linear;
-}
-
-@utility icon-glow {
-  filter: drop-shadow(0 0 8px hsla(var(--primary), 0.4));
-}
-
-@utility animate-float {
-  animation: float 6s ease-in-out infinite;
-}
-
-@keyframes float {
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-  50% {
-    transform: translateY(-10px);
-  }
-}
-
 @utility animate-progress-bar {
   background-size: 200% 100%;
   background-image: linear-gradient(

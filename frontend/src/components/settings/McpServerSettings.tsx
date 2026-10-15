@@ -135,12 +135,12 @@ export default function McpServerSettings() {
   };
 
   const inputBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium";
+    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui";
   const selectBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-premium appearance-none cursor-pointer";
+    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer";
 
   return (
-    <div className="space-y-10 animate-in fade-in slide-in-from-bottom-4 duration-1000 max-w-7xl mx-auto">
+    <div className="space-y-10 max-w-7xl mx-auto">
       <ConfirmDialog
         open={revokeConfirmId !== null}
         title="Revoke agent access"
@@ -154,7 +154,7 @@ export default function McpServerSettings() {
       <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden group/header">
         <div className="flex flex-col md:flex-row items-center justify-between gap-8 relative z-10">
           <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-premium">
+            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-ui">
               <Monitor size={32} />
             </div>
             <div className="space-y-1.5">
@@ -163,7 +163,7 @@ export default function McpServerSettings() {
               </h2>
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary animate-pulse" />
+                  <div className="w-1.5 h-1.5 rounded-full bg-primary" />
                   <span className="text-2xs text-primary font-semibold uppercase tracking-wider leading-none">
                     MCP server running
                   </span>
@@ -204,7 +204,7 @@ export default function McpServerSettings() {
                   Agent name
                 </label>
                 <div className="relative group/input">
-                  <Bot className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-premium" />
+                  <Bot className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-ui" />
                   <input
                     type="text"
                     placeholder="e.g. Claude Desktop"
@@ -220,7 +220,7 @@ export default function McpServerSettings() {
                   Role
                 </label>
                 <div className="relative group/input">
-                  <UserCheck className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-premium pointer-events-none" />
+                  <UserCheck className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-ui pointer-events-none" />
                   <select
                     value={selectedRole}
                     onChange={(e) => setSelectedRole(e.target.value)}
@@ -259,7 +259,7 @@ export default function McpServerSettings() {
               </Button>
 
               {createdAgent && (
-                <div className="mt-6 p-6 bg-primary/5 border border-primary/20 rounded-2xl space-y-4 animate-in zoom-in-95 duration-500 relative overflow-hidden group/token">
+                <div className="mt-6 p-6 bg-primary/5 border border-primary/20 rounded-2xl space-y-4 relative overflow-hidden group/token">
                   <div className="flex items-center gap-3 text-primary relative z-10">
                     <Check className="w-4 h-4" />
                     <span className="text-2xs font-semibold uppercase tracking-wider">
@@ -307,7 +307,7 @@ export default function McpServerSettings() {
                     copy(localEndpoint);
                     toast.success("Local endpoint copied");
                   }}
-                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-premium"
+                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-ui"
                 >
                   Copy local URL
                 </button>
@@ -330,7 +330,7 @@ export default function McpServerSettings() {
                     copy(authEndpoint);
                     toast.success("Production endpoint copied");
                   }}
-                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-premium"
+                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-ui"
                 >
                   Copy production URL
                 </button>
@@ -379,7 +379,7 @@ export default function McpServerSettings() {
                 </div>
               ) : agents.length === 0 ? (
                 <div className="col-span-full py-24 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01] group">
-                  <Bot className="w-16 h-16 text-muted-foreground/30 mb-6 transition-premium group-hover:text-primary/10" />
+                  <Bot className="w-16 h-16 text-muted-foreground/30 mb-6 transition-ui group-hover:text-primary/10" />
                   <p className="text-xs text-muted-foreground/60 font-semibold">
                     No agents yet
                   </p>
@@ -388,15 +388,15 @@ export default function McpServerSettings() {
                 agents.map((agent) => (
                   <div
                     key={agent.id}
-                    className="group bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-premium hover:bg-white/[0.04] hover:border-white/10 relative overflow-hidden"
+                    className="group bg-white/[0.02] border border-white/5 rounded-2xl p-6 transition-ui hover:bg-white/[0.04] hover:border-white/10 relative overflow-hidden"
                   >
                     <div className="flex items-start justify-between relative z-10 mb-6">
                       <div className="flex items-center gap-4">
-                        <div className="w-10 h-10 bg-surface-4/40 border border-white/5 rounded-xl flex items-center justify-center text-muted-foreground/70 group-hover:text-primary transition-premium">
+                        <div className="w-10 h-10 bg-surface-4/40 border border-white/5 rounded-xl flex items-center justify-center text-muted-foreground/70 group-hover:text-primary transition-ui">
                           <Terminal size={18} />
                         </div>
                         <div>
-                          <h5 className="text-sm font-semibold text-white group-hover:text-primary transition-premium">
+                          <h5 className="text-sm font-semibold text-white group-hover:text-primary transition-ui">
                             {agent.name}
                           </h5>
                           <p className="text-2xs font-mono text-muted-foreground/50 mt-1 uppercase">
@@ -407,7 +407,7 @@ export default function McpServerSettings() {
                       <button
                         onClick={() => handleRevoke(agent.id)}
                         disabled={revokingId === agent.id}
-                        className="w-10 h-10 flex items-center justify-center rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/40 hover:text-white hover:bg-destructive hover:border-destructive transition-premium active:scale-90"
+                        className="w-10 h-10 flex items-center justify-center rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/40 hover:text-white hover:bg-destructive hover:border-destructive transition-ui"
                       >
                         {revokingId === agent.id ? (
                           <Loader2 size={14} className="animate-spin" />
@@ -494,7 +494,7 @@ export default function McpServerSettings() {
                       copy(inst.config);
                       toast.success("Configuration copied");
                     }}
-                    className="p-3 bg-white/5 border border-white/10 rounded-xl text-muted-foreground hover:text-white hover:bg-white/10 transition-premium"
+                    className="p-3 bg-white/5 border border-white/10 rounded-xl text-muted-foreground hover:text-white hover:bg-white/10 transition-ui"
                   >
                     <Copy size={16} />
                   </button>
@@ -527,10 +527,10 @@ export default function McpServerSettings() {
                 key={tool.name}
                 className="flex items-center gap-4 group/tool"
               >
-                <div className="w-10 h-10 bg-white/5 border border-white/5 rounded-xl flex items-center justify-center text-muted-foreground/50 group-hover/tool:text-primary group-hover/tool:border-primary/20 transition-premium">
+                <div className="w-10 h-10 bg-white/5 border border-white/5 rounded-xl flex items-center justify-center text-muted-foreground/50 group-hover/tool:text-primary group-hover/tool:border-primary/20 transition-ui">
                   {tool.icon}
                 </div>
-                <span className="text-xs font-semibold text-muted-foreground/60 group-hover/tool:text-white transition-premium">
+                <span className="text-xs font-semibold text-muted-foreground/60 group-hover/tool:text-white transition-ui">
                   {tool.name}
                 </span>
               </div>
