@@ -1022,6 +1022,8 @@ impl WorkflowRepository {
         // The per-node and workflow caps (`crate::graph_caps`), on the owner
         // and the organisation path alike.
         crate::graph_caps::refuse_over_cap_graph(graph_json)?;
+        // A node naming this workflow as its own child (G2-2).
+        crate::graph_caps::refuse_self_reference(graph_json, workflow_id)?;
         if crate::action_link_targets::names_action_targets(graph_json)? {
             let Some(owner) = sqlx::query_scalar::<_, Uuid>(
                 "SELECT user_id FROM workflows \
@@ -2415,6 +2417,8 @@ impl WorkflowRepository {
     ) -> Result<u64> {
         // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
         crate::graph_caps::refuse_over_cap_graph(graph_json)?;
+        // A node naming this workflow as its own child (G2-2).
+        crate::graph_caps::refuse_self_reference(graph_json, workflow_id)?;
         crate::action_link_targets::refuse_unowned_targets_on_pool(
             &self.db_pool,
             user_id,
@@ -2701,6 +2705,8 @@ impl WorkflowRepository {
         let id: Uuid = if let Some(eid) = existing_id {
             // The per-node and workflow caps (`crate::graph_caps`), before the targets rule.
             crate::graph_caps::refuse_over_cap_graph(graph_json)?;
+            // A node naming this workflow as its own child (G2-2).
+            crate::graph_caps::refuse_self_reference(graph_json, eid)?;
             crate::action_link_targets::refuse_unowned_targets_on_pool(
                 &self.db_pool,
                 user_id,

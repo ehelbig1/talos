@@ -14,8 +14,12 @@ This refuses `capability_world: None` inside a `JobRequest { … }` or
 them) in non-test code unless a `// no-world-hint: <reason>` comment sits on
 the line or one of the 3 above it.
 
-Test code is exempt: files under `tests/`, `examples/` or `benches/`, and
-every line after a file's first `#[cfg(test)]` that is followed by a `mod`.
+Test code is exempt: files under `tests/`, `examples/` or `benches/`, and the
+lines of each `#[cfg(test)] mod … { … }` (its braces matched). Until
+2026-10-15 every line after a file's FIRST test module was exempt, and in
+`talos-workflow-engine-nats/src/dispatcher.rs` — whose test modules sit beside
+the code they test — that hid the production `JobRequest` literal that carries
+the hint to the wire (security review round 2, G2-4).
 
 Limits (stated): a textual scan. A job built through a builder or a helper
 that leaves the field at its default is not seen here — the `Default` impl
@@ -39,12 +43,29 @@ def indent(line):
     return len(line) - len(line.lstrip())
 
 
-def test_start(lines):
-    for i, line in enumerate(lines):
-        if line.strip() == "#[cfg(test)]" and i + 1 < len(lines):
-            if re.match(r"\s*(pub(\([a-z]+\))?\s+)?mod\s", lines[i + 1]):
-                return i
-    return None
+def test_lines(lines):
+    """The indices of every line inside a `#[cfg(test)] mod … { … }`, from
+    the attribute to the module's closing brace (braces counted outside `//`
+    comments; a one-line `mod x;` declaration marks only itself)."""
+    out = set()
+    i = 0
+    while i < len(lines):
+        if lines[i].strip() == "#[cfg(test)]" and i + 1 < len(lines) and re.match(
+            r"\s*(pub(\([a-z]+\))?\s+)?mod\s", lines[i + 1]
+        ):
+            depth, opened, j = 0, False, i + 1
+            while j < len(lines):
+                code = lines[j].split("//", 1)[0]
+                depth += code.count("{") - code.count("}")
+                opened = opened or "{" in code
+                if (opened and depth <= 0) or (not opened and code.rstrip().endswith(";")):
+                    break
+                j += 1
+            out.update(range(i, j + 1))
+            i = j + 1
+            continue
+        i += 1
+    return out
 
 
 def enclosing_literal(lines, i):
@@ -79,11 +100,11 @@ def main(root):
             with open(path, encoding="utf-8", errors="replace") as fh:
                 lines = fh.read().split("\n")
             scanned += 1
-            tests_from = test_start(lines)
+            in_tests = test_lines(lines)
             for i, line in enumerate(lines):
                 if not FIELD.match(line):
                     continue
-                if tests_from is not None and i > tests_from:
+                if i in in_tests:
                     continue
                 literal, at = enclosing_literal(lines, i)
                 if literal is None:
@@ -102,5 +123,53 @@ def main(root):
     return 1 if hits else 0
 
 
+def self_test():
+    """A hint-less literal AFTER a test module is still production code."""
+    import tempfile
+
+    src = "\n".join([
+        "fn a() -> JobRequest {",
+        "    JobRequest {",
+        "        capability_world: Some(w),",
+        "    }",
+        "}",
+        "#[cfg(test)]",
+        "mod first_tests {",
+        "    fn t() -> JobRequest {",
+        "        JobRequest {",
+        "            capability_world: None,",
+        "        }",
+        "    }",
+        "}",
+        "fn production_after_tests() -> JobRequest {",
+        "    JobRequest {",
+        "        capability_world: None,",
+        "    }",
+        "}",
+        "fn marked() -> DispatchJob {",
+        "    DispatchJob {",
+        "        // no-world-hint: a stated reason",
+        "        capability_world: None,",
+        "    }",
+        "}",
+    ])
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "c", "src"))
+        with open(os.path.join(tmp, "c", "src", "lib.rs"), "w") as f:
+            f.write(src + "\n")
+        import io
+        import contextlib
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(tmp)
+        out = buf.getvalue()
+    ok = rc == 1 and "lib.rs:16:" in out and "lib.rs:10:" not in out and "lib.rs:22:" not in out
+    print("✓ lint-world-hint self-test" if ok else f"✗ lint-world-hint self-test:\n{out}")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--self-test":
+        sys.exit(self_test())
     sys.exit(main(sys.argv[1] if len(sys.argv) > 1 else "."))

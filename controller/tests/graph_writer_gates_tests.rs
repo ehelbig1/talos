@@ -635,3 +635,61 @@ async fn every_graph_writer_refuses_a_foreign_or_malformed_dispatch_target() {
     .await;
     assert!(!refused(&resp), "{resp:?}");
 }
+
+/// G2-2 (2026-10-15): a node naming its own workflow as a child is refused by
+/// every graph UPDATE, not only by the `add_*_node` tools —
+/// `update_node_config` here, the repository rule behind it
+/// (`graph_caps::refuse_self_reference`) for the rest. The stored graph is
+/// unchanged.
+#[tokio::test]
+async fn a_node_naming_its_own_workflow_as_a_child_is_refused_by_update_node_config() {
+    let s = stack().await;
+    let graph = json!({
+        "nodes": [{ "id": "fanout", "kind": "ensemble", "type": "system:ensemble",
+                    "position": { "x": 0, "y": 0 }, "data": { "label": "fanout" } }],
+        "edges": [],
+    });
+    let wf = seed_workflow(&s.pool, s.me, "self-ref", &graph).await;
+    let before = stored_graph(&s.pool, wf).await;
+    let resp = graph_tool(
+        &s,
+        "update_node_config",
+        json!({ "workflow_id": wf.to_string(), "node_id": "fanout", "action": "update_config",
+                "config": { "child_workflow_id": wf.to_string() } }),
+    )
+    .await;
+    assert!(refused(&resp), "a self-reference was stored: {resp:?}");
+    assert_eq!(stored_graph(&s.pool, wf).await, before, "no graph change");
+
+    // Another workflow of the same user is a legitimate child.
+    let resp = graph_tool(
+        &s,
+        "update_node_config",
+        json!({ "workflow_id": wf.to_string(), "node_id": "fanout", "action": "update_config",
+                "config": { "child_workflow_id": s.own.to_string() } }),
+    )
+    .await;
+    assert!(!refused(&resp), "{resp:?}");
+}
+
+/// G2-5 (2026-10-15): a node id beginning with `__` names the engine's own
+/// records and is refused at write — an import of such a graph creates
+/// nothing.
+#[tokio::test]
+async fn a_node_id_naming_an_engine_record_is_refused_at_write() {
+    let s = stack().await;
+    let before = workflow_count(&s.pool, s.me).await;
+    let resp = workflow_tool(
+        &s,
+        "import_workflow",
+        json!({ "bundle": { "name": "reserved-id", "graph_json": {
+            "nodes": [module_node("__child_runs__", None)], "edges": [] } } }),
+    )
+    .await;
+    assert!(refused(&resp), "{resp:?}");
+    assert_eq!(
+        workflow_count(&s.pool, s.me).await,
+        before,
+        "nothing created"
+    );
+}
