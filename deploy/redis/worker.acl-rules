@@ -25,7 +25,8 @@
 ~talos:tier2_expose:*
 # Local-LLM fleet admission, shared with the controller (talos-local-inference).
 ~talos:llm-admit:*
-# Approval reply topics (host/governance.rs), read by the controller.
+# Approval markers (host/governance.rs): that a decision is awaited for a run.
+# The controller publishes to the subject the run id names, never the value.
 ~approval:*
 resetchannels
 -@all

@@ -98,3 +98,11 @@ All restored: PASS.
 On the next `make up` the Redis container is recreated with the new
 entrypoint. Redis is cache-only in dev (append-only file kept on its volume),
 and the worker reconnects as `talos-worker`.
+
+## Correction, 2026-10-16 (R12)
+
+"Not separated" above said a compromised worker could redirect one approval's
+reply, and named moving the topic out of Redis as the follow-up. That is
+built (`2026-10-16-approval-reply-subject-from-the-run-id.md`): the decision
+goes to the subject the run's signed id names, and `approval:*` is a marker
+whose value is never read.

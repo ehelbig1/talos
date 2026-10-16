@@ -8146,19 +8146,12 @@ async fn handle_submit_workflow_approval(
                     }
                 };
 
-                if let Some(topic) = reply_topic {
-                    // SECURITY: validate the topic before publishing. The topic is stored in Redis
-                    // by a WASM module. Reject wildcards and non-printable ASCII to prevent NATS
-                    // subject injection.
-                    let topic_safe = !topic.is_empty()
-                        && topic.len() <= 512
-                        && topic
-                            .bytes()
-                            .all(|b| b.is_ascii() && b >= 0x20 && b != b'*' && b != b'>');
-                    if !topic_safe {
-                        tracing::error!(%exec_id, "SECURITY: approval reply topic from Redis failed validation");
-                        return mcp_error(req_id, -32000, "Invalid approval routing data");
-                    }
+                // The decision goes to the subject the run's own id names; the
+                // marker's value is never a destination (2026-10-15).
+                if let Some(topic) = talos_workflow_job_protocol::subjects::approval_publish_subject(
+                    exec_id,
+                    reply_topic.as_deref(),
+                ) {
                     if let Some(ref nats) = state.nats_client {
                         let response_str = if approved { "true" } else { "false" };
                         match nats.publish(topic.clone(), response_str.into()).await {

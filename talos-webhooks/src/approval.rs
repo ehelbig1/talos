@@ -106,8 +106,9 @@ pub async fn approval_handler(
         }
     };
 
-    // The frontend UI calls this webhook with the workflow_execution_id, not the specific node's execution_id.
-    let redis_key = format!("approval:{}", execution_id);
+    // The marker a waiting worker leaves for its run (the run's
+    // workflow_execution_id, in its canonical spelling).
+    let redis_key = format!("approval:{exec_uuid}");
     // MCP-999 (2026-05-15): same MCP-535 distinction-of-failures rule
     // applied to the workflow_approval_gates lookups above, now on the
     // Redis side. Pre-fix `.unwrap_or(None)` silently collapsed an
@@ -138,39 +139,19 @@ pub async fn approval_handler(
         }
     };
 
-    let topic = match reply_topic {
-        Some(t) => t,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                "Approval request not found or expired",
-            )
-                .into_response()
-        }
+    // The decision goes to the subject the run's own id names; the marker's
+    // value is never a destination (2026-10-15 — until then it was, and a
+    // process with Redis access chose where the decision was published).
+    let Some(topic) = talos_workflow_job_protocol::subjects::approval_publish_subject(
+        exec_uuid,
+        reply_topic.as_deref(),
+    ) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "Approval request not found or expired",
+        )
+            .into_response();
     };
-
-    // SECURITY: validate topic before publishing. The topic is read from Redis, where it
-    // was written by a WASM module. Reject wildcards (*,>) and enforce printable ASCII
-    // to prevent NATS subject injection (publishing to unintended subjects).
-    {
-        let topic_bytes = topic.as_bytes();
-        let is_safe = !topic.is_empty()
-            && topic.len() <= 512
-            && topic_bytes
-                .iter()
-                .all(|&b| b.is_ascii() && b >= 0x20 && b != b'*' && b != b'>');
-        if !is_safe {
-            tracing::error!(
-                execution_id = %execution_id,
-                "SECURITY: approval reply topic from Redis failed validation — aborting publish"
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Invalid approval routing data",
-            )
-                .into_response();
-        }
-    }
 
     let response_str = if payload.approved { "true" } else { "false" };
 

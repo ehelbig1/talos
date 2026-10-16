@@ -116,6 +116,30 @@ pub fn approvals_wait_for(exec_id: impl std::fmt::Display) -> String {
     format!("talos.approvals.wait.{exec_id}")
 }
 
+/// The subject a run's human-approval decision is published on, named from
+/// the run's signed `workflow_execution_id` by BOTH sides — the worker that
+/// waits and the controller that answers (2026-10-15, security review E2-6
+/// follow-up). Until then the worker wrote the subject into Redis
+/// (`approval:<run>`) and the controller published the decision to whatever
+/// that row held, so a process with Redis access chose where an approval
+/// decision went.
+#[must_use]
+pub fn approval_reply_subject(workflow_execution_id: impl std::fmt::Display) -> String {
+    approvals_wait_for(workflow_execution_id)
+}
+
+/// Where the controller publishes an approval decision for `workflow_execution_id`:
+/// the subject the run's own id names when a waiter has left its marker
+/// (`approval:<run>` in Redis), and nowhere when none has. The marker says
+/// only that a waiter exists; its value is never a destination.
+#[must_use]
+pub fn approval_publish_subject(
+    workflow_execution_id: uuid::Uuid,
+    marker: Option<&str>,
+) -> Option<String> {
+    marker.map(|_| approval_reply_subject(workflow_execution_id))
+}
+
 // ── Worker fleet ───────────────────────────────────────────────────────────
 
 /// Wildcard the fleet manager subscribes on to observe worker heartbeats:
@@ -246,6 +270,7 @@ mod tests {
         assert_eq!(results_for(id), "talos.results.abc123");
         assert_eq!(pipeline_results_for(id), "talos.pipeline.results.abc123");
         assert_eq!(approvals_wait_for(id), "talos.approvals.wait.abc123");
+        assert_eq!(approval_reply_subject(id), "talos.approvals.wait.abc123");
         assert_eq!(worker_heartbeat_for(id), "talos.workers.heartbeat.abc123");
         assert_eq!(agent_invoke_for(id), "talos.agent.abc123.invoke");
         assert_eq!(agent_message_for(id), "talos.agent.abc123.message");
@@ -273,5 +298,27 @@ mod tests {
     fn llm_stream_uses_execution_id() {
         let ex = uuid::Uuid::nil();
         assert_eq!(llm_stream_for(ex), format!("talos.llm.stream.{ex}"));
+    }
+
+    /// An approval decision goes to the subject the run's id names, whatever
+    /// the Redis marker holds — a marker naming another subject redirects
+    /// nothing — and nowhere when no waiter left a marker.
+    #[test]
+    fn an_approval_decision_goes_where_the_run_id_says_not_where_redis_says() {
+        let run = uuid::Uuid::from_u128(7);
+        let derived = format!("talos.approvals.wait.{run}");
+        for marker in [
+            "pending",
+            "talos.memory.op",
+            "talos.approvals.wait.00000000-0000-0000-0000-000000000009",
+            "",
+        ] {
+            assert_eq!(
+                approval_publish_subject(run, Some(marker)).as_deref(),
+                Some(derived.as_str()),
+                "{marker}"
+            );
+        }
+        assert_eq!(approval_publish_subject(run, None), None);
     }
 }

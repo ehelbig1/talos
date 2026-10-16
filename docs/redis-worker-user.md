@@ -43,12 +43,14 @@ installer its URL.
 
 ## What the worker can still reach
 
-Two families are shared on purpose, and the ACL cannot separate them:
+Two families are shared on purpose:
 - `talos:llm-admit:*`, the local-LLM fleet queue, which both processes
   write;
-- `approval:*`, where the worker records the reply topic of an approval and
-  the controller publishes the decision to it.
+- `approval:*`, a marker that a run awaits an approval decision.
 
-A compromised worker can disturb that queue, or redirect one approval
-decision's reply. It cannot write a module's bytes, the controller's nonces
-or its idempotency records.
+A compromised worker can disturb that queue, or plant a marker for another
+run. A planted marker changes no destination: since 2026-10-15 the controller
+publishes a decision to the subject the run's own id names
+(`subjects::approval_publish_subject`), and the database decision is recorded
+either way. The worker cannot write a module's bytes, the controller's
+nonces or its idempotency records.
