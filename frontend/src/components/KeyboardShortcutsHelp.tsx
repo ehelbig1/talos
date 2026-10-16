@@ -9,6 +9,17 @@ export interface Shortcut {
 }
 
 const shortcuts: Shortcut[] = [
+  {
+    key: "⌘ + K",
+    description: "Jump to a page, workflow or actor",
+    category: "Navigation",
+  },
+  {
+    key: "g then w / b / a / l / s / h",
+    description:
+      "Go to Workflows, Briefings, Actors, Library, Settings, System health",
+    category: "Navigation",
+  },
   { key: "⌘ + I", description: "Toggle Inspector", category: "Navigation" },
   { key: "⌘ + J", description: "Cycle Terminal State", category: "Navigation" },
   { key: "?", description: "Show This Help", category: "Navigation" },
