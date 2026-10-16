@@ -386,7 +386,7 @@ deduplication keys, caches and leases (§1).
 |--------|----------|-------------|---------------|
 | Interception of Redis traffic | Info Disclosure | `rediss://` (TLS) required in production for the controller and the worker (§2, B3) | Development may use plaintext. Push-deduplication keys embed identifiers in the key name (the Gmail key contains the mailbox address), so Redis key names are personal data. |
 | Cache poisoning of WASM module bytes | Tampering | The worker verifies loaded bytes against the signed `expected_wasm_hash` and, in production, refuses unattested bytes with no hash (§6 Spoofing) | A Redis writer can cause refusals (availability), not substitution |
-| Poisoning of counters, dedup or replay keys | Tampering | TOTP replay uses atomic `SET NX EX 90`; approval reply topics read from Redis are validated before publishing to NATS | Deleting a dedup key re-enables a webhook replay; resetting counters temporarily lifts the auth rate limit |
+| Poisoning of counters, dedup or replay keys | Tampering | TOTP replay uses atomic `SET NX EX 90`; an approval decision is published to the subject the run's signed id names (`subjects::approval_publish_subject`), never to one read from Redis — the worker's `approval:<run>` row is only a marker (2026-10-15) | Deleting a dedup key re-enables a webhook replay; resetting counters temporarily lifts the auth rate limit |
 | TOTP replay | Spoofing | One-time use enforced with `SET NX`; key TTL (90 s) covers the ±1 step window | Redis unavailability in production makes 2FA login fail closed |
 | Redis unavailable | DoS | Auth limiter and 2FA fail closed in production; GitHub-format webhooks are refused without deduplication | Availability impact by design |
 

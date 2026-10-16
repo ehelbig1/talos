@@ -124,7 +124,19 @@ impl governance::Host for TalosContext {
             }
         };
 
-        let reply_topic = talos_workflow_job_protocol::subjects::approvals_wait_for(&exec_id);
+        // The decision arrives on the subject the RUN's signed id names
+        // (`approval_reply_subject`), which the controller derives too — never
+        // a subject this process writes anywhere (2026-10-15). A job with no
+        // run id would wait on a subject every such job shares: refuse.
+        if self.workflow_id.is_none() {
+            tracing::error!(
+                execution_id = ?self.execution_id,
+                "governance approval requested by a job with no run id — returning false"
+            );
+            return false;
+        }
+        let reply_topic =
+            talos_workflow_job_protocol::subjects::approval_reply_subject(&workflow_id);
 
         // 1. Subscribe to the reply topic FIRST so we don't miss the message
         let mut subscriber = match nats.subscribe(reply_topic.clone()).await {
@@ -144,8 +156,9 @@ impl governance::Host for TalosContext {
             }
         };
 
-        // The frontend UI is sending the overall `workflow_execution_id` to the API webhook,
-        // not the node-specific `exec_id`.
+        // The marker that a decision is awaited for this run. Its value is
+        // not a destination: the controller publishes to the subject the run
+        // id names (`approval_publish_subject`).
         let redis_key = format!("approval:{}", workflow_id);
         // MCP-739 (2026-05-13): log SET failures. Pre-fix the
         // `let _: redis::RedisResult<()>` discarded errors entirely.
@@ -162,7 +175,7 @@ impl governance::Host for TalosContext {
         // but logging at WARN ensures dashboards see the gap.
         if let Err(e) = redis::cmd("SET")
             .arg(&redis_key)
-            .arg(&reply_topic)
+            .arg("pending")
             .arg("EX")
             .arg(86400) // 24 hours
             .query_async::<()>(&mut con)
