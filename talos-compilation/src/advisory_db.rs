@@ -350,10 +350,6 @@ mod tests {
     use std::path::Path;
     use std::sync::Mutex;
 
-    /// `TALOS_ADVISORY_DB_MAX_AGE_DAYS` is process-global; the one test that
-    /// sets it takes this lock so no sibling reads a value it did not set.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
     const DAY: u64 = 86_400;
 
     fn set_age(path: &Path, secs_ago: u64) {
@@ -528,7 +524,12 @@ mod tests {
 
     #[test]
     fn max_age_reads_a_positive_env_value_else_the_default() {
-        let _g = ENV_LOCK.lock().unwrap();
+        // `TALOS_ADVISORY_DB_MAX_AGE_DAYS` is process-global and the gate's
+        // tests in lib.rs read it: the CRATE-wide lock, not one private to
+        // this module (a module-local lock let `100000` reach the gate's
+        // "expired copy is refused" test, which then passed it — the flake
+        // seen 2026-10-15).
+        let _g = crate::container::env_lock();
         let cases: [(Option<&str>, u64); 6] = [
             (None, ADVISORY_DB_DEFAULT_MAX_AGE_DAYS),
             (Some("100000"), 100_000),
