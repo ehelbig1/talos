@@ -49,7 +49,9 @@ role must:
 * a **keeper** is idempotent, bounded, and treats an unreadable store as an
   error, never as an empty store to write over;
 * a **sender** has `DRY_RUN` on by default and sends nothing until it is
-  turned off, and makes one request per run.
+  turned off, and makes one request per run; a sender of a message to a
+  person (`notify-*`, `send-*`) returns the delivery verdict
+  (`docs/building-blocks.md`, "Sender"), which the engine records.
 
 ## 3. Write it
 

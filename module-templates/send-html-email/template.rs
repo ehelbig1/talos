@@ -19,12 +19,20 @@ use talos_sdk_macros::talos_module;
 //     is now an error naming what was missing, so the node fails where it can
 //     be seen instead of mailing a blank.
 //
+// It returns the delivery verdict every sender of a message returns
+// (docs/building-blocks.md, "Sender"; 2026-10-16): `provider`, `sent`,
+// `skipped`, `dry_run`, `parts_total`, `parts_sent`, `actions_sent`, beside
+// the Gmail ids. The engine reads those fields at node completion and records
+// the send (`message_deliveries`), so the Sunday email is counted beside the
+// phone notifications and a tap on one of its buttons is set against it. One
+// email is one part; `actions_sent` is the number of action links in the body.
+//
 // Keep `capability_world` in talos.json in sync with the macro world below
 // (lint check 48). No Date header is emitted — the Gmail API populates one on
 // send, which is always correct; a module-computed date is a needless failure
 // mode (the older send-gmail template hardcoded a 2024 date).
 #[talos_module(world = "http-node")]
-fn run(input: String) -> Result<String, String> {
+pub fn run(input: String) -> Result<String, String> {
     use talos::core::http::{Method, Request};
     use talos::core::logging::{self, Level};
 
@@ -60,9 +68,13 @@ fn run(input: String) -> Result<String, String> {
     let skips = |flag: &Option<Value>| *flag == Some(Value::Bool(true));
     if skips(&upstream.skip) || skips(&root_skip) {
         let out = serde_json::json!({
+            "provider": PROVIDER,
             "sent": false,
             "skipped": true,
             "dry_run": dry_run,
+            "parts_total": 0,
+            "parts_sent": 0,
+            "actions_sent": 0,
             "to": to,
         });
         return serde_json::to_string(&out).map_err(|e| format!("serialize error: {}", e));
@@ -104,6 +116,10 @@ fn run(input: String) -> Result<String, String> {
     // mojibake. ASCII subjects pass through byte-identical.
     let subject_header = encode_subject(&subject);
 
+    // What the message carries that a reader can act on: counted before the
+    // send so a dry run reports it too.
+    let actions_sent = count_action_links(&html);
+
     // The message, built once. The body is copied here and nowhere else.
     let mut raw_message: Vec<u8> = Vec::with_capacity(html.len() + 256);
     for part in [
@@ -121,8 +137,13 @@ fn run(input: String) -> Result<String, String> {
 
     if dry_run {
         let out = serde_json::json!({
+            "provider": PROVIDER,
             "sent": false,
+            "skipped": false,
             "dry_run": true,
+            "parts_total": 1,
+            "parts_sent": 0,
+            "actions_sent": actions_sent,
             "to": to,
             "subject": subject,
             "rfc822_bytes": raw_message.len(),
@@ -167,14 +188,39 @@ fn run(input: String) -> Result<String, String> {
         serde_json::from_str(&body_str).map_err(|e| format!("parse Gmail API response: {}", e))?;
 
     let out = serde_json::json!({
+        "provider": PROVIDER,
         "sent": true,
+        "skipped": false,
         "dry_run": false,
+        "parts_total": 1,
+        "parts_sent": 1,
+        "actions_sent": actions_sent,
         "message_id": sent.get("id").cloned().unwrap_or(Value::Null),
         "thread_id": sent.get("threadId").cloned().unwrap_or(Value::Null),
         "to": to,
         "subject": subject,
     });
     serde_json::to_string(&out).map_err(|e| format!("serialize error: {}", e))
+}
+
+/// The delivery verdict's word for the service this adapter sends through.
+const PROVIDER: &str = "gmail";
+
+/// The path every minted action link carries (`docs/action-links.md`):
+/// `<origin>/action-links/<token>`, written into the body by the
+/// `action_links` node in place of the composer's `talos-action:<id>`.
+const ACTION_LINK_PATH: &str = "/action-links/";
+
+/// The most `actions_sent` reports; the delivery verdict's bound.
+const MAX_ACTIONS_REPORTED: usize = 1024;
+
+/// How many action links the body carries. A link the platform could not
+/// mint fell back to `#` or a `mailto:` and is not one; a count past the
+/// verdict's bound reports the bound, so a body that repeats the path a
+/// thousand times cannot make the send unrecordable. One pass over the body,
+/// no allocation.
+fn count_action_links(html: &str) -> usize {
+    html.matches(ACTION_LINK_PATH).count().min(MAX_ACTIONS_REPORTED)
 }
 
 // The whole input: `{config, input, …}`. `input` is the upstream node's
@@ -464,7 +510,7 @@ mod tests {
         for not_a_skip in [json!(false), json!("true"), json!(1), Value::Null] {
             let v = send(config(), json!({ "skip": not_a_skip, "subject": "s", "html": "<p>b</p>" })).unwrap();
             assert_eq!(v["sent"], json!(true));
-            assert!(v.get("skipped").is_none());
+            assert_eq!(v["skipped"], json!(false));
         }
     }
 
@@ -476,6 +522,51 @@ mod tests {
         assert_eq!((v["sent"].clone(), v["dry_run"].clone()), (json!(false), json!(true)));
         assert!(v["rfc822_bytes"].as_u64().unwrap() > 0);
         assert!(host::http::requests().is_empty());
+    }
+
+    /// The delivery verdict every sender of a message returns
+    /// (docs/building-blocks.md): one email is one part, and its actions
+    /// are the action links in the body. The engine records a send from it.
+    #[test]
+    fn the_verdict_counts_one_part_and_the_action_links_in_the_body() {
+        host::http::respond(200, r#"{"id":"x","threadId":"y"}"#);
+        let html = "<p>Done? <a href=\"https://talos.example.test/action-links/aaaa\">done</a> \
+                    <a href=\"https://talos.example.test/action-links/bbbb\">drop</a> \
+                    <a href=\"#\">unminted</a> <a href=\"mailto:x@example.com\">fallback</a></p>";
+        let v = send(config(), json!({ "subject": "s", "html": html })).unwrap();
+        for (field, want) in [
+            ("provider", json!("gmail")),
+            ("sent", json!(true)),
+            ("skipped", json!(false)),
+            ("dry_run", json!(false)),
+            ("parts_total", json!(1)),
+            ("parts_sent", json!(1)),
+            ("actions_sent", json!(2)),
+        ] {
+            assert_eq!(v[field], want, "{field}: {v}");
+        }
+        // A body with nothing to act on.
+        let v = send(config(), json!({ "subject": "s", "html": "<p>b</p>" })).unwrap();
+        assert_eq!(v["actions_sent"], json!(0));
+
+        // A dry run reports what would have left, and that nothing did.
+        let mut dry = config();
+        dry["DRY_RUN"] = json!(true);
+        let v = send(dry, json!({ "subject": "s", "html": html })).unwrap();
+        assert_eq!(
+            (v["provider"].clone(), v["sent"].clone(), v["parts_total"].clone(), v["parts_sent"].clone(), v["actions_sent"].clone()),
+            (json!("gmail"), json!(false), json!(1), json!(0), json!(2)),
+            "{v}"
+        );
+        // A skip composed nothing.
+        let v = send(config(), json!({ "skip": true })).unwrap();
+        assert_eq!(
+            (v["provider"].clone(), v["parts_total"].clone(), v["parts_sent"].clone(), v["actions_sent"].clone()),
+            (json!("gmail"), json!(0), json!(0), json!(0)),
+            "{v}"
+        );
+        // The count stops at the verdict's bound, so no body makes the send unrecordable.
+        assert_eq!(count_action_links(&ACTION_LINK_PATH.repeat(2000)), MAX_ACTIONS_REPORTED);
     }
 
     #[test]

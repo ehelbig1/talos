@@ -1,7 +1,10 @@
-//! The verdict a `notify-*` adapter returns, read as the engine reads it.
+//! The delivery verdict a sender of a message returns, read as the engine
+//! reads it.
 //!
 //! `docs/notification-contract.md` ("What every adapter returns") fixes the
-//! shape every sender of a phone notification answers with:
+//! shape every sender of a phone notification answers with, and
+//! `docs/building-blocks.md` ("Sender") asks the same four fields and
+//! `actions_sent` of every sender of a message, the email sender included:
 //!
 //! ```jsonc
 //! { "provider": "ntfy", "sent": true, "skipped": false, "dry_run": false,
@@ -29,7 +32,9 @@
 //!
 //! `talos-catalog-tests/tests/notification_contract.rs` runs every adapter
 //! and reads its real verdict through [`read_delivery_verdict`], so a change
-//! to the contract block that this reader does not follow fails CI.
+//! to the contract block that this reader does not follow fails CI;
+//! `talos-catalog-tests/tests/delivery_verdict.rs` does the same for every
+//! sender of a message (`notify-*`, `send-*`).
 
 use serde_json::Value;
 
@@ -44,7 +49,7 @@ pub const MAX_ACTIONS: u64 = 1024;
 /// What one send node delivered, as its adapter reported it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryVerdict {
-    /// The adapter's word for the service (`ntfy`, `home_assistant`, ...).
+    /// The adapter's word for the service (`ntfy`, `home-assistant`, ...).
     pub provider: String,
     /// Notifications composed (a single notification is one).
     pub parts_total: u32,
@@ -182,11 +187,11 @@ mod tests {
 
     #[test]
     fn the_counts_an_adapter_may_omit_default_to_zero() {
-        let v = json!({ "provider": "home_assistant", "sent": true, "parts_total": 1, "parts_sent": 1 });
+        let v = json!({ "provider": "home-assistant", "sent": true, "parts_total": 1, "parts_sent": 1 });
         assert_eq!(
             read_delivery_verdict(&v),
             DeliveryReading::Sent(DeliveryVerdict {
-                provider: "home_assistant".into(),
+                provider: "home-assistant".into(),
                 parts_total: 1,
                 parts_sent: 1,
                 actions_sent: 0,
@@ -200,6 +205,8 @@ mod tests {
     fn an_output_without_the_four_fields_is_not_a_send() {
         for other in [
             json!({ "notification": { "body": "Three things." } }),
+            // The email sender's output before 2026-10-16, still what an
+            // installed copy from before then returns.
             json!({ "sent": true, "message_id": "m1", "thread_id": "t1" }),
             json!({ "provider": "ntfy", "sent": true, "parts_total": 1 }),
             json!({ "provider": 7, "sent": true, "parts_total": 1, "parts_sent": 1 }),

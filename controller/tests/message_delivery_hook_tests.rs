@@ -125,6 +125,48 @@ async fn a_real_send_is_recorded_with_the_adapters_counts() {
     );
 }
 
+/// `send-html-email` returns the same verdict beside its Gmail ids: one
+/// email is one part, its actions the action links in the body.
+#[tokio::test]
+async fn an_emails_verdict_is_recorded_as_one_part_with_its_links() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let workflow = common::create_test_workflow(&pool, user, "pa-sunday").await;
+    let hook = ControllerNodeHook::new(pool.clone());
+    let execution = Uuid::new_v4();
+
+    complete(
+        &hook,
+        Completion {
+            workflow_id: workflow,
+            execution_id: execution,
+            module_id: Some(Uuid::new_v4()),
+            started_by_kind: Some("schedule"),
+            dry_run: false,
+        },
+        &json!({ "provider": "gmail", "sent": true, "skipped": false, "dry_run": false,
+                 "parts_total": 1, "parts_sent": 1, "actions_sent": 2,
+                 "message_id": "made-up", "thread_id": "made-up", "to": "r@example.test", "subject": "Sunday" }),
+    );
+
+    common::eventually_default("the email to be recorded", || async {
+        !recorded(&pool, execution).await.is_empty()
+    })
+    .await;
+    assert_eq!(
+        recorded(&pool, execution).await,
+        vec![Recorded {
+            provider: "gmail".into(),
+            parts_total: 1,
+            parts_sent: 1,
+            actions_sent: 2,
+            one_tap_actions: 0,
+            kept_actions: 0,
+            started_by_kind: Some("schedule".into()),
+        }]
+    );
+}
+
 #[tokio::test]
 async fn nothing_is_recorded_for_a_dry_run_a_stubbed_output_a_system_node_or_another_nodes_output()
 {
@@ -175,7 +217,8 @@ async fn nothing_is_recorded_for_a_dry_run_a_stubbed_output_a_system_node_or_ano
         },
         &verdict(),
     );
-    // A compose node's output, an email sender's output and a verdict with
+    // A compose node's output, the output of an email sender's copy from
+    // before it returned the verdict (2026-10-16), and a verdict with
     // nothing sent are not sends.
     let others = Uuid::new_v4();
     for output in [
@@ -242,21 +285,30 @@ async fn nothing_is_recorded_for_a_dry_run_a_stubbed_output_a_system_node_or_ano
     }
 }
 
+/// One recorded send. A `ntfy` send carries two actions, one of them one-tap
+/// (the shape of the morning message); a `gmail` send carries the actions
+/// given and none one-tap (email cannot act in the background).
 async fn seed_delivery(
     pool: &sqlx::PgPool,
     workflow: Uuid,
     execution: Uuid,
+    provider: &str,
+    actions: i32,
     started_by_kind: &str,
     days_ago: i32,
 ) {
+    let one_tap = i32::from(provider == "ntfy" && actions > 0);
     sqlx::query(
         "INSERT INTO message_deliveries (workflow_id, execution_id, node_id, provider, parts_total, parts_sent, \
                                          actions_sent, one_tap_actions, kept_actions, started_by_kind, sent_at) \
-         VALUES ($1, $2, $3, 'ntfy', 1, 1, 2, 1, 0, $4, NOW() - make_interval(days => $5::int))",
+         VALUES ($1, $2, $3, $4, 1, 1, $5, $6, 0, $7, NOW() - make_interval(days => $8::int))",
     )
     .bind(workflow)
     .bind(execution)
     .bind(Uuid::new_v4())
+    .bind(provider)
+    .bind(actions)
+    .bind(one_tap)
     .bind(started_by_kind)
     .bind(days_ago)
     .execute(pool)
@@ -290,9 +342,12 @@ async fn the_report_sets_taps_against_the_sends_that_carried_them() {
     let target = common::create_test_workflow(&pool, user, "pa-list-done").await;
     let theirs = common::create_test_workflow(&pool, other_user, "their-morning").await;
 
-    // Three morning sends: two real, one a rehearsal; one evening send; one
-    // morning send outside the window; one send of another user's.
-    let (m1, m2, m_test, m_old, e1, t1) = (
+    // Morning runs: m1 sent a notification AND an email with one link; m2 a
+    // notification; m3 an email with no buttons (a plain report: nothing to
+    // tap); one rehearsal; one run outside the window. One evening run; one
+    // run of another user's.
+    let (m1, m2, m3, m_test, m_old, e1, t1) = (
+        Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -300,12 +355,14 @@ async fn the_report_sets_taps_against_the_sends_that_carried_them() {
         Uuid::new_v4(),
         Uuid::new_v4(),
     );
-    seed_delivery(&pool, morning, m1, "schedule", 1).await;
-    seed_delivery(&pool, morning, m2, "schedule", 3).await;
-    seed_delivery(&pool, morning, m_test, "test", 1).await;
-    seed_delivery(&pool, morning, m_old, "schedule", 20).await;
-    seed_delivery(&pool, evening, e1, "schedule", 2).await;
-    seed_delivery(&pool, theirs, t1, "schedule", 1).await;
+    seed_delivery(&pool, morning, m1, "ntfy", 2, "schedule", 1).await;
+    seed_delivery(&pool, morning, m1, "gmail", 1, "schedule", 1).await;
+    seed_delivery(&pool, morning, m2, "ntfy", 2, "schedule", 3).await;
+    seed_delivery(&pool, morning, m3, "gmail", 0, "schedule", 2).await;
+    seed_delivery(&pool, morning, m_test, "ntfy", 2, "test", 1).await;
+    seed_delivery(&pool, morning, m_old, "ntfy", 2, "schedule", 20).await;
+    seed_delivery(&pool, evening, e1, "ntfy", 2, "schedule", 2).await;
+    seed_delivery(&pool, theirs, t1, "ntfy", 2, "schedule", 1).await;
 
     // m1 carried two links, one tapped; m2 one link, tapped; the rehearsal's
     // link was tapped too; a token of another user's names m1 as its source.
@@ -330,20 +387,45 @@ async fn the_report_sets_taps_against_the_sends_that_carried_them() {
             morning_row.actions_sent,
             morning_row.one_tap_actions,
             morning_row.executions,
+            morning_row.executions_with_actions,
             morning_row.executions_tapped,
             morning_row.taps,
         ),
-        (2, 2, 4, 2, 2, 2, 2),
+        (4, 4, 5, 2, 3, 2, 2, 2),
+        "{morning_row:?}"
+    );
+    // The same sends by provider; the taps are not split, since m1's links
+    // were minted once for both.
+    assert_eq!(
+        morning_row.providers,
+        vec![
+            talos_analytics_repository::ProviderSends {
+                provider: "gmail".into(),
+                sends: 2,
+                parts_sent: 2,
+                actions_sent: 1,
+                one_tap_actions: 0,
+            },
+            talos_analytics_repository::ProviderSends {
+                provider: "ntfy".into(),
+                sends: 2,
+                parts_sent: 2,
+                actions_sent: 4,
+                one_tap_actions: 2,
+            },
+        ],
         "{morning_row:?}"
     );
     let evening_row = by_name["pa-evening"];
     assert_eq!(
         (
             evening_row.sends,
+            evening_row.executions_with_actions,
             evening_row.executions_tapped,
-            evening_row.taps
+            evening_row.taps,
+            evening_row.providers.len(),
         ),
-        (1, 0, 0),
+        (1, 1, 0, 0, 1),
         "{evening_row:?}"
     );
     // Ordered by sends.
@@ -352,7 +434,7 @@ async fn the_report_sets_taps_against_the_sends_that_carried_them() {
     // The window is the caller's, and the other user sees only their own.
     assert_eq!(
         repo.message_engagement(user, 30).await.unwrap()[0].sends,
-        3,
+        5,
         "a 30-day window takes the send from 20 days ago"
     );
     let their_rows = repo.message_engagement(other_user, 14).await.unwrap();

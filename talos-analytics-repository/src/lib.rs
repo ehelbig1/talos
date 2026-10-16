@@ -692,24 +692,48 @@ pub struct WorkflowAlertRow {
 /// against the execution that minted its link, so a message with several
 /// links counts every link tapped, and `executions_tapped` says how many
 /// messages drew at least one.
+///
+/// A tap can only come from a message that carried an action, and an email
+/// with no buttons carries none: it can be sent and never tapped. So the
+/// rate is `executions_tapped / executions_with_actions`, never over every
+/// execution, or a workflow that mails a plain report would read as ignored.
+/// The sends are also given per provider word (`ntfy`, `gmail`, …); the taps
+/// are not, because a run that sent by two services minted its links once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageEngagementRow {
     pub workflow_id: Uuid,
     pub workflow_name: String,
     /// Send nodes that delivered.
     pub sends: i64,
-    /// Notifications delivered (a list counts each part).
+    /// Messages delivered (a notification list counts each part; an email is one).
     pub parts_sent: i64,
-    /// Actions delivered across those notifications.
+    /// Actions delivered across those messages (a notification's buttons, an
+    /// email's action links).
     pub actions_sent: i64,
     /// Actions delivered as one-tap (background POST) actions.
     pub one_tap_actions: i64,
     /// Executions that delivered at least one message.
     pub executions: i64,
+    /// Executions among those whose messages carried at least one action:
+    /// the only ones a tap could come from, and the denominator of the rate.
+    pub executions_with_actions: i64,
     /// Executions among those whose action links were tapped at least once.
     pub executions_tapped: i64,
     /// Action links minted in those executions and tapped.
     pub taps: i64,
+    /// The same send counts by provider, most sends first.
+    pub providers: Vec<ProviderSends>,
+}
+
+/// One provider's share of a workflow's sends in the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSends {
+    /// The verdict's word for the service (`ntfy`, `home-assistant`, `gmail`).
+    pub provider: String,
+    pub sends: i64,
+    pub parts_sent: i64,
+    pub actions_sent: i64,
+    pub one_tap_actions: i64,
 }
 
 /// Compact alert row for `get_recent_alerts_summary`.
@@ -4572,7 +4596,13 @@ impl AnalyticsRepository {
                    AND d.started_by_kind IS DISTINCT FROM 'test' \
              ), \
              sent_executions AS ( \
-                 SELECT DISTINCT workflow_id, execution_id FROM sends \
+                 SELECT workflow_id, execution_id, SUM(actions_sent) AS actions \
+                 FROM sends GROUP BY workflow_id, execution_id \
+             ), \
+             executions_by_workflow AS ( \
+                 SELECT workflow_id, COUNT(*)::bigint AS executions, \
+                        COUNT(*) FILTER (WHERE actions > 0)::bigint AS executions_with_actions \
+                 FROM sent_executions GROUP BY workflow_id \
              ), \
              taps AS ( \
                  SELECT se.workflow_id, se.execution_id, COUNT(*)::bigint AS taps \
@@ -4590,13 +4620,16 @@ impl AnalyticsRepository {
                     SUM(s.parts_sent)::bigint AS parts_sent, \
                     SUM(s.actions_sent)::bigint AS actions_sent, \
                     SUM(s.one_tap_actions)::bigint AS one_tap_actions, \
-                    COUNT(DISTINCT s.execution_id)::bigint AS executions, \
+                    ex.executions, \
+                    ex.executions_with_actions, \
                     COALESCE(tw.executions_tapped, 0)::bigint AS executions_tapped, \
                     COALESCE(tw.taps, 0)::bigint AS taps \
              FROM sends s \
              JOIN workflows w ON w.id = s.workflow_id \
+             JOIN executions_by_workflow ex ON ex.workflow_id = s.workflow_id \
              LEFT JOIN taps_by_workflow tw ON tw.workflow_id = s.workflow_id \
-             GROUP BY w.id, w.name, tw.executions_tapped, tw.taps \
+             GROUP BY w.id, w.name, ex.executions, ex.executions_with_actions, \
+                      tw.executions_tapped, tw.taps \
              ORDER BY sends DESC, w.name \
              LIMIT 200",
         )
@@ -4604,18 +4637,58 @@ impl AnalyticsRepository {
         .bind(days)
         .fetch_all(&self.db_pool)
         .await?;
+        // The same sends by provider. A second statement rather than a JSON
+        // aggregate in the first: both are one indexed scan of the window,
+        // and the rows stay typed. Bounded as the first is (200 workflows,
+        // a handful of providers each).
+        let provider_rows = sqlx::query(
+            "SELECT d.workflow_id, d.provider, \
+                    COUNT(*)::bigint AS sends, \
+                    SUM(d.parts_sent)::bigint AS parts_sent, \
+                    SUM(d.actions_sent)::bigint AS actions_sent, \
+                    SUM(d.one_tap_actions)::bigint AS one_tap_actions \
+             FROM message_deliveries d \
+             JOIN workflows w ON w.id = d.workflow_id \
+             WHERE w.user_id = $1 \
+               AND d.sent_at >= NOW() - make_interval(days => $2::int) \
+               AND d.started_by_kind IS DISTINCT FROM 'test' \
+             GROUP BY d.workflow_id, d.provider \
+             ORDER BY sends DESC, d.provider \
+             LIMIT 2000",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+        let mut by_provider: std::collections::HashMap<Uuid, Vec<ProviderSends>> =
+            std::collections::HashMap::new();
+        for r in &provider_rows {
+            by_provider
+                .entry(r.try_get("workflow_id")?)
+                .or_default()
+                .push(ProviderSends {
+                    provider: r.try_get("provider")?,
+                    sends: r.try_get("sends")?,
+                    parts_sent: r.try_get("parts_sent")?,
+                    actions_sent: r.try_get("actions_sent")?,
+                    one_tap_actions: r.try_get("one_tap_actions")?,
+                });
+        }
         rows.iter()
             .map(|r| -> Result<MessageEngagementRow> {
+                let workflow_id: Uuid = r.try_get("workflow_id")?;
                 Ok(MessageEngagementRow {
-                    workflow_id: r.try_get("workflow_id")?,
+                    workflow_id,
                     workflow_name: r.try_get("workflow_name")?,
                     sends: r.try_get("sends")?,
                     parts_sent: r.try_get("parts_sent")?,
                     actions_sent: r.try_get("actions_sent")?,
                     one_tap_actions: r.try_get("one_tap_actions")?,
                     executions: r.try_get("executions")?,
+                    executions_with_actions: r.try_get("executions_with_actions")?,
                     executions_tapped: r.try_get("executions_tapped")?,
                     taps: r.try_get("taps")?,
+                    providers: by_provider.remove(&workflow_id).unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>>>()
