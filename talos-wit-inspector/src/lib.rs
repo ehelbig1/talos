@@ -75,6 +75,137 @@ const NETWORK_TIER: &[&str] = &[
 ];
 
 // ============================================================================
+// What each WIT world imports
+// ============================================================================
+//
+// The `talos:core/*` interfaces each world in `wit/talos.wit` imports. These
+// tables ARE the rule for "does this binary fit that world": a binary fits a
+// world when every interface it imports is in the world's table. The hand-
+// written classifier below only names a world for a binary; the fit test
+// never goes through it (2026-10-16: a compose module that imported only
+// `agent-memory` classified as `trusted`, and a dispatch at its row's world,
+// `agent`, was refused — every agent module that read memory without
+// orchestrating stopped running). `world_imports_match_the_wit_file` holds
+// these tables equal to the WIT file.
+
+const BASE_IMPORTS: &[&str] = &[
+    "talos:core/logging",
+    "talos:core/json",
+    "talos:core/datetime",
+    "talos:core/crypto",
+    "talos:core/env",
+];
+
+const SECRETS_IMPORTS: &[&str] = &[
+    "talos:core/secrets",
+    "talos:core/llm",
+    "talos:core/llm-tools",
+    "talos:core/llm-streaming",
+    "talos:core/context-window",
+    "talos:core/resource-quotas",
+    "talos:core/embedding",
+    "talos:core/model",
+];
+
+const DATABASE_ONLY_IMPORTS: &[&str] = &[
+    "talos:core/database",
+    "talos:core/agent-memory",
+    "talos:core/graph-memory",
+];
+
+const AGENT_ONLY_IMPORTS: &[&str] = &[
+    "talos:core/agent-memory",
+    "talos:core/graph-memory",
+    "talos:core/integration-state",
+    "talos:core/governance",
+    "talos:core/agent-orchestration",
+];
+
+const TRUSTED_ONLY_IMPORTS: &[&str] = &[
+    "talos:core/files",
+    "talos:core/cache",
+    "talos:core/messaging",
+    "talos:core/database",
+    "talos:core/governance",
+    "talos:core/agent-memory",
+    "talos:core/graph-memory",
+    "talos:core/integration-state",
+    "talos:core/agent-orchestration",
+    "talos:core/object-storage",
+];
+
+/// The `talos:core/*` interfaces the WIT world for `world` imports, or `None`
+/// for `Unknown`. `network-node` imports what `http-node` does (raw sockets
+/// are a `wasi:` grant, decided at runtime by the stored world, not an import).
+pub fn world_imports(world: &CapabilityWorld) -> Option<Vec<&'static str>> {
+    let tiers: &[&[&str]] = match world {
+        CapabilityWorld::Minimal => &[BASE_IMPORTS],
+        CapabilityWorld::Http | CapabilityWorld::Network => &[BASE_IMPORTS, NETWORK_TIER],
+        CapabilityWorld::Secrets => &[BASE_IMPORTS, NETWORK_TIER, SECRETS_IMPORTS],
+        CapabilityWorld::Filesystem => &[BASE_IMPORTS, NETWORK_TIER, &["talos:core/files"]],
+        CapabilityWorld::Messaging => &[BASE_IMPORTS, NETWORK_TIER, &["talos:core/messaging"]],
+        CapabilityWorld::Cache => &[BASE_IMPORTS, NETWORK_TIER, &["talos:core/cache"]],
+        CapabilityWorld::Governance => &[BASE_IMPORTS, NETWORK_TIER, &["talos:core/governance"]],
+        CapabilityWorld::Database => &[
+            BASE_IMPORTS,
+            NETWORK_TIER,
+            SECRETS_IMPORTS,
+            DATABASE_ONLY_IMPORTS,
+        ],
+        CapabilityWorld::Agent => &[
+            BASE_IMPORTS,
+            NETWORK_TIER,
+            SECRETS_IMPORTS,
+            AGENT_ONLY_IMPORTS,
+        ],
+        CapabilityWorld::Trusted => &[
+            BASE_IMPORTS,
+            NETWORK_TIER,
+            SECRETS_IMPORTS,
+            TRUSTED_ONLY_IMPORTS,
+        ],
+        CapabilityWorld::Unknown => return None,
+    };
+    Some(tiers.iter().flat_map(|t| t.iter().copied()).collect())
+}
+
+/// The interfaces in `imports` that the WIT world for `world` does not
+/// import, sorted. Empty means the binary fits the world. Every interface is
+/// outside `Unknown`.
+pub fn imports_outside_world(imports: &[String], world: &CapabilityWorld) -> Vec<String> {
+    let Some(admitted) = world_imports(world) else {
+        let mut all = imports.to_vec();
+        all.sort();
+        return all;
+    };
+    let mut outside: Vec<String> = imports
+        .iter()
+        .filter(|i| !admitted.contains(&i.as_str()))
+        .cloned()
+        .collect();
+    outside.sort();
+    outside.dedup();
+    outside
+}
+
+/// Worlds from narrowest to widest, as the classifier tries them. Among the
+/// two incomparable tier-4 worlds `agent-node` comes first: it is the WIT
+/// file's preferred world for a module that reads memory, and it grants no
+/// raw SQL.
+const WORLDS_NARROW_TO_WIDE: &[CapabilityWorld] = &[
+    CapabilityWorld::Minimal,
+    CapabilityWorld::Http,
+    CapabilityWorld::Secrets,
+    CapabilityWorld::Governance,
+    CapabilityWorld::Filesystem,
+    CapabilityWorld::Messaging,
+    CapabilityWorld::Cache,
+    CapabilityWorld::Agent,
+    CapabilityWorld::Database,
+    CapabilityWorld::Trusted,
+];
+
+// ============================================================================
 // Inspection result
 // ============================================================================
 
@@ -150,7 +281,7 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
         // `Minimal`, and the world recorded and the ceilings asked were read
         // off an author-steerable string).
         if let Some(world) = detect_world_from_type_section(wasm_bytes) {
-            capability_world = sentinel_never_narrows(capability_world, world);
+            capability_world = sentinel_never_narrows(capability_world, world, &interfaces);
         }
 
         return ComponentInspection {
@@ -179,10 +310,18 @@ pub fn inspect_component(wasm_bytes: &[u8]) -> ComponentInspection {
 
 /// Validate that a component does not exceed its declared capability level.
 ///
+/// The test is on the IMPORT SET, never on the classified world: the binary
+/// fits `declared` when every `talos:core/*` interface it imports is one the
+/// declared WIT world imports ([`imports_outside_world`]). Two worlds can be
+/// incomparable (`agent-node` and `database-node` both import
+/// `agent-memory`), so a binary importing only `agent-memory` fits either,
+/// and asking "is its classified world a subset of the declared one" refused
+/// it for both (2026-10-16).
+///
 /// Returns `Err` if:
 /// - The component is not a recognised Talos node (`Unknown` capability world).
-/// - The component's actual world is **not** a subset of the declared world
-///   (i.e. it imports more interfaces than the declaration permits).
+/// - The declared world is `Unknown`.
+/// - The component imports an interface outside the declared world.
 pub fn validate_capability_level(
     inspection: &ComponentInspection,
     declared: &CapabilityWorld,
@@ -195,13 +334,22 @@ pub fn validate_capability_level(
             declared
         ));
     }
-    // If the actual world is not a subset of the declared world, reject.
-    if !inspection.capability_world.is_subset_of(declared) {
+    if *declared == CapabilityWorld::Unknown {
+        return Err(format!(
+            "Component cannot be checked against an unknown declared world \
+             (inspected as {}). Imported interfaces: {}",
+            inspection.capability_world,
+            inspection.imported_interfaces.join(", ")
+        ));
+    }
+    let outside = imports_outside_world(&inspection.imported_interfaces, declared);
+    if !outside.is_empty() {
         return Err(format!(
             "Component imports capabilities outside its declared world: \
-             declared={}, actual={}. \
+             declared={}, outside={}, inspected={}. \
              Imported interfaces: {}",
             declared,
+            outside.join(", "),
             inspection.capability_world,
             inspection.imported_interfaces.join(", ")
         ));
@@ -245,13 +393,18 @@ pub fn link_world(
 // ============================================================================
 
 /// The world of a component that has imports, given the world its imports
-/// need (`classified`) and the world its sentinel names: the sentinel when it
-/// covers the imports, the imports' world otherwise.
+/// need (`classified`), the world its sentinel names and the imports
+/// themselves: the sentinel when the imports fit it, the imports' world
+/// otherwise. Asked of the imports, not of `classified`: `agent-node` and
+/// `database-node` are incomparable, so a binary importing only
+/// `agent-memory` (classified `agent`) with the database sentinel fits
+/// `database-node` and is named so.
 fn sentinel_never_narrows(
     classified: CapabilityWorld,
     sentinel: CapabilityWorld,
+    imports: &[String],
 ) -> CapabilityWorld {
-    if classified.is_subset_of(&sentinel) {
+    if imports_outside_world(imports, &sentinel).is_empty() {
         sentinel
     } else {
         classified
@@ -363,101 +516,31 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// Classify a set of imported interface names into the most specific world.
-///
-/// The classification is based on the EXACT set of trusted-tier interfaces
-/// present:
-///
-/// | Trusted interfaces found | World |
-/// |---|---|
-/// | none | Minimal or Network (checked separately) |
-/// | `{secrets}` only | Secrets |
-/// | `{files}` only | Filesystem |
-/// | `{cache}` only | Cache |
-/// | `{messaging}` only | Messaging |
-/// | `{secrets, database}` | Database |
-/// | `{all five}` | Trusted |
-/// | anything else | Trusted (safe escalation) |
+/// Name a world for a binary from its import set: the NARROWEST world whose
+/// WIT imports cover every interface the binary imports
+/// ([`WORLDS_NARROW_TO_WIDE`]). An interface no world imports escalates to
+/// `Trusted` (safe default). This is a NAME for the binary — what a row
+/// records, what a no-hint link uses — not the fit test; that is
+/// [`imports_outside_world`], which a dispatcher asks against the row's own
+/// world.
 fn classify_world(imports: &HashSet<String>, has_sockets: bool) -> CapabilityWorld {
-    let has_secrets = imports.contains("talos:core/secrets");
-    let has_files = imports.contains("talos:core/files");
-    let has_cache = imports.contains("talos:core/cache");
-    let has_messaging = imports.contains("talos:core/messaging");
-    let has_database = imports.contains("talos:core/database");
-    let has_governance = imports.contains("talos:core/governance");
-    // Any LLM-related interface implies secrets tier (LLM API keys are host-managed).
-    let has_llm = imports.contains("talos:core/llm")
-        || imports.contains("talos:core/llm-tools")
-        || imports.contains("talos:core/llm-streaming")
-        || imports.contains("talos:core/context-window")
-        || imports.contains("talos:core/resource-quotas")
-        || imports.contains("talos:core/embedding")
-        || imports.contains("talos:core/model");
-
-    let has_agent_memory = imports.contains("talos:core/agent-memory");
-    let has_agent_orchestration = imports.contains("talos:core/agent-orchestration");
-
-    let any_trusted = has_secrets
-        || has_files
-        || has_cache
-        || has_messaging
-        || has_database
-        || has_governance
-        || has_llm
-        || has_agent_memory
-        || has_agent_orchestration;
-
-    if !any_trusted {
-        // NOTE: `has_sockets` deliberately does NOT escalate the world.
-        // Interpreter-based toolchains (componentize-py) structurally import
-        // wasi:sockets for their embedded runtime regardless of the talos
-        // world — escalating on the import alone classified every Python
-        // module as Network, GRANTING it raw sockets (the world drives
-        // `allow_wasi_network`). Classification follows the talos:core
-        // surface; the socket boundary is enforced at RUNTIME by the
-        // context flag derived from the module's stored world (all tier
-        // linkers satisfy the wasi:sockets import; non-socket worlds deny
-        // the calls — see worker runtime `select_tier`'s layer notes).
-        let _ = has_sockets;
-        if NETWORK_TIER.iter().any(|iface| imports.contains(*iface)) {
-            return CapabilityWorld::Http;
-        }
-        return CapabilityWorld::Minimal;
-    }
-
-    // Map the trusted-interface set to the most specific world.
-    // LLM is always paired with secrets (needs API keys), so it doesn't
-    // affect the tier classification beyond requiring Secrets level.
-    //
-    // Agent-node is identified by agent-orchestration (its distinguishing import)
-    // combined with secrets/LLM, WITHOUT database/files/cache/messaging.
-    //
-    // Any unrecognised combination escalates to Trusted (safe default).
-    match (
-        has_secrets || has_llm, // LLM implies secrets tier
-        has_files,
-        has_cache,
-        has_messaging,
-        has_database,
-        has_governance,
-        has_agent_orchestration,
-    ) {
-        // Simple tier-3 sub-worlds (single additional capability)
-        (true, false, false, false, false, false, false) => CapabilityWorld::Secrets,
-        (false, true, false, false, false, false, false) => CapabilityWorld::Filesystem,
-        (false, false, true, false, false, false, false) => CapabilityWorld::Cache,
-        (false, false, false, true, false, false, false) => CapabilityWorld::Messaging,
-        (false, false, false, false, false, true, false) => CapabilityWorld::Governance,
-        // database-node: secrets + database (optionally agent-memory, no orchestration)
-        (true, false, false, false, true, false, false) => CapabilityWorld::Database,
-        // agent-node: secrets + orchestration, no database/files/cache/messaging
-        // governance and agent-memory are optional (agent-node includes both)
-        (true, false, false, false, false, _, true) => CapabilityWorld::Agent,
-        // Full automation-node: all trusted interfaces
-        (true, true, true, true, true, true, _) => CapabilityWorld::Trusted,
-        // Any other combination — escalate to Trusted (safe)
-        _ => CapabilityWorld::Trusted,
-    }
+    // NOTE: `has_sockets` deliberately does NOT escalate the world.
+    // Interpreter-based toolchains (componentize-py) structurally import
+    // wasi:sockets for their embedded runtime regardless of the talos
+    // world — escalating on the import alone classified every Python
+    // module as Network, GRANTING it raw sockets (the world drives
+    // `allow_wasi_network`). Classification follows the talos:core
+    // surface; the socket boundary is enforced at RUNTIME by the
+    // context flag derived from the module's stored world (all tier
+    // linkers satisfy the wasi:sockets import; non-socket worlds deny
+    // the calls — see worker runtime `select_tier`'s layer notes).
+    let _ = has_sockets;
+    let imports: Vec<String> = imports.iter().cloned().collect();
+    WORLDS_NARROW_TO_WIDE
+        .iter()
+        .find(|w| imports_outside_world(&imports, w).is_empty())
+        .cloned()
+        .unwrap_or(CapabilityWorld::Trusted)
 }
 
 // ============================================================================
@@ -759,6 +842,182 @@ mod tests {
         );
     }
 
+    // ── the fit is on the import set, not the classified world ─────────────
+
+    /// 2026-10-16, the live break: a compose module imported only
+    /// `agent-memory`, the classifier named it `trusted` (no arm matched),
+    /// and the dispatch at its row's world `agent` was refused. The fit is
+    /// asked of the imports: `agent-memory` is an import of `agent-node` and
+    /// of `database-node`, so the binary links at either; it is not one of
+    /// `secrets-node` or `http-node`, so those refuse.
+    #[test]
+    fn a_memory_reading_module_links_at_agent_and_at_database() {
+        // The classified world is set to Trusted on purpose: the fit must not
+        // read it.
+        let memory_only = inspected(CapabilityWorld::Trusted, &["talos:core/agent-memory"]);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Agent), &memory_only).unwrap(),
+            CapabilityWorld::Agent
+        );
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Database), &memory_only).unwrap(),
+            CapabilityWorld::Database
+        );
+        let err = link_world(Some(&CapabilityWorld::Secrets), &memory_only).unwrap_err();
+        assert!(err.contains("outside its declared world"), "{err}");
+        assert!(err.contains("outside=talos:core/agent-memory"), "{err}");
+        assert!(link_world(Some(&CapabilityWorld::Http), &memory_only).is_err());
+
+        // With secrets and an LLM beside it, the same holds.
+        let agent_compose = inspected(
+            CapabilityWorld::Trusted,
+            &[
+                "talos:core/agent-memory",
+                "talos:core/llm",
+                "talos:core/secrets",
+            ],
+        );
+        assert!(link_world(Some(&CapabilityWorld::Agent), &agent_compose).is_ok());
+        assert!(link_world(Some(&CapabilityWorld::Database), &agent_compose).is_ok());
+        assert!(link_world(Some(&CapabilityWorld::Secrets), &agent_compose).is_err());
+    }
+
+    #[test]
+    fn the_fit_names_every_interface_outside_the_world() {
+        let wide = inspected(
+            CapabilityWorld::Trusted,
+            &["talos:core/files", "talos:core/cache", "talos:core/http"],
+        );
+        let err = validate_capability_level(&wide, &CapabilityWorld::Secrets).unwrap_err();
+        assert!(
+            err.contains("outside=talos:core/cache, talos:core/files"),
+            "{err}"
+        );
+        // An interface no world imports fits only nowhere.
+        let foreign = inspected(CapabilityWorld::Trusted, &["talos:core/not-a-thing"]);
+        assert!(validate_capability_level(&foreign, &CapabilityWorld::Trusted).is_err());
+        // An unknown declared world is refused, whatever the binary.
+        let narrow = inspected(CapabilityWorld::Minimal, &[]);
+        assert!(validate_capability_level(&narrow, &CapabilityWorld::Unknown).is_err());
+    }
+
+    /// The classifier names the NARROWEST world whose imports cover the
+    /// binary's; `agent-node` before `database-node` among the tier-4 pair.
+    #[test]
+    fn classification_is_the_narrowest_covering_world() {
+        use CapabilityWorld as W;
+        let c = |ifaces: &[&str]| classify_world(&make_imports(ifaces), false);
+        assert_eq!(c(&["talos:core/agent-memory"]), W::Agent);
+        assert_eq!(
+            c(&["talos:core/agent-memory", "talos:core/secrets"]),
+            W::Agent
+        );
+        assert_eq!(
+            c(&["talos:core/governance", "talos:core/secrets"]),
+            W::Agent
+        );
+        assert_eq!(c(&["talos:core/governance"]), W::Governance);
+        assert_eq!(c(&["talos:core/database"]), W::Database);
+        assert_eq!(
+            c(&["talos:core/database", "talos:core/secrets"]),
+            W::Database
+        );
+        assert_eq!(c(&["talos:core/secrets", "talos:core/llm"]), W::Secrets);
+        assert_eq!(c(&["talos:core/http", "talos:core/email"]), W::Http);
+        assert_eq!(c(&["talos:core/logging"]), W::Minimal);
+        assert_eq!(c(&["talos:core/files", "talos:core/cache"]), W::Trusted);
+        assert_eq!(c(&["talos:core/object-storage"]), W::Trusted);
+        assert_eq!(c(&["talos:core/not-a-thing"]), W::Trusted);
+    }
+
+    /// On a real component: imports `agent-memory` only, carries the
+    /// `agent-node` sentinel. It inspects as `Agent` and fits `agent-node`.
+    #[test]
+    fn a_real_memory_only_component_inspects_as_agent_and_fits_it() {
+        let bytes = wat::parse_str(
+            r#"(component
+                 (import "talos:core/agent-memory" (instance))
+                 (core module
+                   (memory 1)
+                   (data (i32.const 0) "__talos_world_agent-node__")))"#,
+        )
+        .expect("component");
+        let inspection = inspect_component(&bytes);
+        assert_eq!(
+            inspection.imported_interfaces,
+            vec!["talos:core/agent-memory".to_string()]
+        );
+        assert_eq!(inspection.capability_world, CapabilityWorld::Agent);
+        assert_eq!(
+            link_world(Some(&CapabilityWorld::Agent), &inspection).unwrap(),
+            CapabilityWorld::Agent
+        );
+        // The same binary with the database sentinel is named `database`
+        // (it fits), and still links at either tier-4 world.
+        let bytes = wat::parse_str(
+            r#"(component
+                 (import "talos:core/agent-memory" (instance))
+                 (core module
+                   (memory 1)
+                   (data (i32.const 0) "__talos_world_database-node__")))"#,
+        )
+        .expect("component");
+        let inspection = inspect_component(&bytes);
+        assert_eq!(inspection.capability_world, CapabilityWorld::Database);
+        assert!(link_world(Some(&CapabilityWorld::Agent), &inspection).is_ok());
+    }
+
+    /// The import tables are the WIT file's, world by world. Parsed from
+    /// `wit/talos.wit` at test time so a world that gains or loses an import
+    /// fails here, not at a dispatch.
+    #[test]
+    fn world_imports_match_the_wit_file() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../wit/talos.wit");
+        let wit = std::fs::read_to_string(path).expect("wit/talos.wit is readable");
+        let mut worlds: std::collections::HashMap<String, Vec<String>> = Default::default();
+        let mut current: Option<String> = None;
+        for line in wit.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("world ") {
+                let name = rest.trim_end_matches('{').trim().to_string();
+                current = Some(name.clone());
+                worlds.entry(name).or_default();
+            } else if t == "}" {
+                current = None;
+            } else if let (Some(w), Some(import)) = (&current, t.strip_prefix("import ")) {
+                let import = import.trim_end_matches(';').trim();
+                // `wasi:` imports and `export`s are not talos:core interfaces.
+                if !import.contains(':') {
+                    worlds
+                        .get_mut(w)
+                        .unwrap()
+                        .push(format!("talos:core/{import}"));
+                }
+            }
+        }
+        for world in CapabilityWorld::ALL {
+            let wit_name = world.as_node_str();
+            let mut from_wit = worlds
+                .get(wit_name)
+                .unwrap_or_else(|| panic!("world {wit_name} is in wit/talos.wit"))
+                .clone();
+            from_wit.sort();
+            from_wit.dedup();
+            let mut from_table: Vec<String> = world_imports(world)
+                .expect("a known world has a table")
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            from_table.sort();
+            from_table.dedup();
+            assert_eq!(
+                from_table, from_wit,
+                "imports of {wit_name} differ from wit/talos.wit"
+            );
+        }
+        assert!(world_imports(&CapabilityWorld::Unknown).is_none());
+    }
+
     // ── PartialOrd ──────────────────────────────────────────────────────────
 
     #[test]
@@ -972,12 +1231,30 @@ mod tests {
     #[test]
     fn a_sentinel_never_narrows_the_world_the_imports_need() {
         use CapabilityWorld as W;
+        let secrets = vec!["talos:core/secrets".to_string()];
+        let http = vec!["talos:core/http".to_string()];
         // Narrower than the imports: the imports win.
-        assert_eq!(sentinel_never_narrows(W::Secrets, W::Minimal), W::Secrets);
-        assert_eq!(sentinel_never_narrows(W::Http, W::Minimal), W::Http);
+        assert_eq!(
+            sentinel_never_narrows(W::Secrets, W::Minimal, &secrets),
+            W::Secrets
+        );
+        assert_eq!(sentinel_never_narrows(W::Http, W::Minimal, &http), W::Http);
         // Covering the imports: the declared (wider) world stands.
-        assert_eq!(sentinel_never_narrows(W::Http, W::Trusted), W::Trusted);
-        assert_eq!(sentinel_never_narrows(W::Secrets, W::Secrets), W::Secrets);
+        assert_eq!(
+            sentinel_never_narrows(W::Http, W::Trusted, &http),
+            W::Trusted
+        );
+        assert_eq!(
+            sentinel_never_narrows(W::Secrets, W::Secrets, &secrets),
+            W::Secrets
+        );
+        // Incomparable but fitting: a memory-only binary names `agent`, and
+        // the database sentinel, which imports agent-memory too, stands.
+        let memory = vec!["talos:core/agent-memory".to_string()];
+        assert_eq!(
+            sentinel_never_narrows(W::Agent, W::Database, &memory),
+            W::Database
+        );
     }
 
     /// E2-7 (2026-10-15), on a real component: it imports
