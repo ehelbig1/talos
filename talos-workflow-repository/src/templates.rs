@@ -227,7 +227,7 @@ impl WorkflowRepository {
         }
         let rows = sqlx::query(
             "SELECT id, name, config_schema, allowed_secrets, allowed_hosts, max_retries, \
-                    allowed_methods, capability_world, max_fuel \
+                    allowed_methods, capability_world, max_fuel, source_code \
              FROM modules \
              WHERE id = ANY($1)",
         )
@@ -254,6 +254,7 @@ impl WorkflowRepository {
                         .unwrap_or_default(),
                     capability_world: r.try_get::<Option<_>, _>("capability_world")?,
                     max_fuel: r.try_get::<Option<_>, _>("max_fuel")?,
+                    source_code: r.try_get::<Option<String>, _>("source_code")?,
                 })
             })
             .collect()
@@ -305,6 +306,8 @@ impl WorkflowRepository {
                 // path. `None` is honest here ("unknown"), not a claim that
                 // the module has no ceiling.
                 max_fuel: None,
+                // Not selected on this path either: a swap does not read the source.
+                source_code: None,
             })
         })
         .transpose()
@@ -711,6 +714,11 @@ pub struct NodeTemplateRow {
     /// default — a case the sizing check cannot evaluate and must not guess
     /// at.
     pub max_fuel: Option<i64>,
+    /// The module's stored source, when it has one. A gate that reads a
+    /// module's source text (`talos_module_source`: the config keys it reads
+    /// and requires, the contract it declares) asks this; a registry artifact
+    /// and a bytes-only import have `None`, and such a gate says nothing.
+    pub source_code: Option<String>,
 }
 
 impl NodeTemplateRow {

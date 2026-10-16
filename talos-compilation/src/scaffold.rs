@@ -444,16 +444,11 @@ pub const FUEL_PER_BYTE_GUIDANCE: &str = "`fuel_per_byte` (integer 1–100, defa
 /// Dispatcher clamp floor — the smallest max_fuel any module is given.
 pub const FUEL_MIN: u64 = 1_000_000;
 
-/// The share of its fuel limit above which a module has too little headroom:
-/// a larger payload than the one measured is likely to exhaust it.
-///
-/// ONE line, drawn in three places that must agree: the fleet gauge
-/// (`talos_fuel_high_utilisation_nodes`), the `get_fuel_usage_report`
-/// headroom section, and the catalog's recorded-run gate
-/// (`talos-catalog-tests/tests/fuel_fixtures.rs`), which refuses to let a
-/// template be published already above it. The controller's background task
-/// documents how 0.80 was chosen against the fleet's distribution.
-pub const HIGH_FUEL_UTILISATION: f64 = 0.80;
+/// The share of its fuel limit above which a module has too little headroom.
+/// Its home is `talos_workflow_engine_core::HIGH_FUEL_UTILISATION` (the
+/// validator reads it there); this name is kept for the fleet gauge, the
+/// `get_fuel_usage_report` headroom section and the catalog's recorded-run gate.
+pub const HIGH_FUEL_UTILISATION: f64 = talos_workflow_engine_core::HIGH_FUEL_UTILISATION;
 /// Dispatcher clamp ceiling — the largest max_fuel any module is given.
 pub const FUEL_MAX: u64 = 50_000_000;
 

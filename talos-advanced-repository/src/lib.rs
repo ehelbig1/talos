@@ -5476,6 +5476,27 @@ mod audit_retention_clamp_tests {
             upper <= EXECUTION_COST_ROLLUP_RETENTION_DAYS,
             "node_fuel_history may ask for {upper} days of a table kept {EXECUTION_COST_ROLLUP_RETENTION_DAYS}"
         );
+
+        // The validator's reader of the same table, in the workflow repository.
+        let wf = include_str!("../../talos-workflow-repository/src/executions.rs");
+        let start = wf
+            .find("pub async fn node_fuel_history_batch(")
+            .expect("node_fuel_history_batch moved");
+        let body = &wf[start..start + wf[start..].find("sqlx::query_as").unwrap()];
+        let clamp = body
+            .find("window_days.clamp(1, ")
+            .expect("node_fuel_history_batch clamp moved");
+        let upper: i32 = body[clamp + "window_days.clamp(1, ".len()..]
+            .split(')')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("clamp upper bound is not an integer literal");
+        assert!(
+            upper <= EXECUTION_COST_ROLLUP_RETENTION_DAYS,
+            "node_fuel_history_batch may ask for {upper} days of a table kept {EXECUTION_COST_ROLLUP_RETENTION_DAYS}"
+        );
     }
 
     /// `truncated()` and `failed()` see every tier, including the two added

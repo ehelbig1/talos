@@ -1251,6 +1251,7 @@ mod tests {
             allowed_methods: Vec::new(),
             capability_world: None,
             max_fuel: None,
+            source_code: None,
         }
     }
 

@@ -7,7 +7,8 @@ use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use talos_workflow_repository::{NodeRunHistory, NodeTemplateRow, WorkflowRepository};
+use talos_workflow_engine_core::HIGH_FUEL_UTILISATION;
+use talos_workflow_repository::{NodeFuelRow, NodeRunHistory, NodeTemplateRow, WorkflowRepository};
 
 // Re-use the vault path permission check from the MCP module.
 use talos_workflow_job_protocol::vault_path_permitted as _vpp;
@@ -2259,6 +2260,294 @@ pub fn vault_config_findings(
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+// ── Before a first live run (2026-10-16) ────────────────────────────────────
+//
+// Four readings an author gets at `validate_workflow`, each a Warning. The
+// first reads operational history and so may only warn (see the note above
+// `HISTORY_WINDOW_DAYS`); the other three read the graph and the modules'
+// SOURCE through `talos_module_source` — the one home of every reading of a
+// module's source text — and warn because each names a shape that has run
+// wrong on this fleet once already, not a shape that cannot run. Measured on
+// 2026-10-16 over the owner's 92 workflows before any was wired: 2 nodes
+// above the fuel threshold (the fuel report's own count), 1 relayed
+// sub-workflow of 6 without `child_trigger`, 0 send chains that continue
+// past a failed send, 0 list senders with retries, 0 unread config keys and
+// 3 required keys not set (one on a path the node never takes).
+
+/// A node whose hungriest completed run consumed more than
+/// [`HIGH_FUEL_UTILISATION`] of the limit it runs under.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FuelHeadroomFinding {
+    pub node_label: String,
+    /// Completed runs in the window.
+    pub runs: i64,
+    /// The most fuel any of them consumed.
+    pub max_consumed: i64,
+    /// `data.max_fuel`, or the module's `max_fuel` where the node sets none.
+    pub limit: u64,
+    /// `max_consumed / limit`.
+    pub share: f64,
+}
+
+/// Judge one node's completed-run history against its limit. `None` below
+/// the threshold, and for a node with no completed run or no knowable limit.
+#[must_use]
+pub fn fuel_headroom(limit: u64, row: &NodeFuelRow) -> Option<FuelHeadroomFinding> {
+    if limit == 0 || row.runs <= 0 || row.max_fuel <= 0 {
+        return None;
+    }
+    let share = row.max_fuel as f64 / limit as f64;
+    (share > HIGH_FUEL_UTILISATION).then(|| FuelHeadroomFinding {
+        node_label: row.node_id.clone(),
+        runs: row.runs,
+        max_consumed: row.max_fuel,
+        limit,
+        share,
+    })
+}
+
+/// The one wording of the `fuel-headroom` warning.
+#[must_use]
+pub fn describe_fuel_headroom(f: &FuelHeadroomFinding, window_days: i32) -> String {
+    format!(
+        "Node '{}' consumed {} of its {} fuel ({:.0}%) in the hungriest of its {} completed \
+         run(s) over the last {} day(s). Above {:.0}% a payload larger than any seen so far \
+         exhausts it, and a run the fuel meter kills completes nothing and leaves no row \
+         here. Raise the node's data.max_fuel (docs/fuel-budget-sizing.md), or cap what the \
+         node reads.",
+        f.node_label,
+        f.max_consumed,
+        f.limit,
+        f.share * 100.0,
+        f.runs,
+        window_days,
+        HIGH_FUEL_UTILISATION * 100.0
+    )
+}
+
+fn node_label_of(node: &serde_json::Value) -> &str {
+    node.get("id").and_then(|v| v.as_str()).unwrap_or("?")
+}
+
+/// `(node, parent)` for every `system:sub_workflow` node that an upstream
+/// MODULE node feeds and whose data has no `child_trigger` at all.
+///
+/// The engine starts such a child with the OUTER run's trigger
+/// (`subworkflow_trigger_from_input`, 2026-10-14): what the parent produced
+/// reaches the child as node input, never as `__trigger_input__`, so a child
+/// written to be started by a request drafts against the wrong one. The
+/// author decides which the child needs; a present key, `"input"` or
+/// anything else, says they did. One finding per node, naming its first
+/// module parent in edge order.
+#[must_use]
+pub fn relayed_sub_workflows_without_child_trigger(
+    nodes: &[serde_json::Value],
+    edges: &[serde_json::Value],
+) -> Vec<(String, String)> {
+    let by_id: HashMap<&str, &serde_json::Value> =
+        nodes.iter().map(|n| (node_label_of(n), n)).collect();
+    let mut found: Vec<(String, String)> = Vec::new();
+    for edge in edges {
+        let (Some(src), Some(dst)) = (
+            edge.get("source").and_then(|v| v.as_str()),
+            edge.get("target").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let (Some(parent), Some(node)) = (by_id.get(src), by_id.get(dst)) else {
+            continue;
+        };
+        if node.get("type").and_then(|v| v.as_str()) != Some("system:sub_workflow")
+            || talos_workflow_engine_core::node_module_id(parent).is_none()
+            || node
+                .get("data")
+                .is_some_and(|d| d.get("child_trigger").is_some())
+            || found.iter().any(|(n, _)| n == dst)
+        {
+            continue;
+        }
+        found.push((dst.to_string(), src.to_string()));
+    }
+    found
+}
+
+/// Whether an edge's condition stops the run when its source failed
+/// (`!is_error`, `is_error == false`, …): the condition names `is_error`.
+fn edge_stops_on_error(edge: &serde_json::Value) -> bool {
+    edge.get("condition")
+        .and_then(|v| v.as_str())
+        .is_some_and(|c| c.contains("is_error"))
+}
+
+fn edge_ends(edge: &serde_json::Value) -> Option<(&str, &str)> {
+    Some((
+        edge.get("source").and_then(|v| v.as_str())?,
+        edge.get("target").and_then(|v| v.as_str())?,
+    ))
+}
+
+fn is_error_edge(edge: &serde_json::Value) -> bool {
+    edge.get("edge_type").and_then(|v| v.as_str()) == Some("error")
+}
+
+/// `(from, to, next_sender)` for every non-error edge out of a sender node
+/// that leads on to another sender node without stopping on error: a later
+/// part of a message can then arrive after an earlier one failed to send
+/// (AXP-1051, 2026-10-15: part 1 timed out, parts 2–4 and the Post button
+/// arrived). `is_sender` is the caller's reading of a node's module, so the
+/// graph walk has one home and the module reading another.
+#[must_use]
+pub fn sender_chains_that_do_not_stop(
+    nodes: &[serde_json::Value],
+    edges: &[serde_json::Value],
+    is_sender: &dyn Fn(&serde_json::Value) -> bool,
+) -> Vec<(String, String, String)> {
+    let senders: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| is_sender(n))
+        .map(node_label_of)
+        .collect();
+    if senders.len() < 2 {
+        return Vec::new();
+    }
+    let mut next: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges.iter().filter(|e| !is_error_edge(e)) {
+        if let Some((s, t)) = edge_ends(edge) {
+            next.entry(s).or_default().push(t);
+        }
+    }
+    // The first sender reachable from `start`, by breadth-first walk.
+    let reaches_sender = |start: &str| -> Option<String> {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: std::collections::VecDeque<&str> = std::collections::VecDeque::new();
+        queue.push_back(start);
+        while let Some(at) = queue.pop_front() {
+            if !seen.insert(at) {
+                continue;
+            }
+            if senders.contains(at) {
+                return Some(at.to_string());
+            }
+            for n in next.get(at).into_iter().flatten() {
+                queue.push_back(n);
+            }
+        }
+        None
+    };
+    let mut found = Vec::new();
+    for edge in edges
+        .iter()
+        .filter(|e| !is_error_edge(e) && !edge_stops_on_error(e))
+    {
+        let Some((s, t)) = edge_ends(edge) else {
+            continue;
+        };
+        if !senders.contains(s) {
+            continue;
+        }
+        if let Some(later) = reaches_sender(t) {
+            found.push((s.to_string(), t.to_string(), later));
+        }
+    }
+    found
+}
+
+/// `(sender, composer, retries)` for every sender node that declares retries
+/// and is fed directly by a node whose module composes a `notifications`
+/// list. The sender stops at the first part that fails and fails the node;
+/// a retry re-sends the parts already delivered
+/// (`docs/notification-contract.md`).
+#[must_use]
+pub fn list_senders_with_retries(
+    nodes: &[serde_json::Value],
+    edges: &[serde_json::Value],
+    is_sender: &dyn Fn(&serde_json::Value) -> bool,
+    is_list_composer: &dyn Fn(&serde_json::Value) -> bool,
+) -> Vec<(String, String, u64)> {
+    let by_id: HashMap<&str, &serde_json::Value> =
+        nodes.iter().map(|n| (node_label_of(n), n)).collect();
+    let mut found = Vec::new();
+    for edge in edges {
+        let Some((s, t)) = edge_ends(edge) else {
+            continue;
+        };
+        let (Some(composer), Some(sender)) = (by_id.get(s), by_id.get(t)) else {
+            continue;
+        };
+        let retries = node_declared_u64(sender, "retry_count").unwrap_or(0);
+        if retries > 0 && is_sender(sender) && is_list_composer(composer) {
+            found.push((t.to_string(), s.to_string(), retries));
+        }
+    }
+    found
+}
+
+/// What a node's config says against the module's source.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigKeyFindings {
+    /// Keys the node sets that the module's config struct never reads. Judged
+    /// only where the source has a typed config struct, which makes the set
+    /// of keys it reads the whole set (`KeysRead::typed`).
+    pub unread: Vec<String>,
+    /// Keys the module refuses a run without (`Missing KEY config`) that the
+    /// node does not set and no `for_each_connection` binding supplies.
+    pub required_missing: Vec<String>,
+}
+
+/// Hold `node_config` to `source`: see [`ConfigKeyFindings`]. `bound` is the
+/// set of keys the engine writes per run (`for_each_connection.bind`).
+#[must_use]
+pub fn config_keys_against_source(
+    node_config: &serde_json::Value,
+    bound: &std::collections::BTreeSet<String>,
+    source: &str,
+) -> ConfigKeyFindings {
+    use talos_module_source::config_keys::{is_key, keys_read, required_keys};
+    let set: std::collections::BTreeSet<String> = node_config
+        .as_object()
+        .map(|o| o.keys().filter(|k| is_key(k)).cloned().collect())
+        .unwrap_or_default();
+    let read = keys_read(source);
+    let unread = if read.typed {
+        set.iter()
+            .filter(|k| !read.keys.contains(*k))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let required_missing = required_keys(source)
+        .into_iter()
+        .filter(|k| !set.contains(k) && !bound.contains(k))
+        .collect();
+    ConfigKeyFindings {
+        unread,
+        required_missing,
+    }
+}
+
+/// The keys a node's `for_each_connection` binding writes per run.
+fn for_each_bound_keys(node_config: &serde_json::Value) -> std::collections::BTreeSet<String> {
+    node_config
+        .get(talos_workflow_engine_core::connections_reader::FOR_EACH_CONNECTION_KEY)
+        .and_then(|f| f.get("bind"))
+        .and_then(|b| b.as_object())
+        .map(|b| b.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// A module takes part in the sender contract when its source names both
+/// verdict fields (`docs/notification-contract.md`).
+fn source_is_sender(source: &str) -> bool {
+    talos_module_source::literals::names_literal(source, "parts_sent")
+        && talos_module_source::literals::names_literal(source, "parts_total")
+}
+
+/// A module composes a message in parts when its source names the list.
+fn source_composes_a_list(source: &str) -> bool {
+    talos_module_source::literals::names_literal(source, "notifications")
+}
+
 /// Severity of a validation issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationSeverity {
@@ -2436,6 +2725,10 @@ pub struct PreparedValidation {
     /// [`HistoryCoverage::Unavailable`] — never `Empty`, which would report a
     /// failed read as "nothing has been observed".
     pub history: std::result::Result<NodeRunHistory, String>,
+    /// Per-node completed-run fuel over the same window, or the read error.
+    /// `Err` means the `fuel-headroom` check did not run, and is logged;
+    /// `Ok(vec![])` means no node completed a run in the window.
+    pub fuel_history: std::result::Result<Vec<NodeFuelRow>, String>,
 }
 
 // ── Cross-workflow cycles ───────────────────────────────────────────────────
@@ -2744,6 +3037,10 @@ impl WorkflowValidationService {
             )
             .await
             .map_err(|e| e.to_string());
+        let fuel_history = workflow_repo
+            .node_fuel_history(workflow_id, user_id, history_window_days())
+            .await
+            .map_err(|e| e.to_string());
 
         Ok(PreparedValidation {
             workflow_id,
@@ -2753,6 +3050,7 @@ impl WorkflowValidationService {
             installed_secrets,
             has_actor,
             history,
+            fuel_history,
         })
     }
 }
@@ -2797,6 +3095,7 @@ pub fn validate_prepared_with_children(
             installed_secrets,
             has_actor,
             history: history_read,
+            fuel_history: fuel_read,
         } = prepared;
 
         let graph: serde_json::Value = serde_json::from_str(&graph_json)
@@ -3085,6 +3384,14 @@ pub fn validate_prepared_with_children(
                 .iter()
                 .map(|r| (r.id, (r.max_fuel, r.capability_world.clone())))
                 .collect();
+            // The module's name and source, for the readings of the source
+            // below (config keys, the sender contract). A registry artifact
+            // or a bytes-only import has no source, and those readings say
+            // nothing about it.
+            let template_source: HashMap<Uuid, (String, Option<String>)> = template_rows
+                .iter()
+                .map(|r| (r.id, (r.name.clone(), r.source_code.clone())))
+                .collect();
 
             // Retry-envelope inputs, captured from the same rows for the same
             // reason. A node that declares no `retry_count` still gets one at
@@ -3224,6 +3531,49 @@ pub fn validate_prepared_with_children(
                 }
             }
 
+            // ── Fuel headroom from history (Warning) ──────────────────────
+            //
+            // The same limit as the two checks above (node-scoped
+            // `data.max_fuel` ?? `modules.max_fuel`), against what the node
+            // has actually consumed in its completed runs. A failed read is
+            // logged, not read as "every node has headroom".
+            match &fuel_read {
+                Ok(rows) => {
+                    for row in rows {
+                        let Some(node) = nodes.iter().find(|n| node_label_of(n) == row.node_id)
+                        else {
+                            continue;
+                        };
+                        let cfg = node_dispatch_config(node);
+                        let module_fuel = talos_workflow_engine_core::node_module_id(node)
+                            .and_then(|t| template_fuel.get(&t))
+                            .and_then(|(fuel, _)| fuel.filter(|f| *f > 0).map(|f| f as u64));
+                        let Some(limit) =
+                            cfg.get("max_fuel").and_then(|v| v.as_u64()).or(module_fuel)
+                        else {
+                            continue;
+                        };
+                        if let Some(finding) = fuel_headroom(limit, row) {
+                            issues.push(ValidationIssue {
+                                severity: ValidationSeverity::Warning,
+                                message: describe_fuel_headroom(&finding, history_window_days()),
+                                node_id: Some(finding.node_label.clone()),
+                                category: "fuel-headroom".into(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_validation",
+                        %workflow_id,
+                        error = %e,
+                        event_kind = "validation_fuel_history_read_failed",
+                        "fuel-headroom check did not run: the fuel history could not be read"
+                    );
+                }
+            }
+
             // ── Retry envelope vs the workflow budget (Warning) ──────────────
             //
             // See the module-level rationale above `node_retry_envelope_secs`
@@ -3358,6 +3708,112 @@ pub fn validate_prepared_with_children(
                     }
                 }
             }
+
+            // ── Node config against the module's source (Warning) ─────────
+            //
+            // The schema check above reads what the manifest DECLARES; this
+            // reads what the source DOES, through the one home of that
+            // reading (`talos_module_source::config_keys`). Both are Warnings:
+            // a key required on one branch only is listed too.
+            for node in &nodes {
+                let node_id = node_label_of(node);
+                let Some(tid) = talos_workflow_engine_core::node_module_id(node) else {
+                    continue;
+                };
+                let Some((module_name, Some(source))) = template_source.get(&tid) else {
+                    continue;
+                };
+                let node_config = node_dispatch_config(node);
+                let findings = config_keys_against_source(
+                    &node_config,
+                    &for_each_bound_keys(&node_config),
+                    source,
+                );
+                for key in findings.unread {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        message: format!(
+                            "Node '{node_id}' (module: {module_name}) sets config key '{key}', \
+                             which the module's source never reads: a renamed or misspelt key \
+                             does nothing. Remove it, or fix the name."
+                        ),
+                        node_id: Some(node_id.to_string()),
+                        category: "config".into(),
+                    });
+                }
+                for key in findings.required_missing {
+                    issues.push(ValidationIssue {
+                        severity: ValidationSeverity::Warning,
+                        message: format!(
+                            "Node '{node_id}' (module: {module_name}) does not set '{key}', and \
+                             the module's source refuses a run without it ('Missing {key} \
+                             config'). Set it with update_node_config — unless the module needs \
+                             it only on a path this node never takes."
+                        ),
+                        node_id: Some(node_id.to_string()),
+                        category: "config".into(),
+                    });
+                }
+            }
+
+            // ── A message sent in parts (Warning) ──────────────────────────
+            //
+            // A sender is a module whose source takes part in the sender
+            // contract; a list composer one whose source names `notifications`.
+            let source_of = |node: &serde_json::Value| -> Option<&str> {
+                talos_workflow_engine_core::node_module_id(node)
+                    .and_then(|t| template_source.get(&t))
+                    .and_then(|(_, s)| s.as_deref())
+            };
+            let is_sender =
+                |node: &serde_json::Value| source_of(node).is_some_and(source_is_sender);
+            let is_list_composer =
+                |node: &serde_json::Value| source_of(node).is_some_and(source_composes_a_list);
+            for (from, to, later) in sender_chains_that_do_not_stop(&nodes, &edges, &is_sender) {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "Edge '{from}' -> '{to}' goes on to another send ('{later}') whatever \
+                         '{from}' returned: a later part of the message can arrive after an \
+                         earlier one failed to send. Give the edge the condition `!is_error`, \
+                         or compose the parts as one `notifications` list sent by one node."
+                    ),
+                    node_id: Some(from),
+                    category: "message-chain".into(),
+                });
+            }
+            for (sender, composer, retries) in
+                list_senders_with_retries(&nodes, &edges, &is_sender, &is_list_composer)
+            {
+                issues.push(ValidationIssue {
+                    severity: ValidationSeverity::Warning,
+                    message: format!(
+                        "Node '{sender}' retries (retry_count {retries}) a message that \
+                         '{composer}' composes as a `notifications` list. The sender stops at \
+                         the first part that fails and fails the node, so a retry re-sends the \
+                         parts already delivered. Set retry_count to 0 on this node."
+                    ),
+                    node_id: Some(sender),
+                    category: "message-chain".into(),
+                });
+            }
+        }
+
+        // ── A sub-workflow fed by a module says which trigger its child gets (Warning) ──
+        for (node, parent) in relayed_sub_workflows_without_child_trigger(&nodes, &edges) {
+            issues.push(ValidationIssue {
+                severity: ValidationSeverity::Warning,
+                message: format!(
+                    "Node '{node}' runs a sub-workflow after '{parent}' and does not say which \
+                     trigger the child gets. The child is started with THIS run's trigger; what \
+                     '{parent}' produced reaches it as node input, never as `__trigger_input__`. \
+                     A child written to be started by a request needs `child_trigger: \"input\"` \
+                     on this node; a child that reads its own sources takes `child_trigger: \
+                     \"outer\"`, which says so and ends this warning."
+                ),
+                node_id: Some(node),
+                category: "child-trigger".into(),
+            });
         }
 
         // ── Observed failure history (Warning) ───────────────────────────
@@ -5539,6 +5995,7 @@ mod edge_condition_tests {
             installed_secrets: HashMap::new(),
             has_actor: true,
             history: Err("not read in this test".to_string()),
+            fuel_history: Err("not read in this test".to_string()),
         }
     }
 
@@ -7963,6 +8420,7 @@ mod fleet_convergence_tests {
             allowed_methods: vec!["GET".into()],
             capability_world: Some("http-node".into()),
             max_fuel: None,
+            source_code: None,
         }
     }
 
@@ -7980,6 +8438,7 @@ mod fleet_convergence_tests {
                 window_days: 30,
                 nodes: Vec::new(),
             }),
+            fuel_history: Ok(Vec::new()),
         }
     }
 
@@ -9009,6 +9468,7 @@ mod retry_advice_tests {
             installed_secrets: std::collections::HashMap::new(),
             has_actor: true,
             history,
+            fuel_history: Ok(Vec::new()),
         }
     }
 
@@ -9342,5 +9802,373 @@ mod sub_workflow_cycle_tests {
             .collect();
         // Every child references every other, so a 2-cycle exists among them.
         assert!(find_sub_workflow_cycle(a, &root, &children).is_some());
+    }
+}
+
+#[cfg(test)]
+mod before_first_live_run_tests {
+    //! The four readings added 2026-10-16. Each test builds the shape that ran
+    //! wrong on the fleet, shows the warning, then shows the shape that does
+    //! not warn; the last holds every one of them to Warning.
+    use super::*;
+    use serde_json::json;
+    use talos_workflow_repository::{NodeFuelRow, NodeRunHistory, NodeTemplateRow};
+
+    const SENDER: &str = "fn run(i: String) -> Result<String, String> { Ok(json!({\"provider\": \"ntfy\", \"sent\": true, \"parts_total\": 1, \"parts_sent\": 1}).to_string()) }";
+    const COMPOSER: &str = "fn run(i: String) -> Result<String, String> { Ok(json!({\"notifications\": []}).to_string()) }";
+    const PLAIN: &str = "fn run(i: String) -> Result<String, String> { Ok(json!({\"text\": \"one part\"}).to_string()) }";
+    const TYPED: &str = "#[derive(Deserialize)]\nstruct Config {\n    #[serde(rename = \"PROJECT\")]\n    project: Option<String>,\n    #[serde(rename = \"SITE_URL\")]\n    site: Option<String>,\n}\nfn run() { let s = cfg.site.ok_or(\"Missing SITE_URL config\")?; }";
+    const UNTYPED: &str = "fn run() { let a = cfg[\"A\"]; }";
+
+    fn module(
+        id: u128,
+        name: &str,
+        source: Option<&str>,
+        max_fuel: Option<i64>,
+    ) -> NodeTemplateRow {
+        NodeTemplateRow {
+            id: Uuid::from_u128(id),
+            name: name.into(),
+            config_schema: json!({}),
+            allowed_secrets: Vec::new(),
+            allowed_hosts: Vec::new(),
+            max_retries: 0,
+            allowed_methods: vec!["GET".into()],
+            capability_world: Some("http-node".into()),
+            max_fuel,
+            source_code: source.map(str::to_string),
+        }
+    }
+    fn m(id: u128) -> String {
+        Uuid::from_u128(id).to_string()
+    }
+    fn prepared(
+        graph: serde_json::Value,
+        templates: Vec<NodeTemplateRow>,
+        fuel_history: Result<Vec<NodeFuelRow>, String>,
+    ) -> PreparedValidation {
+        PreparedValidation {
+            workflow_id: Uuid::from_u128(99),
+            graph_json: graph.to_string(),
+            existing_modules: graph_module_ids(&graph).into_iter().collect(),
+            templates,
+            installed_secrets: HashMap::new(),
+            has_actor: true,
+            history: Ok(NodeRunHistory {
+                executions_scanned: 0,
+                window_days: 30,
+                nodes: Vec::new(),
+            }),
+            fuel_history,
+        }
+    }
+    fn of(result: &ValidationResult, category: &str) -> Vec<String> {
+        result
+            .issues
+            .iter()
+            .filter(|i| i.category == category)
+            .map(|i| {
+                assert_eq!(i.severity, ValidationSeverity::Warning, "{}", i.message);
+                i.message.clone()
+            })
+            .collect()
+    }
+    fn fuel(node: &str, runs: i64, max_fuel: i64) -> NodeFuelRow {
+        NodeFuelRow {
+            node_id: node.into(),
+            runs,
+            p50_fuel: max_fuel / 2,
+            max_fuel,
+        }
+    }
+
+    #[test]
+    fn a_node_whose_hungriest_run_is_above_the_threshold_is_warned_from_history() {
+        let graph = |node_fuel: Option<u64>| {
+            let mut data = json!({"label": "digest"});
+            if let Some(f) = node_fuel {
+                data["max_fuel"] = json!(f);
+            }
+            json!({"nodes": [{"id": "digest", "type": m(1), "data": data}], "edges": []})
+        };
+        // Above the threshold: warned, with the numbers.
+        let r = validate_prepared(prepared(
+            graph(Some(1_000_000)),
+            vec![module(1, "digest", None, None)],
+            Ok(vec![fuel("digest", 4, 850_000)]),
+        ));
+        let w = of(&r, "fuel-headroom");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].contains("850000 of its 1000000 fuel (85%)")
+                && w[0].contains("4 completed run(s)"),
+            "{}",
+            w[0]
+        );
+        // At the threshold: nothing. The line is `>`, as the fuel report's.
+        let r = validate_prepared(prepared(
+            graph(Some(1_000_000)),
+            vec![module(1, "digest", None, None)],
+            Ok(vec![fuel("digest", 4, 800_000)]),
+        ));
+        assert!(of(&r, "fuel-headroom").is_empty());
+        // The module's shared ceiling is the limit where the node sets none.
+        let r = validate_prepared(prepared(
+            graph(None),
+            vec![module(1, "digest", None, Some(1_000_000))],
+            Ok(vec![fuel("digest", 1, 990_000)]),
+        ));
+        assert_eq!(of(&r, "fuel-headroom").len(), 1);
+        // No limit knowable, a node that never completed, or a row for a node not in the graph: nothing.
+        let r = validate_prepared(prepared(
+            graph(None),
+            vec![module(1, "digest", None, None)],
+            Ok(vec![fuel("digest", 1, 990_000), fuel("gone", 9, 999_999)]),
+        ));
+        assert!(of(&r, "fuel-headroom").is_empty());
+        let r = validate_prepared(prepared(
+            graph(Some(1_000_000)),
+            vec![module(1, "digest", None, None)],
+            Ok(vec![fuel("digest", 0, 0)]),
+        ));
+        assert!(of(&r, "fuel-headroom").is_empty());
+        // A failed read is not "every node has headroom", and is not an error either.
+        let r = validate_prepared(prepared(
+            graph(Some(1_000_000)),
+            vec![module(1, "digest", None, None)],
+            Err("db down".into()),
+        ));
+        assert!(of(&r, "fuel-headroom").is_empty() && r.valid);
+    }
+
+    #[test]
+    fn a_sub_workflow_after_a_module_says_which_trigger_its_child_gets_or_is_warned() {
+        let graph = |sub_data: serde_json::Value, fed_by_module: bool| {
+            json!({"nodes": [
+                {"id": "start", "type": "system:trigger", "data": {}},
+                {"id": "relay", "type": m(1), "data": {"FIELD": "gaps"}},
+                {"id": "ask", "type": "system:sub_workflow", "data": sub_data},
+            ], "edges": [
+                {"source": "start", "target": "relay"},
+                {"source": if fed_by_module { "relay" } else { "start" }, "target": "ask"},
+            ]})
+        };
+        let sub = json!({"sub_workflow_id": m(7)});
+        let r = validate_prepared(prepared(
+            graph(sub.clone(), true),
+            vec![module(1, "relay-field", Some(PLAIN), None)],
+            Ok(vec![]),
+        ));
+        let w = of(&r, "child-trigger");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("Node 'ask' runs a sub-workflow after 'relay'"),
+            "{}",
+            w[0]
+        );
+        // The author said which: either way.
+        for choice in ["input", "outer"] {
+            let mut d = sub.clone();
+            d["child_trigger"] = json!(choice);
+            let r = validate_prepared(prepared(
+                graph(d, true),
+                vec![module(1, "relay-field", Some(PLAIN), None)],
+                Ok(vec![]),
+            ));
+            assert!(of(&r, "child-trigger").is_empty(), "{choice}");
+        }
+        // A root sub-workflow's upstream IS the trigger.
+        let r = validate_prepared(prepared(
+            graph(sub, false),
+            vec![module(1, "relay-field", Some(PLAIN), None)],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "child-trigger").is_empty());
+    }
+
+    #[test]
+    fn a_send_that_goes_on_to_another_send_stops_on_error_or_is_warned() {
+        let graph = |first_edge: serde_json::Value| {
+            json!({"nodes": [
+                {"id": "send1", "type": m(1), "data": {"TOPIC": "t"}},
+                {"id": "part2", "type": m(2), "data": {"PART": 2}},
+                {"id": "send2", "type": m(1), "data": {"TOPIC": "t"}},
+            ], "edges": [first_edge, {"source": "part2", "target": "send2"}]})
+        };
+        let mods = || {
+            vec![
+                module(1, "notify", Some(SENDER), None),
+                module(2, "part", Some(PLAIN), None),
+            ]
+        };
+        let r = validate_prepared(prepared(
+            graph(json!({"source": "send1", "target": "part2"})),
+            mods(),
+            Ok(vec![]),
+        ));
+        let w = of(&r, "message-chain");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("Edge 'send1' -> 'part2' goes on to another send ('send2')"),
+            "{}",
+            w[0]
+        );
+        let r = validate_prepared(prepared(
+            graph(
+                json!({"source": "send1", "target": "part2", "condition": "!is_error", "edge_type": "conditional"}),
+            ),
+            mods(),
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "message-chain").is_empty());
+        // The error path out of a send is not the message going on.
+        let r = validate_prepared(prepared(
+            graph(json!({"source": "send1", "target": "part2", "edge_type": "error"})),
+            mods(),
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "message-chain").is_empty());
+        // Two modules that do not take part in the sender contract are not senders.
+        let r = validate_prepared(prepared(
+            graph(json!({"source": "send1", "target": "part2"})),
+            vec![
+                module(1, "x", Some(PLAIN), None),
+                module(2, "part", Some(PLAIN), None),
+            ],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "message-chain").is_empty());
+    }
+
+    #[test]
+    fn a_sender_fed_a_notifications_list_does_not_retry() {
+        let graph = |retries: u64| {
+            json!({"nodes": [
+                {"id": "compose", "type": m(2), "data": {}},
+                {"id": "send", "type": m(1), "data": {"TOPIC": "t"}, "retry_count": retries},
+            ], "edges": [{"source": "compose", "target": "send"}]})
+        };
+        let r = validate_prepared(prepared(
+            graph(2),
+            vec![
+                module(1, "notify", Some(SENDER), None),
+                module(2, "compose", Some(COMPOSER), None),
+            ],
+            Ok(vec![]),
+        ));
+        let w = of(&r, "message-chain");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with(
+                "Node 'send' retries (retry_count 2) a message that 'compose' composes"
+            ),
+            "{}",
+            w[0]
+        );
+        let r = validate_prepared(prepared(
+            graph(0),
+            vec![
+                module(1, "notify", Some(SENDER), None),
+                module(2, "compose", Some(COMPOSER), None),
+            ],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "message-chain").is_empty());
+        // A composer of one message may be retried.
+        let r = validate_prepared(prepared(
+            graph(2),
+            vec![
+                module(1, "notify", Some(SENDER), None),
+                module(2, "compose", Some(PLAIN), None),
+            ],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "message-chain").is_empty());
+    }
+
+    #[test]
+    fn node_config_is_held_to_the_keys_the_source_reads_and_requires() {
+        let graph = |data: serde_json::Value| json!({"nodes": [{"id": "read", "type": m(3), "data": data}], "edges": []});
+        let typed = || vec![module(3, "jira-read", Some(TYPED), None)];
+        let r = validate_prepared(prepared(
+            graph(json!({"PROJECT": "p", "TYPO": "x", "max_fuel": 5})),
+            typed(),
+            Ok(vec![]),
+        ));
+        let w = of(&r, "config");
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("sets config key 'TYPO', which the module's source never reads"),
+            "{}",
+            w[0]
+        );
+        assert!(
+            w[1].contains(
+                "does not set 'SITE_URL', and the module's source refuses a run without it"
+            ),
+            "{}",
+            w[1]
+        );
+        let r = validate_prepared(prepared(
+            graph(json!({"PROJECT": "p", "SITE_URL": "https://example.atlassian.net"})),
+            typed(),
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "config").is_empty());
+        // A key the engine binds per connection is set, for every run.
+        let r = validate_prepared(prepared(
+            graph(
+                json!({"PROJECT": "p", "for_each_connection": {"provider": "atlassian", "bind": {"SITE_URL": "site"}}}),
+            ),
+            typed(),
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "config").is_empty());
+        // Without a typed config struct the set of keys read is not whole: no unread verdict.
+        let r = validate_prepared(prepared(
+            graph(json!({"B": 1})),
+            vec![module(3, "x", Some(UNTYPED), None)],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "config").is_empty());
+        // No source (a registry artifact): nothing is said.
+        let r = validate_prepared(prepared(
+            graph(json!({"TYPO": "x"})),
+            vec![module(3, "x", None, None)],
+            Ok(vec![]),
+        ));
+        assert!(of(&r, "config").is_empty());
+    }
+
+    #[test]
+    fn every_one_of_these_leaves_the_workflow_publishable() {
+        let graph = json!({"nodes": [
+            {"id": "relay", "type": m(3), "data": {"TYPO": "x", "max_fuel": 1_000_000}},
+            {"id": "ask", "type": "system:sub_workflow", "data": {"sub_workflow_id": m(7)}},
+            {"id": "compose", "type": m(2), "data": {}},
+            {"id": "send1", "type": m(1), "data": {}, "retry_count": 1},
+            {"id": "part2", "type": m(4), "data": {}},
+            {"id": "send2", "type": m(1), "data": {}},
+        ], "edges": [
+            {"source": "relay", "target": "ask"}, {"source": "ask", "target": "compose"},
+            {"source": "compose", "target": "send1"}, {"source": "send1", "target": "part2"}, {"source": "part2", "target": "send2"},
+        ]});
+        let r = validate_prepared(prepared(
+            graph,
+            vec![
+                module(1, "notify", Some(SENDER), None),
+                module(2, "compose", Some(COMPOSER), None),
+                module(3, "jira-read", Some(TYPED), None),
+                module(4, "part", Some(PLAIN), None),
+            ],
+            Ok(vec![fuel("relay", 3, 900_000)]),
+        ));
+        let counts =
+            ["fuel-headroom", "child-trigger", "message-chain", "config"].map(|c| of(&r, c).len());
+        assert_eq!(counts, [1, 1, 2, 2], "{:?}", r.issues);
+        assert!(
+            r.valid,
+            "operational history and advice never gate publish_version"
+        );
     }
 }

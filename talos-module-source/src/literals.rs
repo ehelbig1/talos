@@ -134,6 +134,15 @@ pub fn without_comments(src: &str) -> String {
     out
 }
 
+/// Whether the module body (before its tests, comments out) holds a string
+/// literal that is exactly `text`: the way a module declares a contract it
+/// takes part in, such as the fields of a sender's verdict.
+pub fn names_literal(source: &str, text: &str) -> bool {
+    literals(&without_comments(before_tests(source)))
+        .iter()
+        .any(|(_, lit)| lit == text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +184,20 @@ mod tests {
     fn the_tests_are_cut_off() {
         assert_eq!(before_tests("mod a;\n#[cfg(test)]\nmod t;"), "mod a;\n");
         assert_eq!(before_tests("mod a;"), "mod a;");
+    }
+
+    #[test]
+    fn a_literal_is_named_whole_in_the_body_only() {
+        let src = "let v = json!({\"parts_sent\": 1}); // \"parts_total\"\n#[cfg(test)] mod t { const X: &str = \"notifications\"; }";
+        assert!(names_literal(src, "parts_sent"));
+        assert!(
+            !names_literal(src, "parts_total"),
+            "a comment is not the module"
+        );
+        assert!(
+            !names_literal(src, "notifications"),
+            "a test is not the module"
+        );
+        assert!(!names_literal(src, "parts"), "whole, not a prefix");
     }
 }

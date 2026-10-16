@@ -27,6 +27,7 @@ talos-metrics = { path = "../talos-metrics" }
 talos-module-source = { path = "../talos-module-source" }
 talos-text-util = { path = "../talos-text-util" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }
 tracing.workspace = true
 uuid.workspace = true
