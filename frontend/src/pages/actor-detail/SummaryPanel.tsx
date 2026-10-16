@@ -35,8 +35,8 @@ import {
 } from "@/lib/capabilityConfig";
 import { useGetCapabilityWorldHierarchyQuery } from "@/generated/graphql";
 import { ageDays } from "@/lib/formatTime";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 import {
-  CapabilityBadge,
   StatCard,
   ACTION_ICONS,
   humanizeLogEntry,
@@ -234,7 +234,10 @@ export function SummaryPanel({
                   <div className="flex items-start justify-between gap-4">
                     <div className="space-y-4">
                       <div className="flex items-center gap-3 flex-wrap">
-                        <CapabilityBadge world={actor.maxCapabilityWorld} />
+                        <CapabilityBadge
+                          world={actor.maxCapabilityWorld}
+                          size="md"
+                        />
                         {isAiActor && (
                           <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-2xs font-semibold uppercase tracking-wider px-3 py-1 shadow-sm">
                             <Sparkles className="w-3 h-3" />

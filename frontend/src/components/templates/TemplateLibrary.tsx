@@ -257,7 +257,7 @@ function TemplateCard({
         </span>
 
         {template.description && (
-          <p className="text-xs text-muted-foreground/60 leading-relaxed line-clamp-2 font-bold h-[34px]">
+          <p className="text-xs text-muted-foreground/60 leading-relaxed line-clamp-2 font-medium h-[34px]">
             {template.description}
           </p>
         )}

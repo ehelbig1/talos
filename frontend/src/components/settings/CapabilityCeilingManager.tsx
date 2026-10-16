@@ -168,7 +168,7 @@ export default function CapabilityCeilingManager() {
             <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
               Capability ceiling
             </h3>
-            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+            <p className="text-xs text-muted-foreground/70 font-medium mt-2">
               The most permissive module world you may use
             </p>
           </div>

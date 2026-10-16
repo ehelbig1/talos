@@ -289,7 +289,7 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
             <h3 className="text-base font-semibold text-white tracking-tight">
               {meta.title}
             </h3>
-            <p className="text-xs text-muted-foreground/50 font-bold mt-0.5">
+            <p className="text-xs text-muted-foreground/50 font-medium mt-0.5">
               {briefing.actorName}
             </p>
           </div>
@@ -397,7 +397,7 @@ export default function Briefings() {
           </div>
         ) : isError ? (
           <div className="rounded-2xl border border-destructive/20 bg-destructive/5 p-10 text-center">
-            <p className="text-sm text-destructive font-bold">
+            <p className="text-sm text-destructive font-medium">
               Couldn&apos;t load your results.
             </p>
             <button

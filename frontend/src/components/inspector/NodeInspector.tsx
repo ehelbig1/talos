@@ -29,8 +29,8 @@ import {
 import { useShallow } from "zustand/react/shallow";
 import { cn } from "@/lib/utils";
 import type { WorkflowNodeData } from "@/store/workflowStore";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 import {
-  CapabilityBadge,
   LlmConfigSection,
   RetryPolicySection,
   SystemInternalsSection,
@@ -220,8 +220,11 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
           <div className="flex flex-wrap gap-2.5">
             {node.data.capabilityWorld && (
               <CapabilityBadge
-                capability={node.data.capabilityWorld as string}
-                importedInterfaces={node.data.importedInterfaces as string[]}
+                world={node.data.capabilityWorld as string}
+                size="md"
+                count={
+                  (node.data.importedInterfaces as string[] | undefined)?.length
+                }
               />
             )}
           </div>

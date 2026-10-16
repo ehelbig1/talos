@@ -102,7 +102,7 @@ export function ApprovalQueue() {
             <h3 className="text-xl md:text-2xl font-semibold text-white tracking-tight font-outfit leading-tight">
               Approvals
             </h3>
-            <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+            <p className="text-xs text-muted-foreground/70 font-medium mt-2">
               Runs waiting for a person to approve
             </p>
           </div>
@@ -160,7 +160,7 @@ export function ApprovalQueue() {
               <p className="text-sm text-muted-foreground font-semibold">
                 All Systems Authorized
               </p>
-              <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+              <p className="text-xs text-muted-foreground/60 font-medium mt-2">
                 No manual intervention required at this time.
               </p>
             </div>

@@ -131,7 +131,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
               {lane.actor.name}
             </p>
             {lane.actor.description && (
-              <p className="text-xs text-muted-foreground/70 font-bold truncate mt-1">
+              <p className="text-xs text-muted-foreground/70 font-medium truncate mt-1">
                 {lane.actor.description}
               </p>
             )}
@@ -169,7 +169,7 @@ export function CompareLane({ lane }: { lane: LaneState }) {
         {lane.status === "failed" && lane.errorMessage && (
           <div className="flex items-start gap-3 bg-destructive/10 border border-destructive/20 rounded-2xl px-5 py-4">
             <AlertTriangle className="w-4 h-4 text-destructive shrink-0 mt-0.5" />
-            <p className="text-xs text-destructive/80 font-bold leading-relaxed">
+            <p className="text-xs text-destructive/80 font-medium leading-relaxed">
               {lane.errorMessage}
             </p>
           </div>

@@ -41,7 +41,7 @@ export function KeysTable({
         {isLoading ? (
           <div className="p-10 flex flex-col items-center justify-center gap-4">
             <Spinner className="w-8 h-8 text-primary" />
-            <p className="text-xs text-muted-foreground font-bold">
+            <p className="text-xs text-muted-foreground font-medium">
               Loading Keys...
             </p>
           </div>
@@ -161,11 +161,11 @@ export function KeysTable({
                   <tr>
                     <td colSpan={5} className="px-8 py-12 text-center">
                       <div className="flex flex-col items-center gap-4">
-                        <div className="w-16 h-16 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground/70">
-                          <Terminal size={32} />
+                        <div className="w-14 h-14 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground/70">
+                          <Terminal size={28} />
                         </div>
                         <div className="max-w-xs mx-auto">
-                          <p className="text-sm font-bold text-muted-foreground mb-1">
+                          <p className="text-sm font-medium text-muted-foreground mb-1">
                             No API keys found
                           </p>
                           <p className="text-xs text-muted-foreground max-w-[240px] leading-relaxed">

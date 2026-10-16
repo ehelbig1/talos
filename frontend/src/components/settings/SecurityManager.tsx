@@ -309,8 +309,8 @@ function RotateMasterKeyCard() {
       <div className="relative z-10 space-y-8">
         {/* Title row */}
         <div className="flex items-start gap-6">
-          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 transition-ui">
-            <ShieldAlert size={32} />
+          <div className="w-14 h-14 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive shrink-0 transition-ui">
+            <ShieldAlert size={28} />
           </div>
           <div>
             <div className="flex items-center gap-3 flex-wrap mb-3">
@@ -552,21 +552,16 @@ export default function SecurityManager() {
   return (
     <div className="max-w-6xl mx-auto py-4 space-y-10">
       {/* Page header */}
-      <div className="flex items-center gap-6">
-        <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive relative">
-          <ShieldAlert size={32} className="relative z-10" />
-        </div>
-        <div>
-          <SectionHeader
-            level="h2"
-            className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1 leading-tight"
-          >
-            Encryption keys
-          </SectionHeader>
-          <p className="text-xs text-muted-foreground/70 font-semibold">
-            Key rotation and re-encryption
-          </p>
-        </div>
+      <div>
+        <SectionHeader
+          level="h2"
+          className="text-2xl font-semibold text-white tracking-tight"
+        >
+          Encryption keys
+        </SectionHeader>
+        <p className="text-sm text-muted-foreground mt-2">
+          Key rotation and re-encryption.
+        </p>
       </div>
 
       {/* Global warning banner */}

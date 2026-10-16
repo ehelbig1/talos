@@ -17,7 +17,6 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import { relativeTime } from "@/lib/formatTime";
 import {
   getWorkflowExecutionHistory,
@@ -140,23 +139,6 @@ export const ACTION_ICONS: Record<string, React.ReactNode> = {
 };
 
 // ── Shared primitive components ───────────────────────────────────────────────
-
-export function CapabilityBadge({ world }: { world: string }) {
-  const cfg = getCapabilityConfig(world);
-  return (
-    <span
-      title={cfg.tooltipDetail}
-      className={cn(
-        "inline-flex items-center gap-1 rounded-full border text-xs font-semibold px-2 py-0.5 whitespace-nowrap",
-        cfg.textColor,
-        cfg.bgColor,
-        cfg.borderColor,
-      )}
-    >
-      {cfg.label}
-    </span>
-  );
-}
 
 export function StatCard({
   label,
