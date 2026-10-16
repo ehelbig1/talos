@@ -1,31 +1,25 @@
 import * as React from "react";
+import * as RadixDialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import { DialogWrapper } from "@/components/ui/DialogWrapper";
+import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 
-const FOCUSABLE_SELECTOR =
-  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
-
-/**
- * Simple reusable dialog wrapper used across the UI.
- * It mirrors the styling previously duplicated in several components
- * (CreateSecretDialog, CreateModuleDialog, etc.).
- *
- * Props:
- *   - `open`: control visibility of the dialog.
- *   - `onClose`: callback when the backdrop is clicked or Escape is pressed.
- *   - `title`: optional heading displayed at the top.
- *   - `children`: dialog body.
- */
 export interface DialogProps {
   open: boolean;
+  /** Called when the close button, the backdrop or Escape dismisses the dialog. */
   onClose: () => void;
+  /** The heading. Without one the dialog is still named for assistive technology. */
   title?: string;
+  /** Applied to the panel: use it for the width (`max-w-md`). */
   className?: string;
   children: React.ReactNode;
 }
 
-import { createPortal } from "react-dom";
-
+/**
+ * The one dialog. Radix supplies the portal, the focus trap, the scroll lock,
+ * the Escape and backdrop dismissal and the aria wiring; this file supplies
+ * the one panel every dialog shares.
+ */
 export const Dialog: React.FC<DialogProps> = ({
   open,
   onClose,
@@ -33,102 +27,45 @@ export const Dialog: React.FC<DialogProps> = ({
   className,
   children,
 }) => {
-  const contentRef = React.useRef<HTMLDivElement>(null);
-  const triggerRef = React.useRef<Element | null>(null);
-
-  // Capture the element that had focus before the dialog opened so we can
-  // restore it when the dialog closes.  Also auto-focus the first focusable
-  // element inside the dialog content.
-  React.useEffect(() => {
-    if (open) {
-      triggerRef.current = document.activeElement;
-      // Defer focus until the dialog DOM has painted.
-      const id = requestAnimationFrame(() => {
-        const first =
-          contentRef.current?.querySelector<HTMLElement>(FOCUSABLE_SELECTOR);
-        first?.focus();
-      });
-      return () => cancelAnimationFrame(id);
-    } else if (triggerRef.current instanceof HTMLElement) {
-      triggerRef.current.focus();
-      triggerRef.current = null;
-    }
-  }, [open]);
-
-  const handleKey = React.useCallback(
-    (e: React.KeyboardEvent<HTMLDivElement>) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
-        return;
-      }
-
-      // Focus trap: keep Tab / Shift+Tab within the dialog content.
-      if (e.key === "Tab") {
-        const focusable = Array.from(
-          contentRef.current?.querySelectorAll<HTMLElement>(
-            FOCUSABLE_SELECTOR,
-          ) ?? [],
-        );
-        if (focusable.length === 0) return;
-
-        const first = focusable[0];
-        const last = focusable[focusable.length - 1];
-
-        if (e.shiftKey) {
-          if (document.activeElement === first) {
-            e.preventDefault();
-            last.focus();
-          }
-        } else {
-          if (document.activeElement === last) {
-            e.preventDefault();
-            first.focus();
-          }
-        }
-      }
-    },
-    [onClose],
-  );
-
-  if (!open) return null;
-
-  return createPortal(
-    <div
-      className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-[9999] animate-fade-in"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby={title ? "dialog-title" : undefined}
-      onClick={onClose}
-      onKeyDown={handleKey}
+  return (
+    <RadixDialog.Root
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
     >
-      <div ref={contentRef} className="w-full flex justify-center px-4">
-        <DialogWrapper
-          className={className}
-          onClick={(e: React.MouseEvent) => e.stopPropagation()}
+      <RadixDialog.Portal>
+        <RadixDialog.Overlay className="fixed inset-0 z-[9999] bg-black/60 backdrop-blur-sm animate-fade-in" />
+        <RadixDialog.Content
+          aria-describedby={undefined}
+          className={cn(
+            "fixed left-1/2 top-1/2 z-[9999] w-[calc(100%-2rem)] max-w-3xl max-h-[calc(100vh-2rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto custom-scrollbar rounded-2xl border border-white/10 bg-surface-2 p-6 shadow-2xl outline-none nodrag nopan",
+            className,
+          )}
         >
-          <div className="flex justify-between items-start gap-4 mb-6">
-            {title && (
-              <h2
-                id="dialog-title"
-                className="text-xl font-semibold text-white tracking-tight font-outfit"
-              >
-                {title}
-              </h2>
-            )}
-            <button
-              onClick={onClose}
-              className="ml-auto p-2 bg-white/5 border border-white/10 hover:bg-white/10 rounded-lg transition-ui text-muted-foreground hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30"
-              title="Close"
-              aria-label="Close"
+          <div className="mb-6 flex items-start justify-between gap-4">
+            <RadixDialog.Title
+              className={cn(
+                "text-xl font-semibold text-white tracking-tight font-outfit",
+                !title && "sr-only",
+              )}
             >
-              <X size={18} />
-            </button>
+              {title ?? "Dialog"}
+            </RadixDialog.Title>
+            <RadixDialog.Close asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                aria-label="Close"
+                className="ml-auto -mr-2 -mt-2 h-8 w-8 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </Button>
+            </RadixDialog.Close>
           </div>
           {children}
-        </DialogWrapper>
-      </div>
-    </div>,
-    document.body,
+        </RadixDialog.Content>
+      </RadixDialog.Portal>
+    </RadixDialog.Root>
   );
 };

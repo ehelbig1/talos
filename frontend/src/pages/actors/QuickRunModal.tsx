@@ -1,9 +1,10 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Play, Loader2, ChevronRight } from "lucide-react";
+import { Play, ChevronRight } from "lucide-react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
   getActorWorkflows,
@@ -78,7 +79,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
             <div className="space-y-8">
               {isLoading ? (
                 <div className="flex items-center gap-4 text-muted-foreground/70 text-xs font-semibold py-8">
-                  <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                  <Spinner className="w-5 h-5 text-primary" />
                   Synchronizing Workflows...
                 </div>
               ) : published.length === 0 ? (
@@ -128,7 +129,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
               >
                 {triggerMut.isPending ? (
                   <>
-                    <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                    <Spinner />
                     Starting…
                   </>
                 ) : (

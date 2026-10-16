@@ -3,6 +3,7 @@
  * Extracted from ActorDetail.tsx to enable sub-component files.
  */
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Sparkles,
   Pencil,
@@ -14,7 +15,6 @@ import {
   Activity,
   ChevronDown,
   ChevronUp,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { getCapabilityConfig } from "@/lib/capabilityConfig";
@@ -380,7 +380,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
           <div className="mt-2">
             {loadingOutput ? (
               <div className="flex items-center gap-2 text-muted-foreground/70 text-xs py-2">
-                <Loader2 className="w-3 h-3 animate-spin" />
+                <Spinner className="w-3 h-3" />
                 Loading output…
               </div>
             ) : (

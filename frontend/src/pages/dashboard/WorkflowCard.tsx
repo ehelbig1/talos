@@ -7,9 +7,9 @@ import {
   ArrowRightCircle,
   Trash2,
   Pencil,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import { relativeTime } from "@/lib/formatTime";
 import { getFixSuggestion } from "@/lib/fixSuggestions";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -109,7 +109,7 @@ export default function WorkflowCard({
                 statusColorClass,
               )}
             >
-              {isRunning && <Loader2 className="w-3 h-3 animate-spin" />}
+              {isRunning && <Spinner className="w-3 h-3" />}
               {statusLabel}
             </span>
 

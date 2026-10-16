@@ -1,9 +1,9 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -208,7 +208,7 @@ export default function WorkflowVersionsPanel({
               >
                 {publishMutation.isPending ? (
                   <div className="flex items-center gap-2">
-                    <LoadingSpinner className="w-3.5 h-3.5" />
+                    <Spinner className="w-3.5 h-3.5" />
                     <span>Publishing…</span>
                   </div>
                 ) : (
@@ -224,7 +224,7 @@ export default function WorkflowVersionsPanel({
             <div className="p-8">
               {diffLoading ? (
                 <div className="flex items-center justify-center py-12">
-                  <LoadingSpinner className="w-6 h-6 text-primary" />
+                  <Spinner className="w-6 h-6 text-primary" />
                 </div>
               ) : !diff ? (
                 <p className="text-xs font-semibold text-muted-foreground/60 text-center py-12">
@@ -307,7 +307,7 @@ export default function WorkflowVersionsPanel({
             <div className="p-8">
               {changelogLoading ? (
                 <div className="flex items-center justify-center py-12">
-                  <LoadingSpinner className="w-6 h-6 text-primary" />
+                  <Spinner className="w-6 h-6 text-primary" />
                 </div>
               ) : changelog.length === 0 ? (
                 <div className="text-center py-12 opacity-30">
@@ -349,7 +349,7 @@ export default function WorkflowVersionsPanel({
 
           {activeTab === "versions" && isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
-              <LoadingSpinner className="w-8 h-8 text-primary" />
+              <Spinner className="w-8 h-8 text-primary" />
               <p className="text-xs text-muted-foreground/60 font-semibold">
                 Loading Versions...
               </p>
@@ -542,7 +542,7 @@ export default function WorkflowVersionsPanel({
               >
                 {rollbackMutation.isPending ? (
                   <div className="flex items-center gap-2">
-                    <LoadingSpinner className="w-4 h-4" />
+                    <Spinner className="w-4 h-4" />
                     <span>Rolling back…</span>
                   </div>
                 ) : (

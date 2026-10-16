@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { Dialog } from "@/components/ui/dialog";
+import { LoadingState } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
@@ -166,80 +168,63 @@ function SecretsManager() {
 
       {/* Edit secret value dialog */}
       {secretToEdit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80">
-          <div className="bg-surface-3/60 border border-white/5 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden group">
-            <div className="flex items-center justify-between mb-8 relative z-10">
-              <div className="flex items-center gap-5">
-                <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
-                  <Pencil size={20} />
-                </div>
-                <div>
-                  <h3 className="text-xl font-semibold text-white tracking-tight">
-                    Update Secret
-                  </h3>
-                  <p className="text-xs text-primary font-semibold mt-0.5">
-                    {secretToEdit.name}
-                  </p>
-                </div>
+        <Dialog
+          open
+          onClose={() => {
+            setSecretToEdit(null);
+            setEditValue("");
+          }}
+          title="Update secret"
+          className="max-w-lg"
+        >
+          <p className="text-sm text-primary font-semibold -mt-4 mb-6">
+            {secretToEdit.name}
+          </p>
+
+          <div className="space-y-8 relative z-10">
+            <div className="space-y-3">
+              <label className="text-xs font-medium text-muted-foreground/60 ml-1">
+                New value
+              </label>
+              <div className="relative group/input">
+                <Input
+                  type="password"
+                  autoFocus
+                  value={editValue}
+                  onChange={(e) => setEditValue(e.target.value)}
+                  placeholder="Enter the new secret value"
+                  className="relative"
+                />
               </div>
-              <button
-                type="button"
+            </div>
+
+            <div className="flex gap-4">
+              <Button
+                className="flex-1"
+                disabled={!editValue.trim() || updateSecretMutation.isPending}
+                onClick={() =>
+                  updateSecretMutation.mutate({
+                    input: {
+                      keyPath: secretToEdit.keyPath,
+                      value: editValue,
+                    },
+                  })
+                }
+              >
+                {updateSecretMutation.isPending ? "Saving…" : "Save"}
+              </Button>
+              <Button
+                variant="ghost"
                 onClick={() => {
                   setSecretToEdit(null);
                   setEditValue("");
                 }}
-                aria-label="Cancel"
-                className="p-2.5 hover:bg-white/5 rounded-xl transition-ui text-muted-foreground/70 hover:text-white"
               >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            <div className="space-y-8 relative z-10">
-              <div className="space-y-3">
-                <label className="text-xs font-medium text-muted-foreground/60 ml-1">
-                  New value
-                </label>
-                <div className="relative group/input">
-                  <Input
-                    type="password"
-                    autoFocus
-                    value={editValue}
-                    onChange={(e) => setEditValue(e.target.value)}
-                    placeholder="Enter the new secret value"
-                    className="relative"
-                  />
-                </div>
-              </div>
-
-              <div className="flex gap-4">
-                <Button
-                  className="flex-1"
-                  disabled={!editValue.trim() || updateSecretMutation.isPending}
-                  onClick={() =>
-                    updateSecretMutation.mutate({
-                      input: {
-                        keyPath: secretToEdit.keyPath,
-                        value: editValue,
-                      },
-                    })
-                  }
-                >
-                  {updateSecretMutation.isPending ? "Saving…" : "Save"}
-                </Button>
-                <Button
-                  variant="ghost"
-                  onClick={() => {
-                    setSecretToEdit(null);
-                    setEditValue("");
-                  }}
-                >
-                  Cancel
-                </Button>
-              </div>
+                Cancel
+              </Button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
@@ -266,15 +251,7 @@ function SecretsManager() {
 
       <div className="bg-surface-3/30 border border-white/5 rounded-2xl overflow-hidden min-h-[500px] relative group/registry">
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-48 gap-6">
-            <div className="relative">
-              <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
-              <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
-            </div>
-            <p className="text-xs text-primary/60 font-semibold">
-              Deciphering Registry...
-            </p>
-          </div>
+          <LoadingState label="Loading secrets…" />
         ) : error ? (
           <div className="p-12 text-center text-destructive bg-destructive/5 flex flex-col items-center gap-4">
             <AlertTriangle className="w-8 h-8" />

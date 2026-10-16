@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { Star } from "lucide-react";
@@ -169,10 +170,10 @@ export function TemplateLibrary({
           </div>
           <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-6">
             {isLoading && (
-              <div className="col-span-full py-20 flex flex-col items-center gap-4 opacity-20">
-                <div className="w-10 h-10 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-                <p className="text-xs font-semibold">Accessing Registry...</p>
-              </div>
+              <LoadingState
+                label="Loading templates…"
+                className="col-span-full"
+              />
             )}
             {!!error && (
               <div className="p-8 bg-destructive/10 border border-destructive/20 rounded-2xl text-destructive text-xs font-semibold col-span-full text-center">

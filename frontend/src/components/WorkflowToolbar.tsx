@@ -19,12 +19,13 @@ import React, {
   Suspense,
 } from "react";
 import { ConfirmDialog, Dialog, Button, Input } from "@/components/ui";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { useShallow } from "zustand/react/shallow";
 import {
   usePersistedExecutionStore,
   type PersistedSlice,
 } from "@/store/executionStore";
-import { LoadingSpinner } from "./LoadingSpinner";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useUIStore } from "@/store/uiStore";
 import { useQueryClient } from "@tanstack/react-query";
@@ -393,7 +394,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               className="h-12 px-10"
             >
               {publishVersionMutation.isPending ? (
-                <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                <Spinner className="w-4 h-4 mr-2" />
               ) : (
                 <Tag className="w-4 h-4 mr-2" />
               )}
@@ -480,7 +481,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
 
       {/* Dialog Rendering */}
       {modal.kind === "create" && (
-        <Suspense fallback={<LoadingSpinner />}>
+        <Suspense fallback={<LoadingState />}>
           <CreateModuleDialog
             onModuleCreated={handleModuleCreated}
             onClose={closeModal}
@@ -489,7 +490,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       )}
 
       {modal.kind === "addExisting" && (
-        <Suspense fallback={<LoadingSpinner />}>
+        <Suspense fallback={<LoadingState />}>
           <AddExistingNodeDialog
             onNodeAdded={handleExistingNodeAdded}
             onClose={closeModal}
@@ -498,7 +499,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
       )}
 
       {modal.kind === "test" && workflowId && (
-        <Suspense fallback={<LoadingSpinner />}>
+        <Suspense fallback={<LoadingState />}>
           <TestWorkflowModal
             workflowId={workflowId}
             workflowName={workflowName}

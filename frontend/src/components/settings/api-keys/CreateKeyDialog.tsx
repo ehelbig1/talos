@@ -5,9 +5,9 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { Input } from "@/components/ui/input";
 import { Plus, Calendar, X, Key, Fingerprint } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -207,7 +207,7 @@ export function CreateKeyDialog({
           >
             {isPending ? (
               <div className="flex items-center gap-2">
-                <LoadingSpinner className="w-4 h-4" />
+                <Spinner className="w-4 h-4" />
                 <span>Processing...</span>
               </div>
             ) : (

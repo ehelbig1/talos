@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
@@ -8,7 +9,6 @@ import {
   Plus,
   X,
   ChevronDown,
-  Loader2,
   CheckCircle2,
   AlertTriangle,
   ArrowUpRight,
@@ -342,7 +342,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           >
             {isProvisioning ? (
               <>
-                <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
+                <Spinner className="w-3.5 h-3.5 mr-2" />
                 Setting up…
               </>
             ) : (

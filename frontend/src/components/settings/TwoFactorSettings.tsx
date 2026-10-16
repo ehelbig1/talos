@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { Input } from "@/components/ui/input";
 import {
   ShieldCheck,
@@ -228,7 +228,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
               disabled={setupMutation.isPending}
             >
               {setupMutation.isPending ? (
-                <LoadingSpinner />
+                <Spinner />
               ) : (
                 <>
                   Set up two-factor authentication
@@ -369,7 +369,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                     }
                   }}
                 >
-                  {enableMutation.isPending ? <LoadingSpinner /> : "Turn on"}
+                  {enableMutation.isPending ? <Spinner /> : "Turn on"}
                 </Button>
               </div>
             </div>

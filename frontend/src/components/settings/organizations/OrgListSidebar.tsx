@@ -1,5 +1,5 @@
 import React from "react";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
+import { LoadingState } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 import type { Org } from "./graphql";
 
@@ -22,7 +22,7 @@ export function OrgListSidebar({
       </div>
       {isLoading ? (
         <div className="py-12 flex justify-center bg-white/[0.02] border border-white/5 rounded-2xl">
-          <LoadingSpinner />
+          <LoadingState />
         </div>
       ) : organizations?.length === 0 ? (
         <div className="p-10 border border-dashed border-white/5 rounded-2xl text-center bg-white/[0.01]">

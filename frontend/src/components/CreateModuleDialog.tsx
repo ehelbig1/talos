@@ -1,4 +1,5 @@
 import { toast } from "sonner";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -16,7 +17,6 @@ import {
   Sparkles,
   Filter,
   Check,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -210,7 +210,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           <div className="max-h-[480px] overflow-y-auto pr-2 custom-scrollbar">
             {templatesLoading ? (
               <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-                <Loader2 className="w-10 h-10 animate-spin text-primary" />
+                <Spinner className="w-10 h-10 text-primary" />
                 <p className="text-xs font-semibold">Loading…</p>
               </div>
             ) : filteredTemplates.length === 0 ? (
@@ -416,7 +416,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           >
             {creating ? (
               <div className="flex items-center gap-3">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Spinner className="w-4 h-4" />
                 <span>Creating…</span>
               </div>
             ) : (

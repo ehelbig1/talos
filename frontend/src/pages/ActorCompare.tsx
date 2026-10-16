@@ -1,10 +1,11 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useNavigate, useSearchParams } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { listActors, type ActorSummary } from "@/lib/graphqlApi";
 import { useListWorkflowNamesQuery } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
-import { Play, RefreshCw, Loader2, GitCompare } from "lucide-react";
+import { Play, RefreshCw, GitCompare } from "lucide-react";
 import type { WorkflowOption } from "./actor-compare/types";
 import { CompareLane } from "./actor-compare/CompareLane";
 import { useCompareRun } from "./actor-compare/useCompareRun";
@@ -78,7 +79,7 @@ export default function ActorCompare() {
               )}
               <Button onClick={handleRun} disabled={!canRun}>
                 {running ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Spinner className="w-4 h-4" />
                 ) : (
                   <Play className="w-4 h-4" />
                 )}

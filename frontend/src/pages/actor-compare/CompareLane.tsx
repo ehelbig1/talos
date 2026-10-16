@@ -6,15 +6,9 @@
  */
 
 import React, { useState, useEffect, useRef } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import {
-  CheckCircle2,
-  XCircle,
-  Clock,
-  Loader2,
-  Bot,
-  AlertTriangle,
-} from "lucide-react";
+import { CheckCircle2, XCircle, Clock, Bot, AlertTriangle } from "lucide-react";
 import type { ExecStatus, LaneState } from "./types";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -33,7 +27,7 @@ export function StatusBadge({ status }: { status: ExecStatus }) {
     triggering: {
       label: "Starting…",
       className: "text-primary bg-primary/10",
-      icon: <Loader2 className="w-3 h-3 animate-spin" />,
+      icon: <Spinner className="w-3 h-3" />,
       glow: "",
     },
     queued: {
@@ -45,7 +39,7 @@ export function StatusBadge({ status }: { status: ExecStatus }) {
     running: {
       label: "Running",
       className: "text-primary bg-primary/10",
-      icon: <Loader2 className="w-3 h-3 animate-spin" />,
+      icon: <Spinner className="w-3 h-3" />,
       glow: "",
     },
     completed: {

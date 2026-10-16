@@ -1,8 +1,8 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { ArrowRightLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import type { Role } from "./graphql";
 
 export interface RoleChangeTarget {
@@ -72,7 +72,7 @@ export function RoleChangeDialog({
             disabled={isPending}
             onClick={onConfirm}
           >
-            {isPending ? <LoadingSpinner /> : "Change role"}
+            {isPending ? <Spinner /> : "Change role"}
           </Button>
         </div>
       </div>

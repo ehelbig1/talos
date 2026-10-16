@@ -1,4 +1,5 @@
 import React, { memo, useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { ErrorBanner, Dialog, Button } from "@/components/ui";
 import { ModuleItem } from "@/components/dialogs/ModuleItem";
@@ -94,10 +95,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
 
         <div className="min-h-[300px] flex flex-col">
           {loading ? (
-            <div className="flex-1 flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-              <div className="w-10 h-10 border-4 border-primary/10 border-t-primary rounded-full animate-spin" />
-              <p className="text-xs font-semibold">Loading…</p>
-            </div>
+            <LoadingState className="flex-1" />
           ) : error ? (
             <div>
               <ErrorBanner message={error} />

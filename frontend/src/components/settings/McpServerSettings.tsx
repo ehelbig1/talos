@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -38,7 +39,6 @@ import {
   Trash2,
   Calendar,
   Clock,
-  Loader2,
 } from "lucide-react";
 
 const AVAILABLE_ROLES = [
@@ -242,7 +242,7 @@ export default function McpServerSettings() {
               >
                 {creating ? (
                   <div className="flex items-center gap-3">
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                     <span>Creating…</span>
                   </div>
                 ) : (
@@ -371,7 +371,7 @@ export default function McpServerSettings() {
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {loading ? (
                 <div className="col-span-full py-24 flex flex-col items-center justify-center gap-4">
-                  <Loader2 className="w-8 h-8 text-primary animate-spin" />
+                  <Spinner className="w-8 h-8 text-primary" />
                   <p className="text-xs text-muted-foreground/70 font-semibold">
                     Loading…
                   </p>
@@ -412,7 +412,7 @@ export default function McpServerSettings() {
                         disabled={revokingId === agent.id}
                       >
                         {revokingId === agent.id ? (
-                          <Loader2 size={14} className="animate-spin" />
+                          <Spinner size={14} />
                         ) : (
                           <Trash2 size={14} />
                         )}

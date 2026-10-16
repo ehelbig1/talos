@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useQuery } from "@tanstack/react-query";
 import { getCsrfToken } from "@/lib/csrf";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -7,7 +8,6 @@ import {
   AlertTriangle,
   Check,
   CheckCircle,
-  Loader2,
   Shield,
   ArrowRight,
   Globe,
@@ -157,7 +157,7 @@ export function GoogleCalendarSelector({
   if (loading) {
     return (
       <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4">
-        <Loader2 className="h-5 w-5 animate-spin text-primary" />
+        <Spinner className="h-5 w-5 text-primary" />
         <p className="m-0 text-xs font-semibold text-muted-foreground/70">
           Loading Google accounts…
         </p>
@@ -292,7 +292,7 @@ export function GoogleCalendarSelector({
               </div>
               {loadingCalendars ? (
                 <div className="p-10 flex flex-col items-center justify-center gap-4 bg-surface-3 border border-white/5 rounded-2xl">
-                  <Loader2 className="h-8 w-8 animate-spin text-primary" />
+                  <Spinner className="h-8 w-8 text-primary" />
                   <p className="text-xs font-medium text-muted-foreground/50">
                     Loading calendars…
                   </p>

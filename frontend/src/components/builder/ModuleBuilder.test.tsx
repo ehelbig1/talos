@@ -39,7 +39,7 @@ describe("ModuleBuilder", () => {
       />,
     );
 
-    const closeButton = screen.getByTitle(/close/i);
+    const closeButton = screen.getByRole("button", { name: "Close" });
     fireEvent.click(closeButton);
     expect(mockOnClose).toHaveBeenCalled();
   });

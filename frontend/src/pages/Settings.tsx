@@ -1,4 +1,5 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import ErrorBoundary from "@/components/ErrorBoundary";
@@ -278,18 +279,7 @@ function SettingsSidebar({
 // ─── Panel loading fallback ───────────────────────────────────────────────────
 
 function PanelLoading() {
-  return (
-    <div
-      className="flex flex-col items-center justify-center py-24 gap-4"
-      data-panel-loading
-    >
-      <div className="w-12 h-12 rounded-2xl bg-surface-4/60 border border-white/5 flex items-center justify-center relative overflow-hidden">
-        <div className="absolute inset-0 bg-primary/10" />
-        <div className="w-6 h-6 border-2 border-primary/20 border-t-primary rounded-full animate-spin relative z-10" />
-      </div>
-      <span className="text-sm text-muted-foreground">Loading…</span>
-    </div>
-  );
+  return <LoadingState data-panel-loading />;
 }
 
 // ─── Main Settings page ───────────────────────────────────────────────────────

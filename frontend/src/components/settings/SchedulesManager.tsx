@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
@@ -411,7 +413,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               )}
             >
               {toggleMutation.isPending ? (
-                <div className="w-4 h-4 border-2 border-warning/20 border-t-warning rounded-full animate-spin" />
+                <Spinner className="text-warning" />
               ) : schedule.isEnabled ? (
                 <ToggleRight size={22} />
               ) : (
@@ -544,12 +546,7 @@ export default function SchedulesManager() {
 
       {/* Content */}
       {schedulesLoading ? (
-        <div className="flex flex-col items-center justify-center py-32 gap-6">
-          <div className="w-16 h-16 border-4 border-warning/10 border-t-warning rounded-full animate-spin" />
-          <p className="text-xs text-muted-foreground/70 font-semibold">
-            Synchronizing Time-Stream...
-          </p>
-        </div>
+        <LoadingState label="Loading schedules…" />
       ) : schedules.length === 0 ? (
         <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-24 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
           <div className="w-24 h-24 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">

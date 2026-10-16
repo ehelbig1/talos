@@ -1,4 +1,5 @@
 import React, { Suspense, lazy } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import {
   createBrowserRouter,
   Routes,
@@ -17,7 +18,6 @@ import { useGetApprovalsQuery } from "@/generated/graphql";
 import { NavAlertBadge } from "@/components/NavAlertBadge";
 import {
   Zap,
-  Loader2,
   Workflow,
   Newspaper,
   Bot,
@@ -78,7 +78,7 @@ function LoadingScreen() {
           <Zap size={28} className="text-primary" fill="currentColor" />
         </div>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="w-4 h-4 animate-spin" />
+          <Spinner className="w-4 h-4" />
           Loading…
         </div>
       </div>

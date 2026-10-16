@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -10,7 +12,6 @@ import {
   Bug,
   ExternalLink,
   Webhook,
-  Loader2,
   Database,
   Search,
   Shield,
@@ -197,17 +198,7 @@ export function DLQViewer() {
   const isLoading = activeTab === "nodes" ? nodeLoading : webhookLoading;
 
   if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center py-48 gap-6">
-        <div className="relative">
-          <div className="w-16 h-16 border-2 border-destructive/10 rounded-full" />
-          <div className="w-16 h-16 border-t-2 border-destructive rounded-full animate-spin absolute inset-0" />
-        </div>
-        <p className="text-xs text-destructive/60 font-semibold">
-          Scanning Fault Registry...
-        </p>
-      </div>
-    );
+    return <LoadingState label="Loading failed deliveries…" />;
   }
 
   return (
@@ -384,7 +375,7 @@ export function DLQViewer() {
                     disabled={isReplayingNode}
                   >
                     {isReplayingNode ? (
-                      <Loader2 size={14} className="animate-spin" />
+                      <Spinner size={14} />
                     ) : (
                       <RotateCcw size={14} />
                     )}
@@ -466,7 +457,7 @@ export function DLQViewer() {
                   disabled={isReplayingWebhook}
                 >
                   {isReplayingWebhook ? (
-                    <Loader2 size={14} className="animate-spin" />
+                    <Spinner size={14} />
                   ) : (
                     <RotateCcw size={14} />
                   )}
