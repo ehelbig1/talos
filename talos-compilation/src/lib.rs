@@ -261,12 +261,16 @@ mod advisory_db_age_tests {
     /// must not double-fault.
     #[test]
     fn nonexistent_db_returns_ok() {
+        // The gate reads TALOS_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
         let result = check_advisory_db_age("/does/not/exist/advisory-db");
         assert!(result.is_ok(), "missing DB should not error here");
     }
 
     #[test]
     fn fresh_db_passes() {
+        // The gate reads TALOS_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
         let tmp = tempfile::tempdir().expect("create tempdir");
         check_advisory_db_age(tmp.path().to_str().unwrap()).expect("fresh dir should pass");
     }
@@ -309,6 +313,8 @@ mod advisory_db_age_tests {
 
     #[test]
     fn expired_db_is_refused_in_production_and_passes_elsewhere() {
+        // The gate reads TALOS_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
         let tmp = tempfile::tempdir().expect("create tempdir");
         if !backdate_dir(tmp.path(), 400) {
             // Loud skip, not a silent pass: the platform would not honour a
@@ -380,6 +386,8 @@ mod advisory_db_age_tests {
     /// and this binary is not production, so the gate warns and passes.
     #[test]
     fn expired_db_outside_production_passes() {
+        // The gate reads TALOS_ADVISORY_DB_MAX_AGE_DAYS; a sibling test sets it.
+        let _g = crate::container::env_lock();
         assert!(
             !talos_config::is_production(),
             "this test binary must not run as production"
