@@ -291,6 +291,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(sub) = args.get(1) {
         match sub.as_str() {
             "publish-templates" => return run_publish_templates_cli(&args[2..]).await,
+            "audit-module-worlds" => return run_audit_module_worlds_cli(&args[2..]).await,
             "plaid-link" => return run_plaid_link_cli(&args[2..]).await,
             "admin-query-login" => return run_admin_query_login_cli(&args[2..]).await,
             "generate-worker-trust-keypair" => {
@@ -317,6 +318,16 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("                                        for `oras push`. See");
                 println!("                                        .github/workflows/template-publish.yml");
+                println!(
+                    "  controller audit-module-worlds        Judge every installed module binary"
+                );
+                println!(
+                    "                                        by this build's dispatch rule; exit 1"
+                );
+                println!(
+                    "                                        on a row a dispatch would refuse."
+                );
+                println!("                                        Run by `make up` before the stack starts.");
                 println!("  controller admin-query-login provision | disable");
                 println!(
                     "                                        query_paginated's own DB login; see"

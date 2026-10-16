@@ -805,6 +805,20 @@ pub struct ModuleHistoryRow {
 }
 
 /// Module shared with an organization.
+/// One `modules` row that holds compiled bytes, as the deploy gate reads it
+/// (2026-10-16, `talos-module-world-audit`): the world a dispatch would hint
+/// and the bytes the worker would inspect. `kind` and `owner` are for the
+/// report only.
+#[derive(Debug, Clone)]
+pub struct ModuleBinaryRow {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub owner: Option<Uuid>,
+    pub capability_world: String,
+    pub wasm_bytes: Vec<u8>,
+}
+
 #[derive(Debug)]
 pub struct OrgModuleRow {
     pub id: Uuid,
@@ -4049,6 +4063,58 @@ impl ModuleRepository {
                 ))
             })
             .collect()
+    }
+
+    /// One page of the rows that hold compiled bytes, in id order, after
+    /// `after` (2026-10-16). Keyset, not OFFSET: a page carries up to `limit`
+    /// binaries (the fleet's sandbox rows run to a few MB each), so the
+    /// caller walks pages and never holds every binary at once. Evicted rows
+    /// (`wasm_bytes IS NULL`) and registry references (`oci_url`, no bytes)
+    /// are not here: the worker inspects the former after a refetch and the
+    /// latter after a pull, neither of which this read can do.
+    pub async fn list_module_binaries_after(
+        &self,
+        after: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<ModuleBinaryRow>> {
+        let rows = sqlx::query(
+            "SELECT id, name, kind, user_id, capability_world, wasm_bytes \
+             FROM modules \
+             WHERE wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0 \
+               AND ($1::uuid IS NULL OR id > $1) \
+             ORDER BY id \
+             LIMIT $2",
+        )
+        .bind(after)
+        .bind(limit.clamp(1, 1_000))
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<ModuleBinaryRow> {
+                Ok(ModuleBinaryRow {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    kind: r.try_get("kind")?,
+                    owner: r.try_get::<Option<Uuid>, _>("user_id")?,
+                    capability_world: r.try_get("capability_world")?,
+                    wasm_bytes: r.try_get("wasm_bytes")?,
+                })
+            })
+            .collect()
+    }
+
+    /// How many runnable rows the deploy gate cannot inspect: registry
+    /// references (an `oci_url`, no bytes). Reported beside the audited
+    /// count so a clean report says what it did not cover.
+    pub async fn count_registry_reference_modules(&self) -> Result<i64> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) AS n FROM modules \
+             WHERE oci_url IS NOT NULL \
+               AND (wasm_bytes IS NULL OR octet_length(wasm_bytes) = 0)",
+        )
+        .fetch_one(&self.db_pool)
+        .await?;
+        Ok(row.try_get("n")?)
     }
 
     /// Phase 5: reconciliation sweep is now a no-op. The legacy tables it

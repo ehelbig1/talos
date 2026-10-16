@@ -45,7 +45,7 @@ CONTROLLER_URL     ?= http://localhost:8000
 export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null || echo unknown)
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
-.PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
+.PHONY: help setup up down rebuild restart logs ps shell doctor quickstart audit-module-worlds _audit-module-worlds-gate \
         check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-db test-db-stop test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
         check-lockfile check-changelog-fragments clippy test-unit test-dbfree test-doc test-benches test-scripts \
         check-frontend-codegen typecheck-frontend test-frontend audit-frontend \
@@ -120,6 +120,17 @@ up: ## Build + start the full dev stack, wait for health
 	    printf '\033[1;33m  Every layer was cached, so this deploy ships the SAME code you were already running.\033[0m\n'; \
 	    printf '\033[1;33m  If you expected a change: docker builder prune -f --filter type=exec.cachemount\033[0m\n'; \
 	 fi
+	@# ── module-world gate (2026-10-16) ─────────────────────────────────────
+	@# The 02:05 UTC 2026-10-16 deploy changed how the worker names a binary's
+	@# world, and every agent-node module that imports only agent-memory was
+	@# refused at dispatch for the next twenty hours. The rule lived in the
+	@# worker and the rows in Postgres; nothing asked one about the other.
+	@# This does, from the image just built, before it takes a job: migrations
+	@# are applied first (the audit reads the schema this build expects), then
+	@# `controller audit-module-worlds` walks every installed binary. A finding
+	@# stops the deploy here — the running stack, if any, keeps running the
+	@# old images. TALOS_UP_SKIP_WORLD_AUDIT=1 skips it, loudly.
+	@$(MAKE) --no-print-directory _audit-module-worlds-gate
 	@printf '\033[1;36m→ controller/worker must roll TOGETHER: signed wire formats are version-coupled\033[0m\n'
 	@if grep -Eq '^NGROK_AUTHTOKEN=.+' .env 2>/dev/null; then \
 	    printf '\033[1;36m→ NGROK_AUTHTOKEN present — starting public tunnel (compose profile: public)\033[0m\n'; \
@@ -667,6 +678,23 @@ nuke: ## DESTRUCTIVE — wipe containers, volumes, images, host target/. Require
 	@rm -rf frontend/node_modules/.vite frontend/node_modules/.cache frontend/dist
 
 # Internal: poll /health until controller responds or 60s elapses.
+audit-module-worlds: ## Judge every installed module binary by the BUILT controller image's dispatch rule (read-only; exit 1 on a row a dispatch would refuse)
+	@docker compose run --rm --no-deps -T controller /app/controller audit-module-worlds
+
+_audit-module-worlds-gate:
+	@if [ "$${TALOS_UP_SKIP_WORLD_AUDIT:-}" = "1" ]; then \
+	    printf '\033[1;33m⚠ TALOS_UP_SKIP_WORLD_AUDIT=1 — installed modules were NOT audited against this build; a world-rule change can refuse them at dispatch.\033[0m\n'; \
+	    exit 0; \
+	fi; \
+	printf '\033[1;36m→ auditing installed modules against this build (controller audit-module-worlds)\033[0m\n'; \
+	docker compose run --rm -T migrate >/dev/null || { printf '\033[1;31m✗ migrations did not apply — the audit cannot run against this schema\033[0m\n'; exit 1; }; \
+	if ! docker compose run --rm --no-deps -T controller /app/controller audit-module-worlds; then \
+	    printf '\033[1;31m✗ this build would refuse installed modules at dispatch — the stack was NOT (re)started.\033[0m\n'; \
+	    printf '\033[1;31m  Fix the rows named above (recompile at a fitting world, or re-record the world), then `make up` again.\033[0m\n'; \
+	    printf '\033[2m  override (you accept the refusals): TALOS_UP_SKIP_WORLD_AUDIT=1 make up\033[0m\n'; \
+	    exit 1; \
+	fi
+
 _wait-healthy:
 	@for i in $$(seq 1 30); do \
 	    if curl -sf http://localhost:8000/health >/dev/null 2>&1; then exit 0; fi; \

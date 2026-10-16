@@ -388,6 +388,41 @@ pub fn link_world(
     }
 }
 
+/// What a dispatch of a stored binary at its recorded world would do
+/// (2026-10-16). Asked of a `modules` row BEFORE a worker that would make
+/// the decision is started: the deploy gate (`controller audit-module-worlds`)
+/// walks every row that holds bytes and refuses the deploy on a row a
+/// dispatch would refuse. One decision, not a mirror of one: the fit is
+/// [`link_world`] itself, on the same inspection the worker makes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldFit {
+    /// The worker links the binary at this world.
+    Links(CapabilityWorld),
+    /// The row's world string names no world. The worker refuses a job whose
+    /// hint it cannot parse (`job_world_hint`), so every dispatch of this row
+    /// fails before inspection.
+    UnrecognisedWorld(String),
+    /// The worker refuses the binary at the row's world, with
+    /// [`link_world`]'s own reason, which names the imports outside it.
+    Refused(String),
+}
+
+/// The verdict a dispatch of `wasm_bytes` with the hint `declared` reaches.
+/// `declared` is the row's `capability_world` as stored, in either spelling.
+pub fn world_fit_at_dispatch(declared: &str, wasm_bytes: &[u8]) -> WorldFit {
+    let world = declared
+        .parse::<CapabilityWorld>()
+        .unwrap_or(CapabilityWorld::Unknown);
+    if world == CapabilityWorld::Unknown {
+        return WorldFit::UnrecognisedWorld(declared.to_string());
+    }
+    let inspection = inspect_component(wasm_bytes);
+    match link_world(Some(&world), &inspection) {
+        Ok(linked) => WorldFit::Links(linked),
+        Err(reason) => WorldFit::Refused(reason),
+    }
+}
+
 // ============================================================================
 // Private helpers
 // ============================================================================
@@ -965,6 +1000,55 @@ mod tests {
         let inspection = inspect_component(&bytes);
         assert_eq!(inspection.capability_world, CapabilityWorld::Database);
         assert!(link_world(Some(&CapabilityWorld::Agent), &inspection).is_ok());
+    }
+
+    /// The deploy gate's verdict is the dispatch's: a memory-only binary
+    /// links at `agent-node` (either spelling), is refused at `minimal-node`
+    /// with the import named, and a row whose world string names no world
+    /// is a refusal of its own kind.
+    #[test]
+    fn the_dispatch_fit_of_a_stored_row_is_the_link_decision() {
+        let bytes = wat::parse_str(
+            r#"(component
+                 (import "talos:core/agent-memory" (instance))
+                 (core module (memory 1)))"#,
+        )
+        .expect("component");
+        assert_eq!(
+            world_fit_at_dispatch("agent-node", &bytes),
+            WorldFit::Links(CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            world_fit_at_dispatch("agent", &bytes),
+            WorldFit::Links(CapabilityWorld::Agent)
+        );
+        assert_eq!(
+            world_fit_at_dispatch("database-node", &bytes),
+            WorldFit::Links(CapabilityWorld::Database)
+        );
+        match world_fit_at_dispatch("minimal-node", &bytes) {
+            WorldFit::Refused(reason) => {
+                assert!(reason.contains("talos:core/agent-memory"), "{reason}");
+                assert!(reason.contains("declared=minimal"), "{reason}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert_eq!(
+            world_fit_at_dispatch("llm-node", &bytes),
+            WorldFit::UnrecognisedWorld("llm-node".into())
+        );
+        assert_eq!(
+            world_fit_at_dispatch("", &bytes),
+            WorldFit::UnrecognisedWorld(String::new())
+        );
+        // Bytes that inspect to nothing (no imports, no sentinel) link at
+        // the hint, as the worker does: the hint's linker admits nothing
+        // wider, so there is nothing for the gate to refuse.
+        let empty = wat::parse_str("(component)").expect("component");
+        assert_eq!(
+            world_fit_at_dispatch("http-node", &empty),
+            WorldFit::Links(CapabilityWorld::Http)
+        );
     }
 
     /// The import tables are the WIT file's, world by world. Parsed from

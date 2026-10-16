@@ -1,0 +1,24 @@
+[package]
+name = "talos-module-world-audit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The deploy gate's audit (2026-10-16): every `modules` row that holds bytes,
+# judged by the decision the worker makes at dispatch (`link_world`, through
+# `talos_wit_inspector::world_fit_at_dispatch`). Run by `controller
+# audit-module-worlds` from the CANDIDATE image before `make up` starts it,
+# so a worker whose world rule changed refuses nothing that is installed.
+[dependencies]
+anyhow.workspace = true
+talos-module-repository = { path = "../talos-module-repository" }
+talos-wit-inspector = { path = "../talos-wit-inspector" }
+uuid.workspace = true
+
+[dev-dependencies]
+wat.workspace = true
+
+[lints]
+workspace = true

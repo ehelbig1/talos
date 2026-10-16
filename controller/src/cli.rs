@@ -803,3 +803,32 @@ pub(crate) async fn run_admin_query_login_cli(args: &[String]) -> anyhow::Result
         _ => anyhow::bail!("{usage}"),
     }
 }
+
+// ---------- audit-module-worlds (deploy gate, 2026-10-16) -------------------
+//
+// Every `modules` row that holds bytes, judged by the dispatch decision the
+// worker in THIS image would make (`talos_wit_inspector::world_fit_at_dispatch`
+// through `talos_module_world_audit`). `make up` runs it from the candidate
+// controller image after the build and before the stack is started, so a
+// change to the world rule that would refuse an installed module stops the
+// deploy with the rows named instead of failing their next runs. Read-only;
+// exits non-zero on any finding.
+pub(crate) async fn run_audit_module_worlds_cli(args: &[String]) -> anyhow::Result<()> {
+    if let Some(other) = args.first() {
+        anyhow::bail!("unknown audit-module-worlds flag: {other}");
+    }
+    let pool = crate::db::init_pool().await?;
+    let repo = talos_module_repository::ModuleRepository::new(pool);
+    let report = talos_module_world_audit::audit_installed_modules(&repo).await?;
+    print!("{}", report.render());
+    if report.is_clean() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{} installed module(s) would be refused at dispatch by this build; \
+             fix each row (recompile it at a world its imports fit, or re-record its world) \
+             before deploying",
+            report.findings.len()
+        )
+    }
+}
