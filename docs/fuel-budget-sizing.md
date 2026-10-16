@@ -314,6 +314,10 @@ its configured maximum output alone puts the requirement near 4M before the
    made cheaper or split. `update_node_config` and `add_node_to_workflow` say
    the same when the value is written (`max_fuel_note`), and a fuel-exhausted
    failure at the ceiling no longer calls the limit configurable.
-7. After it has run, check `get_fuel_usage_report` →
-   `high_utilisation_nodes`. Step 6 is a floor and cannot tell you whether the
-   number holds against real inputs.
+7. After it has run, `validate_workflow` says so itself: a `fuel-headroom`
+   warning names a node whose hungriest completed run in the last 30 days
+   used more than 80% of its limit (`get_fuel_usage_report` →
+   `high_utilisation_nodes` is the same line, over the fleet). Step 6 is a
+   floor and cannot tell you whether the number holds against real inputs; a
+   run the fuel meter killed completed nothing and is the `failure-history`
+   warning's to report.

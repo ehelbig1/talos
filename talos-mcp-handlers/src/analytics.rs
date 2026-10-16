@@ -2061,9 +2061,9 @@ impl FleetValidationTally {
 ///
 /// # How this stays out of the N+1
 ///
-/// Five batched loads, ONE round trip each, regardless of workflow count:
+/// Six batched loads, ONE round trip each, regardless of workflow count:
 /// module existence, template rows, installed secret grants, actor bindings,
-/// and execution history (`node_run_history_batch`'s `LATERAL`, which keeps
+/// per-node fuel history, and execution history (`node_run_history_batch`'s `LATERAL`, which keeps
 /// the per-workflow `LIMIT` that a flat `ANY($1)` would collapse). Then a
 /// pure, I/O-free `validate_prepared` per workflow.
 async fn handle_validate_all_workflows(
@@ -2112,12 +2112,12 @@ async fn handle_validate_all_workflows(
             .collect()
     };
 
-    // ── The five batched loads ────────────────────────────────────────────
+    // ── The six batched loads ────────────────────────────────────────────
     // Each is ONE query for the WHOLE fleet. This is the constraint that
     // made the inline duplicate exist; it is met here rather than worked
     // around. `tokio::join!` so they overlap on the wire too.
     let window_days = talos_workflow_validation::history_window_days();
-    let (existing, templates, installed_secrets, bound_actors, history) = tokio::join!(
+    let (existing, templates, installed_secrets, bound_actors, history, fuel_history) = tokio::join!(
         state.workflow_repo.modules_exist(&all_module_ids),
         state.workflow_repo.get_templates_by_ids(&all_module_ids),
         state
@@ -2132,6 +2132,9 @@ async fn handle_validate_all_workflows(
             window_days,
             HISTORY_MAX_EXECUTIONS,
         ),
+        state
+            .workflow_repo
+            .node_fuel_history_batch(&workflow_ids, user_id, window_days),
     );
 
     let existing_modules: std::collections::HashSet<uuid::Uuid> =
@@ -2160,6 +2163,20 @@ async fn handle_validate_all_workflows(
             Err(e.to_string())
         }
     };
+
+    // The same shape for the per-node fuel history: a failed batch read is
+    // carried as `Err` into every workflow, where the `fuel-headroom` check
+    // logs it and does not run, never as "every node has headroom".
+    let fuel_history = fuel_history.map_err(|e| {
+        tracing::error!(
+            target: "talos_validation",
+            error = %e,
+            event_kind = "fleet_validation_fuel_history_read_failed",
+            "validate_all_workflows: batched fuel-history read failed — the fuel-headroom \
+             check did not run for ANY workflow"
+        );
+        e.to_string()
+    });
 
     let mut tally = FleetValidationTally::default();
 
@@ -2226,6 +2243,12 @@ async fn handle_validate_all_workflows(
                 installed_secrets: installed,
                 has_actor: bound_actors.contains(&wf_row.id),
                 history: wf_history,
+                // An id absent from a successful batch has no completed run
+                // in the window: an empty history, not a failed read.
+                fuel_history: fuel_history
+                    .as_ref()
+                    .map(|map| map.get(&wf_row.id).cloned().unwrap_or_default())
+                    .map_err(Clone::clone),
             },
             &fleet_graphs,
         );

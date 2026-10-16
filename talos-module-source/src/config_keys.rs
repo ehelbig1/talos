@@ -31,7 +31,8 @@ pub struct KeysRead {
     pub keys: BTreeSet<String>,
 }
 
-fn is_key(s: &str) -> bool {
+/// Whether `s` is spelt as a config key: `UPPER_CASE`, digits and `_`, starting with a letter.
+pub fn is_key(s: &str) -> bool {
     s.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
         && s.bytes()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_')
@@ -148,6 +149,30 @@ pub fn keys_read(source: &str) -> KeysRead {
 /// What is wrong with one module's `config_schema`, if anything: a sentence
 /// per problem, for a person.
 #[must_use]
+/// The config keys a module refuses to run without: each `KEY` of a string
+/// literal `Missing KEY config` in the body, the wording `ok_or("Missing KEY
+/// config")` that every template and lane module uses. A key read on one
+/// branch only (`match mode { "grant" => cfg.step.ok_or("Missing STEP config") }`)
+/// is listed too — the scan cannot see the branch — so a reader treats the
+/// answer as advice about a node's config, not as proof of a failed run.
+pub fn required_keys(source: &str) -> BTreeSet<String> {
+    let code = without_comments(before_tests(source));
+    let mut out = BTreeSet::new();
+    for (_, lit) in crate::literals::literals(&code) {
+        let Some(rest) = lit.strip_prefix("Missing ") else {
+            continue;
+        };
+        let key: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        if is_key(&key) && rest[key.len()..].starts_with(" config") {
+            out.insert(key);
+        }
+    }
+    out
+}
+
 pub fn schema_mismatch(schema: &serde_json::Value, source: &str) -> Vec<String> {
     let KeysRead { typed, keys: read } = keys_read(source);
     let props = schema
@@ -254,5 +279,15 @@ mod tests {
         assert!(!keys_read("struct Envelope { #[serde(rename = \"KEY\")] k: u8 }").typed);
         // A tuple struct named Config reads nothing.
         assert!(!keys_read("struct Config(u8); struct ConfigUnit;").typed);
+    }
+
+    #[test]
+    fn a_required_key_is_the_one_a_missing_config_message_names() {
+        let src = "let a = cfg.site.ok_or(\"Missing SITE_URL config\")?;\nlet b = cfg.k.ok_or(\"Missing KEY config (the Atlassian site)\")?;\nlet c = x.ok_or(\"Missing value\")?;\n// ok_or(\"Missing IN_COMMENT config\")\n#[cfg(test)] mod t { fn f() { ok_or(\"Missing IN_TEST config\"); } }";
+        let keys = required_keys(src);
+        assert_eq!(
+            keys.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["KEY", "SITE_URL"]
+        );
     }
 }

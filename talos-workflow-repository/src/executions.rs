@@ -2492,3 +2492,145 @@ mod sibling_cancel_pin {
         );
     }
 }
+
+// ── Fuel history per node ───────────────────────────────────────────────────
+//
+// The validator's `fuel-headroom` warning reads what a node has actually
+// consumed against the limit it runs under. The source is
+// `execution_cost_rollup`, written once per VERIFIED attempt by
+// `talos_cost_attribution` (never a node output), and read here the way every
+// learner over the rollup reads it: `outcome = 'completed'` only. A fuel-
+// exhausted attempt writes no completed row and is the failure-history
+// check's to report.
+
+/// One node's completed-run fuel over the window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeFuelRow {
+    /// The graph node id (`execution_cost_rollup.node_id`, a label).
+    pub node_id: String,
+    /// Completed runs in the window.
+    pub runs: i64,
+    /// Median fuel of those runs.
+    pub p50_fuel: i64,
+    /// The most fuel any of them consumed.
+    pub max_fuel: i64,
+}
+
+/// The raw shape one row of the fuel-history query decodes into:
+/// `(workflow_id, node_id, runs, p50, max)`.
+pub type NodeFuelBatchRow = (Uuid, String, i64, i64, i64);
+
+/// Group the batch query's flat rows per workflow. A workflow with no
+/// completed run in the window has no row and is simply absent: the caller
+/// reads absence from a SUCCESSFUL read as an empty history, and a failed
+/// read as `Err`, never the other way round.
+pub fn fold_node_fuel_batch(rows: Vec<NodeFuelBatchRow>) -> HashMap<Uuid, Vec<NodeFuelRow>> {
+    let mut out: HashMap<Uuid, Vec<NodeFuelRow>> = HashMap::new();
+    for (wid, node_id, runs, p50_fuel, max_fuel) in rows {
+        out.entry(wid).or_default().push(NodeFuelRow {
+            node_id,
+            runs,
+            p50_fuel,
+            max_fuel,
+        });
+    }
+    for rows in out.values_mut() {
+        rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    }
+    out
+}
+
+impl WorkflowRepository {
+    /// Per-node completed-run fuel over the last `window_days`, for every
+    /// workflow in `workflow_ids` the user owns, in ONE query.
+    ///
+    /// Never wider than `execution_cost_rollup`'s retention
+    /// (`talos_advanced_repository::EXECUTION_COST_ROLLUP_RETENTION_DAYS`, 90):
+    /// a longer window would report history the reaper has deleted as if it
+    /// had been read. Pinned by that crate's
+    /// `cost_rollup_readers_never_ask_past_the_retention_window`.
+    pub async fn node_fuel_history_batch(
+        &self,
+        workflow_ids: &[Uuid],
+        user_id: Uuid,
+        window_days: i32,
+    ) -> Result<HashMap<Uuid, Vec<NodeFuelRow>>> {
+        if workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let days = window_days.clamp(1, 90);
+        let rows: Vec<NodeFuelBatchRow> = sqlx::query_as(
+            "SELECT r.workflow_id, r.node_id, \
+                    COUNT(*)::bigint, \
+                    COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY r.fuel_consumed), 0)::bigint, \
+                    COALESCE(MAX(r.fuel_consumed), 0)::bigint \
+             FROM execution_cost_rollup r \
+             JOIN workflows w ON w.id = r.workflow_id \
+             WHERE r.workflow_id = ANY($1) AND w.user_id = $2 \
+               AND r.recorded_at > NOW() - make_interval(days => $3::int) \
+               AND r.outcome = 'completed' \
+             GROUP BY r.workflow_id, r.node_id",
+        )
+        .bind(workflow_ids)
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+        Ok(fold_node_fuel_batch(rows))
+    }
+
+    /// [`Self::node_fuel_history_batch`] for one workflow. An absent entry is
+    /// an empty history, so this returns `Ok(vec![])` for a workflow with no
+    /// completed run in the window.
+    pub async fn node_fuel_history(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+        window_days: i32,
+    ) -> Result<Vec<NodeFuelRow>> {
+        Ok(self
+            .node_fuel_history_batch(&[workflow_id], user_id, window_days)
+            .await?
+            .remove(&workflow_id)
+            .unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod node_fuel_batch_fold_tests {
+    use super::{fold_node_fuel_batch, NodeFuelRow};
+    use uuid::Uuid;
+
+    #[test]
+    fn each_workflow_keeps_its_own_nodes_in_label_order() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let out = fold_node_fuel_batch(vec![
+            (a, "send".into(), 3, 100, 150),
+            (b, "read".into(), 1, 9, 9),
+            (a, "compose".into(), 3, 500, 900),
+        ]);
+        assert_eq!(
+            out[&a],
+            [
+                NodeFuelRow {
+                    node_id: "compose".into(),
+                    runs: 3,
+                    p50_fuel: 500,
+                    max_fuel: 900
+                },
+                NodeFuelRow {
+                    node_id: "send".into(),
+                    runs: 3,
+                    p50_fuel: 100,
+                    max_fuel: 150
+                },
+            ]
+        );
+        assert_eq!(out[&b].len(), 1);
+        assert!(
+            !out.contains_key(&Uuid::from_u128(3)),
+            "no row is no entry, not an empty one"
+        );
+    }
+}

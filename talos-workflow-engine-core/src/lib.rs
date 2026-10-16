@@ -110,6 +110,18 @@
 /// `talos-workflow-engine-core` while disabling it on the engine.
 pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 
+/// The share of its fuel limit above which a node has too little headroom:
+/// a larger payload than the one measured is likely to exhaust it.
+///
+/// ONE line, drawn in four places that must agree: the fleet gauge
+/// (`talos_fuel_high_utilisation_nodes`), the `get_fuel_usage_report`
+/// headroom section, the catalog's recorded-run gate
+/// (`talos-catalog-tests/tests/fuel_fixtures.rs`) and the validator's
+/// `fuel-headroom` warning. `talos_compilation::scaffold::HIGH_FUEL_UTILISATION`
+/// is this constant. The controller's background task documents how 0.80 was
+/// chosen against the fleet's distribution.
+pub const HIGH_FUEL_UTILISATION: f64 = 0.80;
+
 pub mod action_links;
 mod actor_ceilings;
 mod approval_gate;
