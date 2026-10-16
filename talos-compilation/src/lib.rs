@@ -31,7 +31,7 @@ pub use sandbox_run::{CompileSlot, RunError, SandboxCommand};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use talos_capability_world::{classify_world_declaration, CapabilityWorld, WorldDeclaration};
+use talos_capability_world::{CapabilityWorld, WorldDeclaration};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
@@ -2202,46 +2202,48 @@ fn sanitize_package_name(name: &str, job_suffix: &str) -> String {
 }
 
 /// Step 8a of a compile: reconcile the world the source DECLARED with the world
-/// the binary IMPORTS. An escalation (the binary needs more than declared, or
-/// either side is unknown) refuses the compile, returned as the failed
-/// `CompilationResult`; an over-declaration is logged and the compile goes on.
-/// A free function so the refusal is testable without a `cargo component`
-/// build.
+/// the binary IMPORTS. An escalation (the binary imports an interface the
+/// declared world does not, or either side is unknown) refuses the compile,
+/// returned as the failed `CompilationResult`; an over-declaration is logged
+/// and the compile goes on. The verdict is asked of the IMPORT SET
+/// (`talos_wit_inspector::imports_outside_world`), never of the classified
+/// world: `agent-node` and `database-node` are incomparable, so a binary that
+/// fits both has one name and two homes (2026-10-16). A free function so the
+/// refusal is testable without a `cargo component` build.
 fn reconcile_declared_world(
     name: &str,
     declared_world: &str,
     inspection: talos_wit_inspector::ComponentInspection,
 ) -> Result<talos_wit_inspector::ComponentInspection, CompilationResult> {
     let detected_world_str = inspection.capability_world.to_string();
-    // The verdict compares PARSED worlds: `Display` is the short form
-    // (`agent`) while sources declare `agent-node`, so a string compare
-    // reported every exact match as an over-declaration. `Unknown` on either
-    // side is an escalation (fail closed), as before.
-    let verdict = if declared_world.is_empty() {
-        WorldDeclaration::Matches
-    } else {
-        classify_world_declaration(declared_world, &inspection.capability_world)
-    };
+    let (verdict, outside) = declaration_verdict(declared_world, &inspection);
     if verdict != WorldDeclaration::Matches {
         if verdict == WorldDeclaration::Escalation {
             let err_msg = format!(
                 "world-mismatch: source declares `{declared_world}` but the \
                  compiled binary imports `{detected_world_str}` capabilities \
-                 ({interfaces}). The binary requests MORE privileges than \
-                 the source attribute declares — refusing to ship. Fix the \
-                 source `world = \"...\"` attribute to match what the \
-                 module actually uses, or remove the unused imports.",
+                 ({interfaces}); outside the declared world: {outside}. The \
+                 binary requests MORE privileges than the source attribute \
+                 declares — refusing to ship. Fix the source `world = \"...\"` \
+                 attribute to match what the module actually uses, or remove \
+                 the unused imports.",
                 declared_world = declared_world,
                 detected_world_str = detected_world_str,
                 interfaces = inspection.imported_interfaces.join(", "),
+                outside = if outside.is_empty() {
+                    "(an unknown world on one side)".to_string()
+                } else {
+                    outside.join(", ")
+                },
             );
             tracing::error!(
                 declared_world = %declared_world,
                 detected_world = %detected_world_str,
                 interfaces = %inspection.imported_interfaces.join(", "),
+                outside = %outside.join(", "),
                 module_name = %name,
-                "world-mismatch (escalation): detected world is not a \
-                 subset of declared world — refusing to emit binary"
+                "world-mismatch (escalation): the binary imports an interface \
+                 the declared world does not — refusing to emit binary"
             );
             return Err(CompilationResult {
                 success: false,
@@ -2275,6 +2277,37 @@ fn reconcile_declared_world(
         );
     }
     Ok(inspection)
+}
+
+/// The verdict on a source declaration against an inspected binary, with the
+/// interfaces outside the declared world. `Matches` when the declaration
+/// names the binary's own world; `OverDeclared` when every import fits a
+/// declaration that names a wider or incomparable world; `Escalation` when an
+/// import falls outside it or either side is unknown. An empty declaration
+/// matches (nothing was declared).
+fn declaration_verdict(
+    declared_world: &str,
+    inspection: &talos_wit_inspector::ComponentInspection,
+) -> (WorldDeclaration, Vec<String>) {
+    if declared_world.is_empty() {
+        return (WorldDeclaration::Matches, vec![]);
+    }
+    let declared: CapabilityWorld = declared_world.parse().unwrap_or(CapabilityWorld::Unknown);
+    if declared == CapabilityWorld::Unknown
+        || inspection.capability_world == CapabilityWorld::Unknown
+    {
+        return (WorldDeclaration::Escalation, vec![]);
+    }
+    let outside =
+        talos_wit_inspector::imports_outside_world(&inspection.imported_interfaces, &declared);
+    if !outside.is_empty() {
+        return (WorldDeclaration::Escalation, outside);
+    }
+    if declared == inspection.capability_world {
+        (WorldDeclaration::Matches, vec![])
+    } else {
+        (WorldDeclaration::OverDeclared, vec![])
+    }
 }
 
 /// Every world the source declares, in order: each `world = "…"` /
@@ -2341,22 +2374,40 @@ pub fn required_world_declaration(source: &str, required: &str) -> Result<String
 
 /// The world to RECORD for a module just built for `requested`: the world the
 /// compiled binary was found to be (`res.capability_world`, the inspection —
-/// for JS/Python the authoritative world it was built at), never the request's
-/// label. Refused when that world is unknown or is not within `requested`, so
-/// no row is labelled narrower than what it runs (security review 2026-10-14,
-/// G-1). Returns the short form the `modules.capability_world` CHECK accepts
-/// (`trusted` for `automation-node`).
+/// for JS/Python the authoritative world it was built at) when that world is
+/// within `requested`, and otherwise `requested` itself — the world the binary
+/// was checked at and will be linked at — provided every interface the binary
+/// imports is one `requested` imports. Never a label narrower than what the
+/// binary needs (security review 2026-10-14, G-1), and never a refusal for a
+/// binary that fits: `agent-node` and `database-node` are incomparable, so a
+/// memory-only binary built for `database-node` is named `agent` by the
+/// classifier and recorded `database` here (2026-10-16). Refused when the
+/// request or the binary's world is unknown, or an import falls outside the
+/// request. Returns the short form the `modules.capability_world` CHECK
+/// accepts (`trusted` for `automation-node`).
 pub fn world_to_record(requested: &str, res: &CompilationResult) -> Result<&'static str, String> {
     let detected = &res.capability_world;
-    if *detected == CapabilityWorld::Unknown
-        || !talos_capability_world::ceiling_permits(requested, detected.as_str())
-    {
+    let requested_world: CapabilityWorld = requested.parse().unwrap_or(CapabilityWorld::Unknown);
+    if *detected == CapabilityWorld::Unknown || requested_world == CapabilityWorld::Unknown {
         return Err(format!(
             "world-mismatch: the compiled binary is `{}`, which `{requested}` does not cover",
             detected.as_node_str()
         ));
     }
-    Ok(detected.as_str())
+    let outside =
+        talos_wit_inspector::imports_outside_world(&res.imported_interfaces, &requested_world);
+    if !outside.is_empty() {
+        return Err(format!(
+            "world-mismatch: the compiled binary is `{}` and imports {} outside `{requested}`",
+            detected.as_node_str(),
+            outside.join(", ")
+        ));
+    }
+    if talos_capability_world::ceiling_permits(requested, detected.as_str()) {
+        Ok(detected.as_str())
+    } else {
+        Ok(requested_world.as_str())
+    }
 }
 
 fn extract_wit_world(source: &str) -> String {
@@ -2863,13 +2914,15 @@ fn check_interpreted_component(
             wasm_bytes.len()
         );
     }
-    let detected = talos_wit_inspector::inspect_component(wasm_bytes)
-        .capability_world
-        .to_string();
-    if !talos_capability_world::ceiling_permits(world, &detected) {
+    let inspection = talos_wit_inspector::inspect_component(wasm_bytes);
+    let requested: CapabilityWorld = world.parse().unwrap_or(CapabilityWorld::Unknown);
+    let outside =
+        talos_wit_inspector::imports_outside_world(&inspection.imported_interfaces, &requested);
+    if inspection.capability_world == CapabilityWorld::Unknown || !outside.is_empty() {
         bail!(
-            "Compiled component imports the '{detected}' world, wider than the requested \
-             '{world}'"
+            "Compiled component imports the '{}' world ({}), wider than the requested '{world}'",
+            inspection.capability_world,
+            outside.join(", ")
         );
     }
     Ok(())
@@ -4298,6 +4351,12 @@ pub fn run(input: String) -> Result<String, String> { Ok(input) }"#;
         }
     }
 
+    fn result_with(world: CapabilityWorld, imports: &[&str]) -> CompilationResult {
+        let mut r = result(world);
+        r.imported_interfaces = imports.iter().map(|s| s.to_string()).collect();
+        r
+    }
+
     #[test]
     fn the_recorded_world_is_the_binarys_never_wider_than_the_request() {
         assert_eq!(
@@ -4308,8 +4367,40 @@ pub fn run(input: String) -> Result<String, String> { Ok(input) }"#;
             world_to_record("automation-node", &result(CapabilityWorld::Trusted)).unwrap(),
             "trusted"
         );
-        assert!(world_to_record("minimal-node", &result(CapabilityWorld::Secrets)).is_err());
+        // An import outside the request refuses, whatever the name.
+        assert!(world_to_record(
+            "minimal-node",
+            &result_with(CapabilityWorld::Secrets, &["talos:core/secrets"])
+        )
+        .is_err());
         assert!(world_to_record("http-node", &result(CapabilityWorld::Unknown)).is_err());
+        assert!(world_to_record("not-a-world", &result(CapabilityWorld::Minimal)).is_err());
+    }
+
+    /// 2026-10-16: a memory-only binary is NAMED `agent` (the narrowest
+    /// covering world) but fits `database-node` too. Built for
+    /// `database-node` it is recorded `database`, the world it was checked
+    /// at; built for `agent-node` it is recorded `agent`; built for
+    /// `secrets-node` it is refused, naming the interface.
+    #[test]
+    fn a_binary_that_fits_an_incomparable_request_is_recorded_at_the_request() {
+        let memory_only = result_with(CapabilityWorld::Agent, &["talos:core/agent-memory"]);
+        assert_eq!(
+            world_to_record("database-node", &memory_only).unwrap(),
+            "database"
+        );
+        assert_eq!(
+            world_to_record("agent-node", &memory_only).unwrap(),
+            "agent"
+        );
+        let err = world_to_record("secrets-node", &memory_only).unwrap_err();
+        assert!(err.contains("talos:core/agent-memory"), "{err}");
+        // A binary with no imports fits every world; it is recorded at the
+        // narrower of its name and the request.
+        assert_eq!(
+            world_to_record("minimal-node", &result(CapabilityWorld::Secrets)).unwrap(),
+            "minimal"
+        );
     }
 }
 
@@ -4362,6 +4453,40 @@ mod reconcile_declared_world_tests {
             reconcile_declared_world("m", "agent-node", inspection(CapabilityWorld::Unknown))
                 .is_err()
         );
+    }
+
+    fn inspection_with(world: CapabilityWorld, imports: &[&str]) -> ComponentInspection {
+        ComponentInspection {
+            capability_world: world,
+            imported_interfaces: imports.iter().map(|s| s.to_string()).collect(),
+            is_talos_node: true,
+        }
+    }
+
+    /// 2026-10-16: the verdict is on the imports. A memory-only binary is
+    /// named `agent`; declared `database-node` it compiles (over-declared,
+    /// not an escalation: `database-node` imports `agent-memory`); declared
+    /// `secrets-node` it is refused with the interface named; a declaration
+    /// that parses to no world is refused.
+    #[test]
+    fn the_verdict_is_on_the_import_set_not_the_classified_world() {
+        let memory_only = || inspection_with(CapabilityWorld::Agent, &["talos:core/agent-memory"]);
+        assert!(reconcile_declared_world("m", "database-node", memory_only()).is_ok());
+        assert!(reconcile_declared_world("m", "agent-node", memory_only()).is_ok());
+        let refused = reconcile_declared_world("m", "secrets-node", memory_only())
+            .expect_err("secrets-node does not import agent-memory");
+        assert!(
+            refused.errors[0]
+                .message
+                .contains("outside the declared world: talos:core/agent-memory"),
+            "{}",
+            refused.errors[0].message
+        );
+        assert!(reconcile_declared_world("m", "no-such-node", memory_only()).is_err());
+        // The classified world being `trusted` (the pre-fix name for this
+        // binary) changes nothing: the imports fit `agent-node`.
+        let misnamed = inspection_with(CapabilityWorld::Trusted, &["talos:core/agent-memory"]);
+        assert!(reconcile_declared_world("m", "agent-node", misnamed).is_ok());
     }
 }
 
