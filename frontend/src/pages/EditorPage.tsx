@@ -66,8 +66,12 @@ function EditorPage() {
     };
   }, [id]);
 
+  // h-full, not h-screen: the shell's <main> is the screen minus the nav, and
+  // a taller child makes <main> scroll its first 56 px (the toolbar row) out
+  // of view the moment anything lower takes focus, while clipping the console
+  // drawer at the bottom.
   return (
-    <div className="flex flex-col h-screen bg-background overflow-hidden">
+    <div className="flex flex-col h-full bg-background overflow-hidden">
       <ErrorBoundary
         fallback={
           <div className="p-4 text-destructive">Failed to load editor.</div>
