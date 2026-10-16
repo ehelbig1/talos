@@ -103,6 +103,7 @@ talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 talos-workflow-validation = { path = "../talos-workflow-validation" }
 talos-workflow-versions = { path = "../talos-workflow-versions" }
 talos-module-repository = { path = "../talos-module-repository" }
+talos-module-world-audit = { path = "../talos-module-world-audit" }
 talos-registry = { path = "../talos-registry" }
 talos-module-templates = { path = "../talos-module-templates" }
 talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
@@ -181,6 +182,7 @@ prometheus.workspace = true # opentelemetry-prometheus 0.32 supports prometheus 
                     # clearing RUSTSEC-2024-0437 (protobuf recursion crash) — deny.toml exemption removed.
 
 [dev-dependencies]
+wat.workspace = true
 # fuel_ledger_tests drives the real hourly-budget admission (2026-09-29).
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 # failed_run_node_outputs_tests builds a failed run's stored output with the

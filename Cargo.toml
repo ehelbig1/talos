@@ -138,6 +138,7 @@ members = [
     "talos-actor-policy-hook",
     "talos-workflow-versions",
     "talos-module-repository",
+    "talos-module-world-audit",
     "talos-registry",
     "talos-sigstore-policy",
     "talos-module-templates",

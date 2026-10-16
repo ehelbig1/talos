@@ -177,6 +177,34 @@ only when Postgres is down; Redis and NATS are reported and do not fail it.
 The chart's probes use `/live` and `/ready`, never `/health`, so a Postgres
 hiccup cannot restart the pod.
 
+### The module-world gate in `make up`
+
+Between building the images and starting them, `make up` applies the
+migrations and runs the audit from the controller image it just built:
+
+```bash
+make audit-module-worlds
+```
+
+`controller audit-module-worlds` walks every `modules` row that holds compiled
+bytes and asks the dispatch decision the worker in that build would make
+(`talos_wit_inspector::world_fit_at_dispatch`, which is `link_world` on the
+same inspection) whether the binary links at the row's recorded world. One
+line per row a dispatch would refuse, naming the module, its kind and owner,
+the declared world and the imports outside it; then the totals, including how
+many registry references (`oci_url`, no bytes) it could not inspect. A finding
+exits non-zero and `make up` stops there: the running stack, if any, keeps the
+old images. Fix each row named (recompile it at a world its imports fit, or
+re-record its world) and run `make up` again. `TALOS_UP_SKIP_WORLD_AUDIT=1`
+skips the gate and says so.
+
+It exists because the 02:05 UTC 2026-10-16 deploy changed how the worker names
+a binary's world, and every agent-node module that imports only agent-memory
+was refused at dispatch for the next twenty hours; the rule was in the worker,
+the rows in Postgres, and nothing asked one about the other before the switch.
+The gate covers `make up` only: a bare `docker compose up` and the k3s
+installer do not run it (the chart has no audit Job yet).
+
 ### Confirming a deploy
 
 After `git pull && make up`, one read-only command answers "is the commit on

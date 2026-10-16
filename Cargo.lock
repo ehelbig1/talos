@@ -1896,6 +1896,7 @@ dependencies = [
  "talos-module-payload-encryption",
  "talos-module-repository",
  "talos-module-templates",
+ "talos-module-world-audit",
  "talos-nats-tls",
  "talos-oauth",
  "talos-ops-alerts-repository",
@@ -1964,6 +1965,7 @@ dependencies = [
  "tracing-subscriber",
  "urlencoding",
  "uuid",
+ "wat",
 ]
 
 [[package]]
@@ -9364,6 +9366,17 @@ dependencies = [
  "chrono-tz 0.10.4",
  "hmac 0.13.0",
  "sha2 0.11.0",
+]
+
+[[package]]
+name = "talos-module-world-audit"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "talos-module-repository",
+ "talos-wit-inspector",
+ "uuid",
+ "wat",
 ]
 
 [[package]]
