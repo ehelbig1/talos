@@ -76,3 +76,21 @@ they are unreachable and left as they are.
 
 The constraint is not mutation-proven separately: its test reads the constraint
 by name from the migrated database.
+
+## Follow-up, 2026-10-16
+
+Most of the report sites listed under "Deliberately NOT changed" now read a
+`*` as the matcher does (it grants nothing):
+- `validate_workflow` and the creation helper's quickstart check every
+  `vault://` reference, with no `*` short-circuit;
+- `get_workflow_risk_assessment` lost risk A;
+- `install_module_from_catalog`'s `setup_required` and its warnings;
+- `SecretsManager::find_modules_referencing_secret` and
+  `list_referenced_secret_names`, which lose their wildcard flag;
+- `get_secret_usage` (no `access_type` / `wildcard_access`) and
+  `get_unused_secrets` (no wildcard early return).
+
+Advice that told people to grant `["*"]` was rewritten, in the empty-grant
+warnings and three tool descriptions; the descriptions now say it is refused.
+The hygiene report's `summary.wildcard_secret_grant` reading is kept: it is a
+measured reading, now always false, and other consumers read that report.

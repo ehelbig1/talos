@@ -371,7 +371,6 @@ pub struct ModuleSecretReference {
     pub module_id: Uuid,
     pub module_name: String,
     pub source: ModuleSource,
-    pub wildcard: bool,
 }
 
 /// Discriminator for `ModuleSecretReference`. Kept post-Phase-5 so the
@@ -4340,8 +4339,9 @@ impl SecretsManager {
         }))
     }
 
-    /// Find modules that declare `secret_name` in their `allowed_secrets`
-    /// (or have wildcard `*`). Single SELECT over the unified `modules`
+    /// Find modules that declare `secret_name` in their `allowed_secrets`.
+    /// (A `*` grant referenced every secret until 2026-10-15; it now grants
+    /// nothing and no row holds one — D2-D.) Single SELECT over the unified `modules`
     /// table by canonical id; `source` is derived from `kind` via
     /// `ModuleSource::from_modules_kind`.
     pub async fn find_modules_referencing_secret(
@@ -4353,7 +4353,7 @@ impl SecretsManager {
             "SELECT id AS module_id, name, allowed_secrets, kind \
              FROM modules \
              WHERE user_id = $1 \
-               AND ($2 = ANY(allowed_secrets) OR '*' = ANY(allowed_secrets))",
+               AND $2 = ANY(allowed_secrets)",
         )
         .bind(user_id)
         .bind(secret_name)
@@ -4363,9 +4363,6 @@ impl SecretsManager {
 
         let mut out = Vec::new();
         for row in rows {
-            let allowed: Vec<String> = row
-                .try_get::<Option<_>, _>("allowed_secrets")?
-                .unwrap_or_default();
             let kind: String = row.try_get::<Option<_>, _>("kind")?.unwrap_or_default();
             out.push(ModuleSecretReference {
                 module_id: row
@@ -4373,7 +4370,6 @@ impl SecretsManager {
                     .unwrap_or_default(),
                 module_name: row.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
                 source: ModuleSource::from_modules_kind(&kind),
-                wildcard: allowed.iter().any(|s| s == "*"),
             });
         }
         Ok(out)
@@ -4441,16 +4437,16 @@ impl SecretsManager {
             .collect()
     }
 
-    /// Aggregate set of secret names referenced by any of the user's modules
-    /// plus a flag indicating any wildcard grant. Used by the
-    /// "unused secrets" report.
+    /// Aggregate set of secret names referenced by any of the user's modules.
+    /// Used by the "unused secrets" report. (It also flagged a `*` grant
+    /// until 2026-10-15; no row holds one now — D2-D.)
     ///
     /// Phase 5: single SELECT over the unified `modules` table replaces the
     /// old UNION across node_templates + wasm_modules.
     pub async fn list_referenced_secret_names(
         &self,
         user_id: Uuid,
-    ) -> Result<(std::collections::HashSet<String>, bool)> {
+    ) -> Result<std::collections::HashSet<String>> {
         let lists = sqlx::query_scalar::<_, Vec<String>>(
             "SELECT allowed_secrets FROM modules \
              WHERE user_id = $1 AND allowed_secrets IS NOT NULL",
@@ -4460,18 +4456,7 @@ impl SecretsManager {
         .await
         .context("list_referenced_secret_names: query failed")?;
 
-        let mut referenced = std::collections::HashSet::new();
-        let mut has_wildcard = false;
-        for list in lists.iter() {
-            for s in list {
-                if s == "*" {
-                    has_wildcard = true;
-                } else {
-                    referenced.insert(s.clone());
-                }
-            }
-        }
-        Ok((referenced, has_wildcard))
+        Ok(lists.into_iter().flatten().collect())
     }
 
     /// Just the key_paths for a user's secrets (used by `normalize_secret_paths`).
