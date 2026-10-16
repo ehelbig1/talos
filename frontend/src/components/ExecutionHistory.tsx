@@ -416,7 +416,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
         </div>
       ) : history.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-16 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl">
-          <HistoryIcon className="w-16 h-16 text-muted-foreground/5 mb-6" />
+          <HistoryIcon className="w-10 h-10 text-muted-foreground/5 mb-6" />
           <p className="text-xs font-semibold text-muted-foreground/50">
             Zero Execution Cycles Logged
           </p>

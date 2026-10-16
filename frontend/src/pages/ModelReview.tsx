@@ -286,7 +286,7 @@ export default function ModelReview() {
             </div>
           ) : models.length === 0 ? (
             <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
-              <BrainCircuit className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
+              <BrainCircuit className="w-10 h-10 text-muted-foreground/30 mb-6 mx-auto" />
               <p className="text-sm text-muted-foreground/50 font-semibold">
                 No models yet
               </p>
@@ -404,7 +404,7 @@ export default function ModelReview() {
                 </div>
               ) : pending.length === 0 ? (
                 <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl group">
-                  <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-ui" />
+                  <CheckCircle2 className="w-10 h-10 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-ui" />
                   <p className="text-sm text-muted-foreground font-semibold">
                     All caught up
                   </p>

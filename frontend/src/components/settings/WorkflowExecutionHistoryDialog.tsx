@@ -389,7 +389,7 @@ export default function WorkflowExecutionHistoryDialog({
           <div className="p-2 text-center space-y-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-2xl flex items-center justify-center mx-auto border",
+                "w-14 h-14 rounded-2xl flex items-center justify-center mx-auto border",
                 confirmAction.type === "retry"
                   ? "bg-primary/10 border-primary/20 text-primary"
                   : "bg-warning/10 border-warning/20 text-warning",

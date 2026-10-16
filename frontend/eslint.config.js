@@ -59,6 +59,35 @@ const LOADING_SELECTORS = [
 
 const UI_FLOOR_SELECTORS = [
                 {
+                    // A paragraph is read, not scanned: body text is never bold.
+                    // (Clarity pass item 10 made 43 of them regular.)
+                    selector:
+                        'JSXOpeningElement[name.name="p"] JSXAttribute[name.name="className"] Literal[value=/\\bfont-bold\\b/]',
+                    message:
+                        "A paragraph is never bold: font-medium at most (a heading or a value may be font-semibold).",
+                },
+                {
+                    selector:
+                        'JSXOpeningElement[name.name="p"] JSXAttribute[name.name="className"] TemplateElement[value.raw=/\\bfont-bold\\b/]',
+                    message:
+                        "A paragraph is never bold: font-medium at most (a heading or a value may be font-semibold).",
+                },
+                {
+                    // The 64 px icon tile was the loudest element on every
+                    // settings panel header; the pass settled on w-14 h-14 for a
+                    // tile and h-8 w-8 for an empty state's icon (EmptyState).
+                    selector:
+                        "Literal[value=/(^|\\s)(w-16 h-16|h-16 w-16)(\\s|$)/]",
+                    message:
+                        "Retired size token. An icon tile is w-14 h-14; an empty state uses EmptyState from @/components/ui (icon h-8 w-8).",
+                },
+                {
+                    selector:
+                        "TemplateElement[value.raw=/(^|\\s)(w-16 h-16|h-16 w-16)(\\s|$)/]",
+                    message:
+                        "Retired size token. An icon tile is w-14 h-14; an empty state uses EmptyState from @/components/ui (icon h-8 w-8).",
+                },
+                {
                     // An icon-only button (no text anywhere below it) has no
                     // accessible name unless it says aria-label; a title is a
                     // tooltip, not a name. Spread props may carry one.

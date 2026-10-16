@@ -449,7 +449,7 @@ function WorkflowHealth() {
           </div>
         ) : sorted.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-16 text-center">
-            <Activity className="w-16 h-16 text-muted-foreground/30 mb-6" />
+            <Activity className="w-10 h-10 text-muted-foreground/30 mb-6" />
             <p className="text-sm text-muted-foreground">
               No runs in the last 7 days
             </p>
