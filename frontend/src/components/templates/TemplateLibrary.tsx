@@ -121,7 +121,7 @@ export function TemplateLibrary({
         {favoriteTemplatesList.length > 0 && (
           <div>
             <div className="flex items-center gap-3 mb-6 px-1">
-              <Star size={16} className="text-amber-400 fill-amber-400" />
+              <Star size={16} className="text-warning fill-warning" />
               <h3 className="text-xs font-semibold text-white">Favorites</h3>
             </div>
             <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-6">
@@ -226,7 +226,7 @@ function TemplateCard({
           e.stopPropagation();
           onToggleFavorite();
         }}
-        className="absolute top-5 right-5 p-2 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/70 hover:text-amber-400 transition-ui z-20"
+        className="absolute top-5 right-5 p-2 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/70 hover:text-warning transition-ui z-20"
         title={isFavorite ? "Remove from favorites" : "Add to favorites"}
         aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
         aria-pressed={isFavorite}
@@ -236,8 +236,8 @@ function TemplateCard({
           className={cn(
             "transition-ui",
             isFavorite
-              ? "text-amber-400 fill-amber-400"
-              : "group-hover:text-amber-400",
+              ? "text-warning fill-warning"
+              : "group-hover:text-warning",
           )}
         />
       </button>

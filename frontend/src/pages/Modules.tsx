@@ -44,12 +44,11 @@ function worldColor(world: string | null | undefined): string {
 }
 
 function langColor(lang: string | null | undefined): string {
-  if (lang === "rust")
-    return "text-orange-400 bg-orange-500/10 border-orange-500/20";
+  if (lang === "rust") return "text-warning bg-warning/10 border-warning/20";
   if (lang === "javascript" || lang === "js")
-    return "text-yellow-400 bg-yellow-500/10 border-yellow-500/20";
+    return "text-warning bg-warning/10 border-warning/20";
   if (lang === "typescript" || lang === "ts")
-    return "text-blue-400 bg-blue-500/10 border-blue-500/20";
+    return "text-info bg-info/10 border-info/20";
   return "text-muted-foreground bg-white/5 border-white/10";
 }
 

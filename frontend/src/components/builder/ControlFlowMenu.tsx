@@ -186,8 +186,8 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
                 className={cn(
                   "text-xs font-semibold",
                   activeIndex === idx
-                    ? "text-cyan-400"
-                    : "text-white group-hover:text-cyan-400",
+                    ? "text-info"
+                    : "text-white group-hover:text-info",
                 )}
               >
                 {sn.label}

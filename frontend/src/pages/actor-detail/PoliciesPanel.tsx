@@ -7,7 +7,7 @@ export function PoliciesPanel() {
     <div className="space-y-6">
       <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
         <div className="flex items-start gap-3 mb-4">
-          <Shield className="w-5 h-5 text-violet-400 shrink-0 mt-0.5" />
+          <Shield className="w-5 h-5 text-primary shrink-0 mt-0.5" />
           <p className="text-muted-foreground text-sm leading-relaxed">
             Approval policies define when this Actor must pause and request
             human approval before proceeding. Enforced triggers today are

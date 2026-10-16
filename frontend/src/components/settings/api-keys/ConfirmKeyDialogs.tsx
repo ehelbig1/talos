@@ -22,11 +22,11 @@ export function RevokeKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-amber-500/20 rounded-2xl overflow-hidden w-[400px]"
+        className="bg-surface-3/90 border border-warning/20 rounded-2xl overflow-hidden w-[400px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-500 mx-auto">
+          <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
             <Shield size={32} />
           </div>
           <div>
@@ -52,7 +52,7 @@ export function RevokeKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white shadow-amber-900/20 font-bold h-12 rounded-xl transition-ui"
+            className="flex-1 bg-warning hover:bg-warning/90 text-warning-foreground shadow-warning/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? "Revoking..." : "Revoke Key"}
           </Button>
@@ -74,11 +74,11 @@ export function RotateKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-indigo-500/20 rounded-2xl overflow-hidden w-[460px]"
+        className="bg-surface-3/90 border border-primary/20 rounded-2xl overflow-hidden w-[460px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl flex items-center justify-center text-indigo-400 mx-auto">
+          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary mx-auto">
             <RefreshCw size={32} />
           </div>
           <div>
@@ -91,9 +91,9 @@ export function RotateKeyDialog({
               using this key.
             </p>
           </div>
-          <div className="p-4 bg-indigo-500/5 border border-indigo-500/15 rounded-xl text-left">
+          <div className="p-4 bg-primary/5 border border-primary/15 rounded-xl text-left">
             <div className="flex items-start gap-2.5">
-              <Info className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+              <Info className="w-4 h-4 text-primary shrink-0 mt-0.5" />
               <p className="text-xs text-muted-foreground leading-relaxed">
                 The new secret will be shown once after rotation. Make sure you
                 have a place to save it before proceeding.
@@ -113,7 +113,7 @@ export function RotateKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-900/20 font-bold h-12 rounded-xl transition-ui"
+            className="flex-1 bg-primary hover:bg-primary/90 text-white shadow-primary/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? (
               <div className="flex items-center gap-2">
@@ -142,11 +142,11 @@ export function DeleteKeyDialog({
   return (
     <Dialog open={true} onClose={onCancel}>
       <div
-        className="bg-surface-3/90 border border-red-500/20 rounded-2xl overflow-hidden w-[400px]"
+        className="bg-surface-3/90 border border-destructive/20 rounded-2xl overflow-hidden w-[400px]"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-red-500/10 border border-red-500/20 rounded-2xl flex items-center justify-center text-red-500 mx-auto">
+          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive mx-auto">
             <Trash2 size={32} />
           </div>
           <div>
@@ -172,7 +172,7 @@ export function DeleteKeyDialog({
           <Button
             onClick={onConfirm}
             disabled={isPending}
-            className="flex-1 bg-red-600 hover:bg-red-500 text-white shadow-red-900/20 font-bold h-12 rounded-xl transition-ui"
+            className="flex-1 bg-destructive hover:bg-destructive/90 text-white shadow-destructive/20 font-bold h-12 rounded-xl transition-ui"
           >
             {isPending ? "Deleting..." : "Delete Key"}
           </Button>

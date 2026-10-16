@@ -72,7 +72,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
           <p className="text-muted-foreground/70 text-xs leading-relaxed">
             Handoffs let this actor delegate work to another actor
             mid-execution. Use the{" "}
-            <code className="text-violet-300 bg-violet-500/10 px-1 rounded font-mono text-xs">
+            <code className="text-primary bg-primary/10 px-1 rounded font-mono text-xs">
               handoff_to_actor
             </code>{" "}
             MCP tool or call it from a workflow node to start building a handoff
@@ -89,7 +89,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
       {partnerFreq.length > 0 && (
         <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
-            <Bot className="w-4 h-4 text-violet-400" />
+            <Bot className="w-4 h-4 text-primary" />
             Partner Actors
             <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {partnerFreq.length}
@@ -102,13 +102,13 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                 className="flex items-center justify-between gap-3"
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  <div className="w-6 h-6 rounded-full bg-violet-500/20 flex items-center justify-center shrink-0">
-                    <Bot className="w-3 h-3 text-violet-400" />
+                  <div className="w-6 h-6 rounded-full bg-primary/20 flex items-center justify-center shrink-0">
+                    <Bot className="w-3 h-3 text-primary" />
                   </div>
                   {p.id ? (
                     <button
                       onClick={() => navigate(`/actors/${p.id}`)}
-                      className="text-sm text-violet-300 hover:text-violet-200 transition-ui truncate"
+                      className="text-sm text-primary hover:text-white transition-ui truncate"
                     >
                       {p.name}
                     </button>
@@ -120,12 +120,12 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                 </div>
                 <div className="flex items-center gap-3 shrink-0 text-xs">
                   {p.outCount > 0 && (
-                    <span className="text-violet-400" title="Outbound handoffs">
+                    <span className="text-primary" title="Outbound handoffs">
                       → {p.outCount}
                     </span>
                   )}
                   {p.inCount > 0 && (
-                    <span className="text-emerald-400" title="Inbound handoffs">
+                    <span className="text-success" title="Inbound handoffs">
                       ← {p.inCount}
                     </span>
                   )}
@@ -139,7 +139,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
       {outbound.length > 0 && (
         <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
-            <GitBranch className="w-4 h-4 text-violet-400" />
+            <GitBranch className="w-4 h-4 text-primary" />
             Outbound Handoffs
             <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {outbound.length}
@@ -154,11 +154,11 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                   className="flex items-start justify-between gap-4"
                 >
                   <p className="text-muted-foreground text-sm">
-                    <span className="text-violet-400 font-mono mr-1">→</span>
+                    <span className="text-primary font-mono mr-1">→</span>
                     {id ? (
                       <button
                         onClick={() => navigate(`/actors/${id}`)}
-                        className="text-violet-300 hover:text-violet-200 transition-ui"
+                        className="text-primary hover:text-white transition-ui"
                       >
                         {name}
                       </button>
@@ -179,7 +179,7 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
       {inbound.length > 0 && (
         <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
           <h2 className="text-white font-medium text-sm mb-4 flex items-center gap-2">
-            <GitBranch className="w-4 h-4 text-emerald-400" />
+            <GitBranch className="w-4 h-4 text-success" />
             Inbound Handoffs
             <span className="text-xs bg-surface-4/60 text-muted-foreground px-1.5 py-0.5 rounded-full ml-1">
               {inbound.length}
@@ -194,11 +194,11 @@ export function HandoffsPanel({ entries }: { entries: ActorActionLogEntry[] }) {
                   className="flex items-start justify-between gap-4"
                 >
                   <p className="text-muted-foreground text-sm">
-                    <span className="text-emerald-400 font-mono mr-1">←</span>
+                    <span className="text-success font-mono mr-1">←</span>
                     {id ? (
                       <button
                         onClick={() => navigate(`/actors/${id}`)}
-                        className="text-emerald-300 hover:text-emerald-200 transition-ui"
+                        className="text-success hover:text-white transition-ui"
                       >
                         {name}
                       </button>

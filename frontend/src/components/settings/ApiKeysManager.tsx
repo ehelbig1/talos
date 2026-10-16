@@ -131,7 +131,7 @@ export default function ApiKeysManager() {
     <div className="max-w-6xl mx-auto py-4 space-y-8">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <div className="w-12 h-12 bg-indigo-500/10 border border-indigo-500/20 rounded-xl flex items-center justify-center text-indigo-400">
+          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center text-primary">
             <Key size={24} />
           </div>
           <div>
@@ -145,7 +145,7 @@ export default function ApiKeysManager() {
         </div>
         <Button
           onClick={() => setShowCreate(true)}
-          className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold px-6 py-6 h-auto rounded-xl transition-ui"
+          className="bg-primary hover:bg-primary/90 text-white font-bold px-6 py-6 h-auto rounded-xl transition-ui"
         >
           <Plus className="w-5 h-5 mr-1" />
           Create New Key
@@ -161,7 +161,7 @@ export default function ApiKeysManager() {
       />
 
       <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl flex items-start gap-4 max-w-2xl">
-        <div className="w-10 h-10 bg-indigo-500/10 border border-indigo-500/20 rounded-lg flex items-center justify-center text-indigo-400 shrink-0">
+        <div className="w-10 h-10 bg-primary/10 border border-primary/20 rounded-lg flex items-center justify-center text-primary shrink-0">
           <Info size={18} />
         </div>
         <div>

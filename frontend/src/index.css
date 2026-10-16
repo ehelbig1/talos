@@ -67,14 +67,14 @@
     --destructive: 0 84% 60%;
     --destructive-foreground: 210 40% 98%;
 
-    --warning: 45 93% 47%;
+    --warning: 43 96% 56%; /* amber-400 */
     --warning-foreground: 45 93% 5%;
 
-    --success: 160 84% 39%;
-    --success-foreground: 160 84% 98%;
+    --success: 158 64% 52%; /* emerald-400 */
+    --success-foreground: 160 84% 6%;
 
-    --info: 199 89% 48%;
-    --info-foreground: 210 40% 98%;
+    --info: 199 89% 60%; /* between sky-400 and sky-500 */
+    --info-foreground: 199 89% 6%;
 
     --border: 232 14% 18%;
     --input: 232 14% 12%;

@@ -69,14 +69,14 @@ function EditorPage() {
     <div className="flex flex-col h-screen bg-background overflow-hidden">
       <ErrorBoundary
         fallback={
-          <div className="p-4 text-red-400">Failed to load editor.</div>
+          <div className="p-4 text-destructive">Failed to load editor.</div>
         }
       >
         <Suspense
           fallback={
             <div className="flex-1 flex items-center justify-center text-muted-foreground">
               <div className="flex flex-col items-center gap-3">
-                <div className="w-8 h-8 border-2 border-violet-500/20 border-t-violet-500 rounded-full animate-spin" />
+                <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
                 <span className="text-sm font-medium">Loading editor…</span>
               </div>
             </div>

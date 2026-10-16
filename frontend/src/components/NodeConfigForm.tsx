@@ -361,7 +361,7 @@ export const NodeConfigForm = React.memo(
             </div>
 
             <div className="flex items-center gap-4 px-5 py-4 bg-surface-3/60 border border-white/5 rounded-2xl">
-              <div className="p-2.5 rounded-xl bg-violet-500/10 border border-violet-500/20 text-violet-400">
+              <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20 text-primary">
                 <IterationCcw className="w-4 h-4" />
               </div>
               <div className="flex flex-col gap-1">
@@ -560,15 +560,15 @@ export const NodeConfigForm = React.memo(
                 className={inputBase}
               />
             </div>
-            <div className="flex items-center gap-4 px-6 py-5 bg-amber-500/5 border border-amber-500/20 rounded-2xl relative overflow-hidden group">
-              <div className="p-3 bg-amber-500/10 rounded-2xl text-amber-500 transition-ui relative z-10">
+            <div className="flex items-center gap-4 px-6 py-5 bg-warning/5 border border-warning/20 rounded-2xl relative overflow-hidden group">
+              <div className="p-3 bg-warning/10 rounded-2xl text-warning transition-ui relative z-10">
                 <Clock className="w-5 h-5" />
               </div>
               <div className="flex flex-col gap-1 relative z-10">
-                <p className="text-xs text-amber-400 font-semibold">
+                <p className="text-xs text-warning font-semibold">
                   Workflow pauses here
                 </p>
-                <p className="text-xs text-amber-300/40 font-medium leading-relaxed">
+                <p className="text-xs text-warning/40 font-medium leading-relaxed">
                   The run's state is saved. It resumes only when it is signalled
                   to continue.
                 </p>

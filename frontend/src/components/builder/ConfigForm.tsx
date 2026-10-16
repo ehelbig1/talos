@@ -220,7 +220,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                   <div className="bg-surface-2 border border-white/5 rounded-2xl p-6 space-y-6 relative overflow-hidden group/http">
                     <div className="flex items-center justify-between relative z-10">
                       <div className="flex items-center gap-3">
-                        <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
+                        <div className="p-1.5 rounded-lg bg-success/10 text-success">
                           <CheckCircle className="h-4 w-4" />
                         </div>
                         <span className="text-xs font-semibold text-white/70">

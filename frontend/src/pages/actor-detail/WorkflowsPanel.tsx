@@ -81,7 +81,7 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                     {wf.name}
                     {aiWf && (
                       <span title="LLM workflow with memory injection">
-                        <Sparkles className="w-3 h-3 text-violet-400" />
+                        <Sparkles className="w-3 h-3 text-primary" />
                       </span>
                     )}
                   </span>

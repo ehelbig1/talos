@@ -3,20 +3,20 @@ import type { NodeStatusType } from "@/store/executionStore";
 
 export const STATUS_BORDER: Record<NodeStatusType, string> = {
   idle: "border-l-muted-foreground/30",
-  running: "border-l-blue-500",
-  success: "border-l-green-500",
-  failed: "border-l-red-500",
+  running: "border-l-info",
+  success: "border-l-success",
+  failed: "border-l-destructive",
   skipped: "border-l-muted-foreground/50",
-  awaiting_approval: "border-l-amber-400",
+  awaiting_approval: "border-l-warning",
 };
 
 const STATUS_DOT: Record<NodeStatusType, string> = {
   idle: "bg-muted-foreground/30",
-  running: "bg-blue-500 animate-status-pulse",
-  success: "bg-green-500",
-  failed: "bg-red-500",
+  running: "bg-info animate-status-pulse",
+  success: "bg-success",
+  failed: "bg-destructive",
   skipped: "bg-muted-foreground/50",
-  awaiting_approval: "bg-amber-400",
+  awaiting_approval: "bg-warning",
 };
 
 export const StatusDot = React.memo(function StatusDot({

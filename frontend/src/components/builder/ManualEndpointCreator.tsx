@@ -105,7 +105,7 @@ export function ManualEndpointCreator({
         className={cn(
           "h-10 px-6 text-sm font-semibold rounded-xl transition-ui",
           baseUrl
-            ? "bg-emerald-500 hover:bg-emerald-400 text-white shadow-emerald-500/20"
+            ? "bg-success hover:bg-success/90 text-success-foreground shadow-success/20"
             : "bg-surface-3 text-muted-foreground/70 grayscale",
         )}
       >
@@ -115,11 +115,11 @@ export function ManualEndpointCreator({
   }
 
   return (
-    <div className="bg-surface-2/60 border border-emerald-500/20 rounded-2xl p-8 space-y-8 relative overflow-hidden">
+    <div className="bg-surface-2/60 border border-success/20 rounded-2xl p-8 space-y-8 relative overflow-hidden">
       <div className="flex items-center justify-between relative z-10">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-            <Target className="h-5 w-5 text-emerald-400" />
+          <div className="p-2 rounded-xl bg-success/10 border border-success/20">
+            <Target className="h-5 w-5 text-success" />
           </div>
           <div>
             <h4 className="text-xs font-semibold text-white">
@@ -155,7 +155,7 @@ export function ManualEndpointCreator({
                   method: e.target.value,
                 })
               }
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white outline-none focus:border-emerald-500/40 transition-ui"
+              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white outline-none focus:border-success/40 transition-ui"
             >
               <option value="GET">GET</option>
               <option value="POST">POST</option>
@@ -167,7 +167,7 @@ export function ManualEndpointCreator({
 
           <div className="flex-1 space-y-2">
             <label className="text-xs font-medium text-white/70 px-1">
-              Path <span className="text-emerald-400">*</span>
+              Path <span className="text-success">*</span>
             </label>
             <input
               type="text"
@@ -176,7 +176,7 @@ export function ManualEndpointCreator({
                 setCurrentEndpoint({ ...currentEndpoint, path: e.target.value })
               }
               placeholder="/API/V1/RESOURCES/{ID}"
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-mono font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-ui"
+              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-mono font-semibold text-white placeholder-white/10 outline-none focus:border-success/40 transition-ui"
             />
           </div>
         </div>
@@ -196,7 +196,7 @@ export function ManualEndpointCreator({
               })
             }
             placeholder="e.g. Get a user by ID"
-            className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 outline-none focus:border-emerald-500/40 transition-ui"
+            className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 outline-none focus:border-success/40 transition-ui"
           />
         </div>
 
@@ -237,10 +237,10 @@ export function ManualEndpointCreator({
                       className={cn(
                         "w-16 h-8 text-2xs font-semibold uppercase tracking-wider border",
                         param.in === "path"
-                          ? "bg-blue-500/10 text-blue-400 border-blue-500/20"
+                          ? "bg-info/10 text-info border-info/20"
                           : param.in === "query"
-                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                            : "bg-purple-500/10 text-purple-400 border-purple-500/20",
+                            ? "bg-success/10 text-success border-success/20"
+                            : "bg-primary/10 text-primary border-primary/20",
                       )}
                     >
                       {param.in}
@@ -252,7 +252,7 @@ export function ManualEndpointCreator({
                         updateParameter(index, "name", e.target.value)
                       }
                       placeholder="KEY"
-                      className="flex-1 h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-emerald-500/40"
+                      className="flex-1 h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-success/40"
                     />
                     <input
                       type="text"
@@ -261,7 +261,7 @@ export function ManualEndpointCreator({
                         updateParameter(index, "description", e.target.value)
                       }
                       placeholder="Description"
-                      className="flex-[2] h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-emerald-500/40"
+                      className="flex-[2] h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-success/40"
                     />
                     <label className="flex items-center gap-2 cursor-pointer group/check">
                       <input
@@ -270,7 +270,7 @@ export function ManualEndpointCreator({
                         onChange={(e) =>
                           updateParameter(index, "required", e.target.checked)
                         }
-                        className="w-4 h-4 rounded border-white/10 bg-surface-4 text-emerald-500 focus:ring-emerald-500/40"
+                        className="w-4 h-4 rounded border-white/10 bg-surface-4 text-success focus:ring-success/40"
                       />
                       <span className="text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider group-hover/check:text-white transition-ui">
                         Req
@@ -300,7 +300,7 @@ export function ManualEndpointCreator({
             className={cn(
               "flex-1 h-12 text-sm font-semibold rounded-2xl transition-ui flex items-center justify-center gap-3",
               currentEndpoint.path
-                ? "bg-emerald-600 hover:bg-emerald-500 text-white shadow-emerald-500/20"
+                ? "bg-success hover:bg-success/90 text-success-foreground shadow-success/20"
                 : "bg-surface-3 text-muted-foreground/70",
             )}
           >
@@ -316,11 +316,11 @@ export function ManualEndpointCreator({
           </Button>
         </div>
 
-        <div className="p-6 bg-emerald-500/5 border border-emerald-500/10 rounded-2xl flex items-start gap-4">
-          <div className="shrink-0 p-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20">
-            <Shield className="w-4 h-4 text-emerald-400" />
+        <div className="p-6 bg-success/5 border border-success/10 rounded-2xl flex items-start gap-4">
+          <div className="shrink-0 p-2 rounded-xl bg-success/10 border border-success/20">
+            <Shield className="w-4 h-4 text-success" />
           </div>
-          <p className="text-xs text-emerald-400/60 leading-relaxed">
+          <p className="text-xs text-success/60 leading-relaxed">
             Tip: use {`{variable_name}`} in the path for values that change per
             request.
           </p>

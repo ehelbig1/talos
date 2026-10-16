@@ -74,15 +74,15 @@ type Tab = "nodes" | "webhooks";
 const DROP_REASON_LABELS: Record<string, { label: string; color: string }> = {
   circuit_breaker: {
     label: "Circuit Breaker",
-    color: "text-red-400 bg-red-400/10 border-red-400/20",
+    color: "text-destructive bg-destructive/10 border-destructive/20",
   },
   rate_limit: {
     label: "Rate Limit",
-    color: "text-amber-400 bg-amber-400/10 border-amber-400/20",
+    color: "text-warning bg-warning/10 border-warning/20",
   },
   sig_invalid: {
     label: "Sig Invalid",
-    color: "text-orange-400 bg-orange-400/10 border-orange-400/20",
+    color: "text-warning bg-warning/10 border-warning/20",
   },
   disabled: {
     label: "Disabled",
@@ -294,7 +294,7 @@ export function DLQViewer() {
           className={cn(
             "flex-1 flex items-center justify-center gap-3 py-4 rounded-2xl text-sm font-semibold transition-ui relative overflow-hidden group",
             activeTab === "webhooks"
-              ? "bg-amber-500 text-black shadow-amber-500/20"
+              ? "bg-warning text-warning-foreground shadow-warning/20"
               : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
           )}
         >
@@ -305,8 +305,8 @@ export function DLQViewer() {
               className={cn(
                 "px-2 py-0.5 rounded-lg text-2xs font-semibold min-w-[1.2rem] text-center relative z-10 transition-ui",
                 activeTab === "webhooks"
-                  ? "bg-black text-amber-500"
-                  : "bg-amber-500/10 text-amber-500",
+                  ? "bg-black text-warning"
+                  : "bg-warning/10 text-warning",
               )}
             >
               {pendingWebhooks.length}
@@ -396,7 +396,7 @@ export function DLQViewer() {
           )
         ) : pendingWebhooks.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-amber-500/20">
+            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-warning/20">
               <Database size={40} />
             </div>
             <h3 className="text-2xl font-semibold text-white/70 tracking-tight mb-4">
@@ -414,7 +414,7 @@ export function DLQViewer() {
             >
               <div className="flex items-start justify-between mb-8 relative z-10">
                 <div className="flex items-center gap-5">
-                  <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-500">
+                  <div className="w-12 h-12 rounded-xl bg-warning/10 border border-warning/20 flex items-center justify-center text-warning">
                     <Webhook size={20} />
                   </div>
                   <div className="space-y-1.5">

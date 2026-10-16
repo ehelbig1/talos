@@ -89,7 +89,7 @@ function AddScheduleDialog({
         {/* Header */}
         <div className="px-10 py-8 border-b border-white/5 flex items-center justify-between bg-white/[0.02] relative z-10">
           <div className="flex items-center gap-4">
-            <div className="w-12 h-12 bg-amber-500/10 rounded-2xl flex items-center justify-center border border-amber-500/20 text-amber-500">
+            <div className="w-12 h-12 bg-warning/10 rounded-2xl flex items-center justify-center border border-warning/20 text-warning">
               <Clock size={24} />
             </div>
             <div>
@@ -122,7 +122,7 @@ function AddScheduleDialog({
               <select
                 value={workflowId}
                 onChange={(e) => setWorkflowId(e.target.value)}
-                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-amber-500/40 focus:ring-4 focus:ring-amber-500/10 transition-ui appearance-none cursor-pointer"
+                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-warning/40 focus:ring-4 focus:ring-warning/10 transition-ui appearance-none cursor-pointer"
               >
                 <option value="" disabled className="bg-surface-3">
                   Select a workflow…
@@ -150,7 +150,7 @@ function AddScheduleDialog({
               onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                 setCron(e.target.value)
               }
-              className="bg-black/40 border-white/5 focus:border-amber-500/40 focus:ring-amber-500/10 h-14 rounded-2xl text-sm font-semibold px-6"
+              className="bg-black/40 border-white/5 focus:border-warning/40 focus:ring-warning/10 h-14 rounded-2xl text-sm font-semibold px-6"
             />
 
             {/* Cron example chips */}
@@ -162,7 +162,7 @@ function AddScheduleDialog({
                   className={cn(
                     "px-4 py-2 rounded-xl border text-2xs font-semibold transition-ui",
                     cron === ex.value
-                      ? "bg-amber-500/10 border-amber-500/30 text-amber-400 shadow-amber-500/5"
+                      ? "bg-warning/10 border-warning/30 text-warning shadow-warning/5"
                       : "bg-white/5 border-white/5 text-muted-foreground/70 hover:border-white/10 hover:text-white",
                   )}
                 >
@@ -186,7 +186,7 @@ function AddScheduleDialog({
               onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                 setTimezone(e.target.value)
               }
-              className="bg-black/40 border-white/5 focus:border-amber-500/40 focus:ring-amber-500/10 h-14 rounded-2xl text-sm font-semibold px-6"
+              className="bg-black/40 border-white/5 focus:border-warning/40 focus:ring-warning/10 h-14 rounded-2xl text-sm font-semibold px-6"
             />
           </div>
         </div>
@@ -259,7 +259,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
             onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
               setCron(e.target.value)
             }
-            className="bg-black/40 border-white/5 focus:border-amber-500/40 h-10 text-sm font-semibold rounded-xl px-4"
+            className="bg-black/40 border-white/5 focus:border-warning/40 h-10 text-sm font-semibold rounded-xl px-4"
           />
         </div>
         <div className="space-y-2">
@@ -271,7 +271,7 @@ function EditForm({ schedule, onDone }: EditFormProps) {
             onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
               setTimezone(e.target.value)
             }
-            className="bg-black/40 border-white/5 focus:border-amber-500/40 h-10 text-sm font-semibold rounded-xl px-4"
+            className="bg-black/40 border-white/5 focus:border-warning/40 h-10 text-sm font-semibold rounded-xl px-4"
           />
         </div>
       </div>
@@ -351,7 +351,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
         className={cn(
           "group bg-white/[0.02] border rounded-2xl p-8 hover:bg-white/[0.04] transition-ui relative overflow-hidden",
           schedule.isEnabled
-            ? "border-amber-500/10 hover:border-amber-500/30"
+            ? "border-warning/10 hover:border-warning/30"
             : "border-white/5 opacity-60 hover:opacity-100",
         )}
       >
@@ -362,7 +362,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               className={cn(
                 "w-14 h-14 rounded-2xl flex items-center justify-center border shrink-0 transition-ui",
                 schedule.isEnabled
-                  ? "bg-amber-500/10 border-amber-500/20 text-amber-500"
+                  ? "bg-warning/10 border-warning/20 text-warning"
                   : "bg-white/5 border-white/5 text-muted-foreground/60",
               )}
             >
@@ -370,14 +370,14 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             </div>
             <div className="min-w-0">
               <div className="flex items-center gap-4 flex-wrap">
-                <span className="text-xl font-semibold text-white font-outfit truncate group-hover:text-amber-400 transition-ui">
+                <span className="text-xl font-semibold text-white font-outfit truncate group-hover:text-warning transition-ui">
                   {workflowName}
                 </span>
                 <span
                   className={cn(
                     "text-2xs font-semibold uppercase tracking-wider px-3 py-1 rounded-full border shadow-sm",
                     schedule.isEnabled
-                      ? "bg-amber-500/10 border-amber-500/30 text-amber-400"
+                      ? "bg-warning/10 border-warning/30 text-warning"
                       : "bg-white/5 border-white/10 text-muted-foreground/70",
                   )}
                 >
@@ -385,7 +385,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
                 </span>
               </div>
               <div className="flex items-center gap-3 mt-3">
-                <div className="flex items-center gap-2 text-xs font-semibold font-mono text-amber-400/70 bg-amber-500/5 border border-amber-500/10 px-3 py-1 rounded-xl">
+                <div className="flex items-center gap-2 text-xs font-semibold font-mono text-warning/70 bg-warning/5 border border-warning/10 px-3 py-1 rounded-xl">
                   {schedule.cronExpression}
                 </div>
                 <ChevronRight className="w-3.5 h-3.5 text-muted-foreground/50" />
@@ -406,12 +406,12 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               className={cn(
                 "w-11 h-11 flex items-center justify-center rounded-2xl border transition-ui",
                 schedule.isEnabled
-                  ? "bg-amber-500/10 border-amber-500/20 text-amber-400 hover:bg-amber-500/20"
+                  ? "bg-warning/10 border-warning/20 text-warning hover:bg-warning/20"
                   : "bg-white/5 border-white/5 text-muted-foreground/60 hover:text-white hover:bg-white/10",
               )}
             >
               {toggleMutation.isPending ? (
-                <div className="w-4 h-4 border-2 border-amber-500/20 border-t-amber-500 rounded-full animate-spin" />
+                <div className="w-4 h-4 border-2 border-warning/20 border-t-warning rounded-full animate-spin" />
               ) : schedule.isEnabled ? (
                 <ToggleRight size={22} />
               ) : (
@@ -521,7 +521,7 @@ export default function SchedulesManager() {
       {/* Page header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-6">
-          <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-500 relative">
+          <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning relative">
             <Clock size={32} className="relative z-10" />
           </div>
           <div>
@@ -545,7 +545,7 @@ export default function SchedulesManager() {
       {/* Content */}
       {schedulesLoading ? (
         <div className="flex flex-col items-center justify-center py-32 gap-6">
-          <div className="w-16 h-16 border-4 border-amber-500/10 border-t-amber-500 rounded-full animate-spin" />
+          <div className="w-16 h-16 border-4 border-warning/10 border-t-warning rounded-full animate-spin" />
           <p className="text-xs text-muted-foreground/70 font-semibold">
             Synchronizing Time-Stream...
           </p>
@@ -585,7 +585,7 @@ export default function SchedulesManager() {
       {schedules.length > 0 && (
         <div className="flex items-center gap-10 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
           <div className="flex items-center gap-3 relative z-10">
-            <div className="w-2 h-2 rounded-full bg-amber-500" />
+            <div className="w-2 h-2 rounded-full bg-warning" />
             <span className="text-xs text-muted-foreground/70 font-semibold">
               <strong className="text-white">{schedules.length}</strong>{" "}
               schedules

@@ -111,7 +111,7 @@ export function OAuthCallback() {
       <div className="bg-surface-3/60 border border-white/5 rounded-xl p-12 w-full max-w-md text-center">
         {status === "loading" && (
           <>
-            <div className="animate-spin w-14 h-14 mx-auto mb-6 rounded-full border-4 border-white/10 border-t-violet-500" />
+            <div className="animate-spin w-14 h-14 mx-auto mb-6 rounded-full border-4 border-white/10 border-t-primary" />
             <SectionHeader
               level="h2"
               className="text-xl font-semibold text-white mb-2"
@@ -124,7 +124,7 @@ export function OAuthCallback() {
 
         {status === "success" && (
           <>
-            <div className="w-14 h-14 mx-auto mb-6 bg-green-500 rounded-full flex items-center justify-center">
+            <div className="w-14 h-14 mx-auto mb-6 bg-success rounded-full flex items-center justify-center">
               <Check className="w-7 h-7 text-white" strokeWidth={3} />
             </div>
             <SectionHeader
@@ -139,7 +139,7 @@ export function OAuthCallback() {
 
         {status === "error" && (
           <>
-            <div className="w-14 h-14 mx-auto mb-6 bg-red-500 rounded-full flex items-center justify-center">
+            <div className="w-14 h-14 mx-auto mb-6 bg-destructive rounded-full flex items-center justify-center">
               <X className="w-7 h-7 text-white" strokeWidth={3} />
             </div>
             <SectionHeader

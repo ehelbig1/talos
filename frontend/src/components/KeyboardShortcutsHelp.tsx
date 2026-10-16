@@ -63,7 +63,7 @@ export function KeyboardShortcutsHelp() {
           <div key={category}>
             <SectionHeader
               level="h3"
-              className="text-xs font-bold text-gray-500 mb-3"
+              className="text-xs font-bold text-muted-foreground mb-3"
             >
               {category}
             </SectionHeader>

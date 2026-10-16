@@ -132,7 +132,7 @@ export function ApprovalQueue() {
           <Clock className="w-4 h-4" />
           Pending
           {pending.length > 0 && (
-            <span className="bg-warning text-black text-2xs font-semibold rounded-full px-2 py-0.5 min-w-[1.4rem] text-center">
+            <span className="bg-warning text-warning-foreground text-2xs font-semibold rounded-full px-2 py-0.5 min-w-[1.4rem] text-center">
               {pending.length}
             </span>
           )}
@@ -197,7 +197,7 @@ export function ApprovalQueue() {
 
                 <div className="grid grid-cols-2 gap-4 relative z-10">
                   <Button
-                    className="h-14 rounded-2xl font-semibold text-sm bg-success/10 hover:bg-success text-success hover:text-black border border-success/20 transition-ui"
+                    className="h-14 rounded-2xl font-semibold text-sm bg-success/10 hover:bg-success text-success hover:text-success-foreground border border-success/20 transition-ui"
                     onClick={() => handleDecision(approval.id, "approved")}
                   >
                     <Check className="w-4 h-4 mr-3" />

@@ -209,7 +209,7 @@ export function SlackAppSelector({
             <Button
               onClick={() => setShowCreator(true)}
               variant="outline"
-              className="h-9 px-4 bg-purple-500/5 hover:bg-purple-500/10 text-purple-400 border-purple-500/20 text-2xs font-semibold rounded-xl transition-ui"
+              className="h-9 px-4 bg-primary/5 hover:bg-primary/10 text-primary border-primary/20 text-2xs font-semibold rounded-xl transition-ui"
             >
               <Rocket className="w-3.5 h-3.5 mr-2" /> Manifest App
             </Button>

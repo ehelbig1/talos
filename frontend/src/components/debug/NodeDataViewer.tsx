@@ -20,11 +20,11 @@ export const NodeDataViewer: React.FC<NodeDataViewerProps> = ({
   }
 
   if (typeof data === "boolean") {
-    return <span className="text-yellow-400">{data ? "true" : "false"}</span>;
+    return <span className="text-warning">{data ? "true" : "false"}</span>;
   }
 
   if (typeof data === "number") {
-    return <span className="text-cyan-400">{String(data)}</span>;
+    return <span className="text-info">{String(data)}</span>;
   }
 
   if (typeof data === "string") {
@@ -53,13 +53,13 @@ const StringValue: React.FC<{ value: string }> = ({ value }) => {
       : value;
 
   return (
-    <span className="text-green-400">
+    <span className="text-success">
       &quot;{displayValue}&quot;
       {isTruncated && (
         <button
           type="button"
           onClick={() => setExpanded(!expanded)}
-          className="ml-1 text-2xs text-violet-400 hover:text-violet-300 underline underline-offset-2 transition-ui"
+          className="ml-1 text-2xs text-primary hover:text-white underline underline-offset-2 transition-ui"
         >
           {expanded ? "collapse" : "expand"}
         </button>
@@ -145,7 +145,7 @@ const ObjectValue: React.FC<{
           <div className="pl-4 border-l border-white/5">
             {keys.map((key, i) => (
               <div key={key} className="py-0.5">
-                <span className="text-violet-300">&quot;{key}&quot;</span>
+                <span className="text-primary">&quot;{key}&quot;</span>
                 <span className="text-muted-foreground">: </span>
                 <NodeDataViewer data={obj[key]} depth={depth + 1} />
                 {i < keys.length - 1 && (

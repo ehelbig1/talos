@@ -15,17 +15,17 @@ describe("NodeStatus", () => {
     const { container } = render(<StatusDot status="running" />);
     const dot = container.querySelector(".animate-status-pulse");
     expect(dot).toBeInTheDocument();
-    expect(dot).toHaveClass("bg-blue-500");
+    expect(dot).toHaveClass("bg-info");
   });
 
   it("renders correctly for failed status", () => {
     const { container } = render(<StatusDot status="failed" />);
-    const dot = container.querySelector(".bg-red-500");
+    const dot = container.querySelector(".bg-destructive");
     expect(dot).toBeInTheDocument();
   });
 
   it("exports correct border styles", () => {
-    expect(STATUS_BORDER.running).toBe("border-l-blue-500");
-    expect(STATUS_BORDER.failed).toBe("border-l-red-500");
+    expect(STATUS_BORDER.running).toBe("border-l-info");
+    expect(STATUS_BORDER.failed).toBe("border-l-destructive");
   });
 });

@@ -98,17 +98,17 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
   > = {
     actor_dispatch: {
       label: "Actor",
-      cls: "text-violet-400 bg-violet-400/10 border-violet-400/20",
+      cls: "text-primary bg-primary/10 border-primary/20",
       Icon: Bot,
     },
     scheduled: {
       label: "Schedule",
-      cls: "text-cyan-400 bg-cyan-400/10 border-cyan-400/20",
+      cls: "text-info bg-info/10 border-info/20",
       Icon: CalendarClock,
     },
     webhook: {
       label: "Webhook",
-      cls: "text-blue-400 bg-blue-400/10 border-blue-400/20",
+      cls: "text-info bg-info/10 border-info/20",
       Icon: Webhook,
     },
   };
@@ -195,7 +195,7 @@ function ExecutionRow({
               })}
             </span>
             {agentName && exec.triggerType === "actor_dispatch" && (
-              <span className="flex items-center gap-2 text-violet-400/60">
+              <span className="flex items-center gap-2 text-primary/60">
                 <Bot size={12} />
                 {agentName}
               </span>
@@ -237,7 +237,7 @@ function ExecutionRow({
                       onRetry(exec.id);
                     }}
                     disabled={isRetrying}
-                    className="h-11 px-6 text-sm font-semibold rounded-2xl bg-violet-500/10 border border-violet-500/20 text-violet-400 hover:bg-violet-500/20 transition-ui"
+                    className="h-11 px-6 text-sm font-semibold rounded-2xl bg-primary/10 border border-primary/20 text-primary hover:bg-primary/20 transition-ui"
                   >
                     {isRetrying ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
@@ -254,7 +254,7 @@ function ExecutionRow({
                     onResume(exec.id);
                   }}
                   disabled={isResuming}
-                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 transition-ui"
+                  className="h-11 px-6 text-sm font-semibold rounded-2xl bg-success/10 border border-success/20 text-success hover:bg-success/20 transition-ui"
                 >
                   {isResuming ? (
                     <Loader2 className="w-4 h-4 animate-spin" />

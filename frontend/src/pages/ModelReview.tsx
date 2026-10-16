@@ -315,7 +315,7 @@ export default function ModelReview() {
                         {m.name}
                       </span>
                       {m.pendingDisagreements > 0 && (
-                        <span className="shrink-0 bg-warning text-black text-xs font-semibold rounded-full px-2.5 py-1 min-w-[1.6rem] text-center">
+                        <span className="shrink-0 bg-warning text-warning-foreground text-xs font-semibold rounded-full px-2.5 py-1 min-w-[1.6rem] text-center">
                           {m.pendingDisagreements}
                         </span>
                       )}
