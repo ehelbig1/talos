@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { Plus, Key, Info } from "lucide-react";
+import { Plus, Info } from "lucide-react";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -14,11 +14,8 @@ import {
 import { KeysTable } from "./api-keys/KeysTable";
 import { CreateKeyDialog } from "./api-keys/CreateKeyDialog";
 import { NewKeyDialog } from "./api-keys/NewKeyDialog";
-import {
-  RevokeKeyDialog,
-  RotateKeyDialog,
-  DeleteKeyDialog,
-} from "./api-keys/ConfirmKeyDialogs";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 
 /**
  * UI component that lists the current user's API keys and allows creation of a new one.
@@ -129,26 +126,21 @@ export default function ApiKeysManager() {
 
   return (
     <div className="max-w-6xl mx-auto py-4 space-y-8">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-xl flex items-center justify-center text-primary">
-            <Key size={24} />
-          </div>
-          <div>
-            <h2 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
-              API Ingress Keys
-            </h2>
-            <p className="text-sm text-muted-foreground font-medium tracking-tight">
-              Manage keys for external system access and CI/CD integrations
-            </p>
-          </div>
+      <div className="flex items-center justify-between gap-6">
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            API keys
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            Keys for scripts, CI and other systems that call Talos as you.
+          </p>
         </div>
-        <Button
-          onClick={() => setShowCreate(true)}
-          className="bg-primary hover:bg-primary/90 text-white font-bold px-6 py-6 h-auto rounded-xl transition-ui"
-        >
-          <Plus className="w-5 h-5 mr-1" />
-          Create New Key
+        <Button onClick={() => setShowCreate(true)}>
+          <Plus className="w-4 h-4" />
+          New key
         </Button>
       </div>
 
@@ -165,13 +157,12 @@ export default function ApiKeysManager() {
           <Info size={18} />
         </div>
         <div>
-          <h4 className="text-sm font-bold text-foreground mb-1">
-            Security Best Practice
+          <h4 className="text-sm font-semibold text-foreground mb-1">
+            A key acts as you
           </h4>
           <p className="text-xs text-muted-foreground leading-relaxed">
-            API keys carry the same permissions as your user account. We
-            recommend using **short-lived keys** and assigning only the
-            **minimum necessary scopes** for each integration.
+            A key carries the same permissions as your account. Give each
+            integration a short-lived key with only the scopes it needs.
           </p>
         </div>
       </div>
@@ -198,8 +189,13 @@ export default function ApiKeysManager() {
 
       {/* Revoke confirmation */}
       {revokingId && (
-        <RevokeKeyDialog
-          isPending={revokeMutation.isPending}
+        <ConfirmDialog
+          open
+          title="Revoke this key?"
+          message="Anything using this key loses access now. The key stays in the list as inactive. This cannot be undone."
+          confirmLabel="Revoke key"
+          destructive
+          isLoading={revokeMutation.isPending}
           onCancel={() => setRevokingId(null)}
           onConfirm={() => handleRevoke(revokingId)}
         />
@@ -207,8 +203,12 @@ export default function ApiKeysManager() {
 
       {/* Rotate confirmation */}
       {rotatingId && (
-        <RotateKeyDialog
-          isPending={rotateMutation.isPending}
+        <ConfirmDialog
+          open
+          title="Rotate this key?"
+          message="A new key with the same permissions replaces this one, and the old key stops working now. The new secret is shown once, so have somewhere to save it."
+          confirmLabel="Rotate key"
+          isLoading={rotateMutation.isPending}
           onCancel={() => setRotatingId(null)}
           onConfirm={() => handleRotate(rotatingId)}
         />
@@ -216,8 +216,13 @@ export default function ApiKeysManager() {
 
       {/* Delete confirmation */}
       {deletingId && (
-        <DeleteKeyDialog
-          isPending={deleteMutation.isPending}
+        <ConfirmDialog
+          open
+          title="Delete this key?"
+          message="The key is removed from your account and anything using it loses access now. This cannot be undone."
+          confirmLabel="Delete key"
+          destructive
+          isLoading={deleteMutation.isPending}
           onCancel={() => setDeletingId(null)}
           onConfirm={() => handleDelete(deletingId)}
         />

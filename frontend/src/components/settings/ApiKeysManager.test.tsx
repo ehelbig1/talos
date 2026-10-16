@@ -86,7 +86,7 @@ describe("ApiKeysManager", () => {
       expect(screen.getByText("No API keys found")).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByText("Create New Key"));
+    fireEvent.click(screen.getByText("New key"));
 
     await waitFor(() =>
       expect(
@@ -120,7 +120,7 @@ describe("ApiKeysManager", () => {
       expect(screen.getByText("No API keys found")).toBeInTheDocument(),
     );
 
-    fireEvent.click(screen.getByText("Create New Key"));
+    fireEvent.click(screen.getByText("New key"));
     await waitFor(() =>
       expect(
         screen.getByPlaceholderText("e.g. GitHub Actions Runner"),
@@ -155,9 +155,9 @@ describe("ApiKeysManager", () => {
     fireEvent.click(screen.getByText("Revoke"));
 
     await waitFor(() =>
-      expect(screen.getByText("Revoke API Key?")).toBeInTheDocument(),
+      expect(screen.getByText("Revoke this key?")).toBeInTheDocument(),
     );
-    expect(screen.getByText("Revoke Key")).toBeInTheDocument();
+    expect(screen.getByText("Revoke key")).toBeInTheDocument();
   });
 
   it("shows a confirmation gate before deleting a key", async () => {
@@ -173,8 +173,8 @@ describe("ApiKeysManager", () => {
     fireEvent.click(screen.getByText("Delete"));
 
     await waitFor(() =>
-      expect(screen.getByText("Delete API Key?")).toBeInTheDocument(),
+      expect(screen.getByText("Delete this key?")).toBeInTheDocument(),
     );
-    expect(screen.getByText("Delete Key")).toBeInTheDocument();
+    expect(screen.getByText("Delete key")).toBeInTheDocument();
   });
 });
