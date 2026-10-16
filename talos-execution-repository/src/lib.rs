@@ -31,6 +31,7 @@ pub enum RetryReset {
 /// confidence-gate executions (`/approval-actions/{token}/{action}`).
 pub mod action_links;
 pub mod approval_links;
+pub mod message_deliveries;
 
 /// The fleet-wide stale-execution sweep and the attribution it writes —
 /// "orphaned by a controller restart" vs "genuinely overran".

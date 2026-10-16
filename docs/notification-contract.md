@@ -207,6 +207,30 @@ is not sent, and is counted in `actions_dropped`.
 
 Swapping to an adapter with no such setting loses the box and nothing else.
 
+## What the platform records of a send
+
+The verdict above is the only trace of a message having left: the adapter's
+HTTP call leaves nothing behind, and a node's output is encrypted at rest. So
+the engine reads the verdict when the send node completes
+(`talos_workflow_engine_core::delivery_verdict`) and, for a send that
+happened on a real run, writes one `message_deliveries` row: the workflow,
+execution and node, the `provider` word, `parts_total`, `parts_sent`,
+`actions_sent`, `one_tap_actions`, `kept_actions`, and how the run was
+started. No recipient, no address, no text.
+
+Nothing is written for a dry run (the engine's own flag, before the output is
+read), a skip, or a verdict with no part sent. A verdict outside the bounds
+above (more than 64 parts, a provider word that is not lowercase ASCII) is
+counted as malformed and not written; `talos-catalog-tests/tests/notification_contract.rs`
+holds every adapter's real verdict readable by the engine, so a change to the
+block that the reader does not follow fails CI.
+
+The MCP tool `get_message_engagement` reads that table and sets action-link
+taps against the executions that sent them: per workflow, sends, parts,
+actions, executions, executions with at least one tap, and taps. Rehearsals
+(`started_by_kind = test`) are left out. A new adapter needs nothing beyond
+returning the verdict unchanged.
+
 ## What is not in the contract
 
 Email. The morning message is HTML mail through the delivery pattern

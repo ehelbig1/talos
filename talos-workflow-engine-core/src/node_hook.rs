@@ -68,6 +68,13 @@ pub struct NodeCompletionContext<'a> {
     /// when unknown. The `__ml_distill__` hook accepts a human-confirmed
     /// label only when this is `action_link`.
     pub started_by_kind: Option<&'a str>,
+    /// Whether the run is a dry run (`workflow_executions.dry_run`, the
+    /// engine's own flag, carried into child runs): every send was stubbed,
+    /// so a verdict in `output` that says a message left is not a message
+    /// that left. The hook that records sends (`message_deliveries`) refuses
+    /// on this before it reads the output. The adapter's own `dry_run` word
+    /// is the second check, never the first.
+    pub dry_run: bool,
     /// MONOTONIC execution time in milliseconds, measured from dispatch
     /// to completion with `std::time::Instant` — despite the field name,
     /// which is preserved because it is also the name of the column it

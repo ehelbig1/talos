@@ -995,9 +995,18 @@ pub struct SideTableReap {
     /// [`EXECUTION_COST_ROLLUP_RETENTION_DAYS`] — its own clock, not the
     /// lifetime.
     pub execution_cost_rollup: u64,
-    /// Any of the four stopped at the per-tick cap with a full last batch.
+    /// `message_deliveries` rows older than
+    /// [`MESSAGE_DELIVERY_RETENTION_DAYS`] — its own clock: a year of sends
+    /// and taps is the engagement history, and the rows are small.
+    pub message_deliveries: u64,
+    /// Any of the five stopped at the per-tick cap with a full last batch.
     pub truncated: bool,
 }
+
+/// How long a sent message stays countable (`message_deliveries.sent_at`).
+/// A year: the engagement report compares seasons, and a row is five
+/// integers and three ids.
+pub const MESSAGE_DELIVERY_RETENTION_DAYS: i32 = 365;
 
 /// What tier five deleted.
 ///
@@ -1184,7 +1193,11 @@ impl RetentionPassOutcome {
         // Tier four / five (2026-09-10). Same rule as above: a count and an
         // error are different answers and both are reported.
         if let Some(s) = &self.side_tables {
-            if s.execution_state_orphans + s.llm_usage + s.judge_scores + s.execution_cost_rollup
+            if s.execution_state_orphans
+                + s.llm_usage
+                + s.judge_scores
+                + s.execution_cost_rollup
+                + s.message_deliveries
                 > 0
             {
                 tracing::info!(
@@ -1194,7 +1207,9 @@ impl RetentionPassOutcome {
                     llm_usage = s.llm_usage,
                     judge_scores = s.judge_scores,
                     execution_cost_rollup = s.execution_cost_rollup,
+                    message_deliveries = s.message_deliveries,
                     cost_rollup_retention_days = EXECUTION_COST_ROLLUP_RETENTION_DAYS,
+                    message_delivery_retention_days = MESSAGE_DELIVERY_RETENTION_DAYS,
                     lifetime_days = self
                         .windows
                         .map_or(-1, |w| w.archive_after_days.saturating_add(w.purge_after_days)),
@@ -1842,6 +1857,16 @@ impl AdvancedRepository {
              )",
             batch = RETENTION_BATCH
         );
+        let deliveries_sql = format!(
+            "DELETE FROM message_deliveries WHERE id IN ( \
+                 SELECT id FROM message_deliveries \
+                 WHERE sent_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY sent_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
         let llm = run_batched(&self.db_pool, &llm_sql, days, "reap_llm_usage").await?;
         let judge = run_batched(&self.db_pool, &judge_sql, days, "reap_judge_scores").await?;
         let orphans = run_batched(
@@ -1858,12 +1883,24 @@ impl AdvancedRepository {
             "reap_execution_cost_rollup",
         )
         .await?;
+        let deliveries = run_batched(
+            &self.db_pool,
+            &deliveries_sql,
+            MESSAGE_DELIVERY_RETENTION_DAYS,
+            "reap_message_deliveries",
+        )
+        .await?;
         Ok(SideTableReap {
             execution_state_orphans: orphans.rows,
             llm_usage: llm.rows,
             judge_scores: judge.rows,
             execution_cost_rollup: rollup.rows,
-            truncated: llm.truncated || judge.truncated || orphans.truncated || rollup.truncated,
+            message_deliveries: deliveries.rows,
+            truncated: llm.truncated
+                || judge.truncated
+                || orphans.truncated
+                || rollup.truncated
+                || deliveries.truncated,
         })
     }
 

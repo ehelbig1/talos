@@ -30,6 +30,7 @@ sha2 = { workspace = true }  # used-indirectly: named by included template sourc
 [dev-dependencies]
 talos-compilation = { path = "../talos-compilation" }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }
 tempfile.workspace = true

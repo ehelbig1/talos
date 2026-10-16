@@ -1428,6 +1428,21 @@ async fn seed_cost_rollup(f: &Fixture, age_days: i32) -> Uuid {
     .unwrap()
 }
 
+async fn seed_message_delivery(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO message_deliveries (workflow_id, execution_id, node_id, provider, parts_total, parts_sent, \
+                                         actions_sent, one_tap_actions, kept_actions, sent_at) \
+         VALUES ($1, $2, $3, 'ntfy', 1, 1, 0, 0, 0, NOW() - make_interval(days => $4::int)) RETURNING id",
+    )
+    .bind(f.workflow)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(age_days)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
 async fn seed_judge_score(f: &Fixture, age_days: i32) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO judge_scores (workflow_id, node_id, execution_id, score, passed, created_at) \
@@ -1550,6 +1565,9 @@ async fn side_table_reap_is_clocked_on_total_lifetime_and_spares_the_young() {
     let rollup_old = seed_cost_rollup(&f, 91).await;
     let rollup_past_lifetime = seed_cost_rollup(&f, 70).await;
     let rollup_new = seed_cost_rollup(&f, 5).await;
+    // Sent messages keep their own clock (a year), like the rollup.
+    let delivery_old = seed_message_delivery(&f, 400).await;
+    let delivery_past_lifetime = seed_message_delivery(&f, 100).await;
 
     let refused = f.repo.reap_execution_side_tables(0).await.unwrap();
     assert_eq!(
@@ -1568,6 +1586,12 @@ async fn side_table_reap_is_clocked_on_total_lifetime_and_spares_the_young() {
     assert!(reap.judge_scores >= 1, "{reap:?}");
     assert!(reap.execution_state_orphans >= 1, "{reap:?}");
     assert!(reap.execution_cost_rollup >= 1, "{reap:?}");
+    assert!(reap.message_deliveries >= 1, "{reap:?}");
+    assert!(!row_exists(&f, "message_deliveries", delivery_old).await);
+    assert!(
+        row_exists(&f, "message_deliveries", delivery_past_lifetime).await,
+        "a sent message past the execution lifetime but inside its own retention is kept"
+    );
     assert!(!row_exists(&f, "execution_cost_rollup", rollup_old).await);
     assert!(
         row_exists(&f, "execution_cost_rollup", rollup_past_lifetime).await,
