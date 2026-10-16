@@ -310,6 +310,26 @@ def write(templates_dir, slug, files, force):
     return target
 
 
+# What a template directory may hold that the scan reads: text a person wrote.
+SCANNED_SUFFIXES = (".rs", ".json", ".md", ".txt", ".toml", ".yaml", ".yml")
+
+
+def scan_templates(templates_dir, only=None):
+    """Every identifier in the catalog's templates, as `{slug: [(file, identifier), ...]}`.
+
+    A template written straight into `module-templates/` never meets the scan a
+    promotion runs, so CI runs this over the whole catalog (`make check-catalog`)."""
+    found = {}
+    for template in sorted(pathlib.Path(templates_dir).iterdir()):
+        if not template.is_dir() or (only and template.name != only):
+            continue
+        for path in sorted(template.rglob("*")):
+            if path.is_file() and path.suffix in SCANNED_SUFFIXES:
+                for identifier in identifiers(path.read_text(errors="replace")):
+                    found.setdefault(template.name, []).append((str(path.relative_to(template)), identifier))
+    return found
+
+
 def run(argv):
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("module_dir", nargs="?")
@@ -323,9 +343,23 @@ def run(argv):
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--scan", action="store_true", help="scan module-templates/ (or --slug) for identifiers, and write nothing")
     args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
+    if args.scan:
+        if args.slug and not (pathlib.Path(args.templates_dir) / args.slug).is_dir():
+            return 0  # not a template of this directory: nothing here to scan
+        found = scan_templates(args.templates_dir, args.slug)
+        for slug, hits in found.items():
+            for relative, identifier in hits:
+                print(f"{slug}/{relative}: {identifier}", file=sys.stderr)
+        if found:
+            print("refused: the templates above hold identifiers. This repository is public: replace each with a "
+                  "made-up value (an address at example.com, a project named example-…).", file=sys.stderr)
+            return 1
+        print("no identifiers in " + (args.slug or pathlib.Path(args.templates_dir).name))
+        return 0
     if not args.module_dir:
         parser.error("module_dir is required")
     try:
@@ -522,6 +556,17 @@ def self_test():
         # 7. Reserved example addresses are not identifiers; a real-looking one is.
         check("example addresses pass", identifiers("a@corp.example b@example.com c@x.test") == [])
         check("nil uuid passes", identifiers(NIL_UUID) == [])
+        # 9. The catalog scan reads every text file of a template, and only those.
+        catalog = scratch / "catalog"
+        (catalog / "clean-one").mkdir(parents=True)
+        (catalog / "clean-one" / "template.rs").write_text("// owner@example.com\n")
+        (catalog / "leaky-one" / "fixtures").mkdir(parents=True)
+        leaked = "pat" + "@" + "corp-domain.io"
+        (catalog / "leaky-one" / "fixtures" / "http.json").write_text(json.dumps([{"body": leaked}]))
+        (catalog / "leaky-one" / "logo.png").write_bytes(b"pat" + b"@" + b"corp-domain.io")
+        found = scan_templates(catalog)
+        check("catalog scan finds the leak in a fixture", found == {"leaky-one": [("fixtures/http.json", leaked)]}, str(found))
+        check("catalog scan for one template", scan_templates(catalog, "clean-one") == {}, str(scan_templates(catalog, "clean-one")))
         # 8. Three placeholder shapes pass, and the real shapes beside them do not.
         check("a version is no address", identifiers("uses: org/scan-action@0.28.0") == [])
         agents = ("123456@cloudservices.gserviceaccount.com 123456-compute@developer.gserviceaccount.com "

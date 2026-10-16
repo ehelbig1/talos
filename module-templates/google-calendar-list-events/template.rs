@@ -299,7 +299,7 @@ mod tests {
     #[test]
     fn an_invitation_reports_what_a_planner_needs() {
         let e = event_json(event(json!({
-            "id": "abc", "iCalUID": "uid-1@google.com", "status": "confirmed", "summary": "Design review",
+            "id": "abc", "iCalUID": "uid-1@example.com", "status": "confirmed", "summary": "Design review",
             "start": {"dateTime": "2026-10-06T10:30:00-04:00"}, "end": {"dateTime": "2026-10-06T11:30:00-04:00"},
             "hangoutLink": "https://meet.example/x", "recurringEventId": "r1", "organizer": {"self": false},
             "attendees": [
@@ -309,7 +309,7 @@ mod tests {
             ]
         })))
         .unwrap();
-        assert_eq!(e["uid"], "uid-1@google.com");
+        assert_eq!(e["uid"], "uid-1@example.com");
         assert_eq!(e["busy"], true);
         assert_eq!(e["event_type"], "default");
         assert_eq!(e["response"], "tentative", "the owner's own answer, not a guest's");

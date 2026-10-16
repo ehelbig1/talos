@@ -18,6 +18,9 @@ type LlmHandler = Box<
 struct State {
     http: Option<HttpHandler>,
     http_seen: Vec<wit_http::Request>,
+    /// Every request that was answered, with its answer, in order: what
+    /// `recorded_run::keep` writes as the template's recorded run.
+    http_served: Vec<(wit_http::Request, wit_http::Response)>,
     memory: BTreeMap<String, String>,
     memory_fails: bool,
     secrets: BTreeMap<String, Vec<u8>>,
@@ -65,6 +68,12 @@ pub mod http {
         }
     }
 
+    /// Every request answered so far on this thread, with its answer, in order.
+    #[must_use]
+    pub fn served() -> Vec<(wit_http::Request, wit_http::Response)> {
+        with(|s| s.http_served.clone())
+    }
+
     /// Every request made so far on this thread, in order.
     #[must_use]
     pub fn requests() -> Vec<wit_http::Request> {
@@ -86,6 +95,9 @@ pub mod http {
         with(|s| {
             if s.http.is_none() {
                 s.http = Some(handler);
+            }
+            if let Ok(response) = &out {
+                s.http_served.push((req.clone(), response.clone()));
             }
         });
         out

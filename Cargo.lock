@@ -9367,6 +9367,7 @@ dependencies = [
  "chrono",
  "chrono-tz 0.10.4",
  "hmac 0.13.0",
+ "serde_json",
  "sha2 0.11.0",
 ]
 

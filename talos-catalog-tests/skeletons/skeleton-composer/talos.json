@@ -1,0 +1,19 @@
+{
+  "name": "skeleton-composer",
+  "version": "v1.0.0",
+  "display_name": "Skeleton Composer",
+  "description": "TODO(author): what it renders, from which node's output, into which surface. Renders; decides nothing; reaches no network.",
+  "category": "Utilities",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "allowed_methods": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "block": {"role": "composer"},
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "TITLE": {"type": "string", "default": "Picked today", "description": "The message's title, cut at 120 characters."}
+    }
+  }
+}

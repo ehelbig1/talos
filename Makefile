@@ -36,6 +36,10 @@ SERVICE            ?= controller
 # i.e. the flag warned on correct invocations and taught readers to ignore it.
 ARGS               ?=
 TEMPLATE           ?=
+# make new-template: the new template's name, its role, and (reader, sender) its API host.
+SLUG               ?=
+ROLE               ?=
+HOST               ?=
 CHANGELOG_WRITE    ?=
 CONTROLLER_URL     ?= http://localhost:8000
 
@@ -46,7 +50,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart audit-module-worlds _audit-module-worlds-gate \
-        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-db test-db-stop test-integration test-clean coverage-html audit check-catalog check-catalog-fuel test-integration-scaffold test-alert-rules ci \
+        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-db test-db-stop test-integration test-clean coverage-html audit check-catalog check-catalog-fuel new-template record-template template test-integration-scaffold test-alert-rules ci \
         check-lockfile check-changelog-fragments clippy test-unit test-dbfree test-doc test-benches test-scripts \
         check-frontend-codegen typecheck-frontend test-frontend audit-frontend \
         drill drill-schedule drill-unschedule drill-schedule-status \
@@ -561,6 +565,15 @@ test-alert-rules: ## promtool `check rules` on both alert files + `test rules` o
 		check rules /repo/deploy/helm/talos/files/alerts.yaml /repo/observability/rules/alerts.yml
 	@docker run --rm -v "$(CURDIR):/repo:ro" --entrypoint promtool $(PROMTOOL_IMAGE) \
 		test rules /repo/observability/alerts_test.yml /repo/observability/alerts_chart_test.yml
+
+new-template: ## Start a catalog template from its role's skeleton: SLUG=<slug> ROLE=reader|decider|keeper|composer|sender [HOST=<api host>]
+	@python3 scripts/template.py new "$(SLUG)" --role "$(ROLE)" $(if $(HOST),--host "$(HOST)")
+
+record-template: ## Write a template's recorded run (fixtures/) from the test that keeps it: TEMPLATE=<slug>
+	@python3 scripts/template.py record "$(TEMPLATE)"
+
+template: ## Every gate CI runs on one template, fastest first, stopping with what to fix: TEMPLATE=<slug>
+	@python3 scripts/template.py check "$(TEMPLATE)"
 
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh

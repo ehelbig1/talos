@@ -29,26 +29,10 @@ use talos_catalog_tests as catalog;
 
 type Run = fn(String) -> Result<String, String>;
 
-/// Every template that carries planted faults. A template with a
-/// `fixtures/planted/` directory and no row here fails
-/// `every_template_with_planted_faults_is_held_here`.
-const CHECKS: &[(&str, Run)] = &[
-    (
-        "artifact-registry-check",
-        catalog::artifact_registry_check::run,
-    ),
-    ("binauthz-check", catalog::binauthz_check::run),
-    (
-        "github-dependency-scan-check",
-        catalog::github_dependency_scan_check::run,
-    ),
-    ("github-env-check", catalog::github_env_check::run),
-    (
-        "security-alerting-check",
-        catalog::security_alerting_check::run,
-    ),
-    ("wif-check", catalog::wif_check::run),
-];
+/// Every security check template (found by its source: it answers
+/// `CATALOGUE_ONLY`), with its entry point. Nothing is registered by hand: a
+/// new check is held here from the moment it exists.
+const CHECKS: &[(&str, Run)] = catalog::SECURITY_CHECKS;
 
 const PREDATING: &[(&str, &[&str])] = &[
     (
@@ -234,10 +218,16 @@ fn every_template_with_planted_faults_is_held_here() {
         .flatten()
     {
         let name = entry.file_name().to_string_lossy().to_string();
+        let answers_catalogue = std::fs::read_to_string(entry.path().join("template.rs"))
+            .is_ok_and(|t| t.contains("\"CATALOGUE_ONLY\""));
+        assert!(
+            !answers_catalogue || held.contains(name.as_str()),
+            "{name} is a security check (it answers CATALOGUE_ONLY) with no #[cfg(test)] module, so its rules are held to nothing: give it tests"
+        );
         if entry.path().join("fixtures").join("planted").is_dir() {
             assert!(
                 held.contains(name.as_str()),
-                "{name} carries planted faults and is not in CHECKS here, so nothing runs them"
+                "{name} carries planted faults but is not found as a security check (its source does not answer CATALOGUE_ONLY, or it has no #[cfg(test)] module), so nothing runs them"
             );
             found.insert(name);
         }

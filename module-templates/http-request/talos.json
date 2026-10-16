@@ -34,10 +34,12 @@
           "DELETE",
           "PATCH"
         ],
-        "default": "GET"
+        "default": "GET",
+        "description": "The HTTP method. Default GET. The installed copy's allowed_methods must include it."
       },
       "URL": {
-        "type": "string"
+        "type": "string",
+        "description": "The URL to request. Its host must be one the installed copy is granted (allowed_hosts)."
       },
       "HEADERS": {
         "type": "array",
@@ -51,14 +53,17 @@
               "type": "string"
             }
           }
-        }
+        },
+        "description": "Request headers, as a list of {key, value}. A value written as a vault:// reference is replaced by the platform with the secret, never seen by the module, and only when the copy is granted that secret and the URL's host is named in its allowed_hosts (\"*\" names no host)."
       },
       "BODY": {
-        "type": "string"
+        "type": "string",
+        "description": "The request body, sent as written (for POST, PUT and PATCH)."
       },
       "TIMEOUT_MS": {
         "type": "number",
-        "default": 5000
+        "default": 5000,
+        "description": "How long to wait for the response, in milliseconds. Default 5000."
       },
       "SANITIZE_FOR_LLM": {
         "type": "boolean",

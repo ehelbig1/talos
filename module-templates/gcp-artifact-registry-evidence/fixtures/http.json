@@ -1,47 +1,47 @@
 [
- {
-  "method": "GET",
-  "url_contains": "serviceusage.googleapis.com/v1/projects/example-np/services/containerscanning.googleapis.com",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
+  {
+    "body": "{\"state\":\"DISABLED\"}",
+    "headers": {
+      "date": "Wed, 14 Oct 2026 12:00:00 GMT"
+    },
+    "method": "GET",
+    "status": 200,
+    "url_contains": "serviceusage.googleapis.com/v1/projects/example-np/services/containerscanning.googleapis.com"
   },
-  "body": "{\"name\":\"projects/123/services/containerscanning.googleapis.com\",\"state\":\"ENABLED\"}"
- },
- {
-  "method": "GET",
-  "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations?pageSize=100",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
+  {
+    "body": "{\"locations\":[{\"locationId\":\"us-central1\",\"name\":\"projects/example-np/locations/us-central1\"},{\"locationId\":\"europe-west1\",\"name\":\"projects/example-np/locations/europe-west1\"}]}",
+    "headers": {
+      "date": "Wed, 14 Oct 2026 12:00:00 GMT"
+    },
+    "method": "GET",
+    "status": 200,
+    "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations"
   },
-  "body": "{\"locations\":[{\"locationId\":\"us-central1\",\"name\":\"projects/example-np/locations/us-central1\"},{\"locationId\":\"europe-west1\",\"name\":\"projects/example-np/locations/europe-west1\"}]}"
- },
- {
-  "method": "GET",
-  "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations/us-central1/repositories?pageSize=1000",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
+  {
+    "body": "{\"repositories\":[{\"cleanupPolicies\":{\"delete-old\":{\"action\":\"DELETE\",\"condition\":{\"olderThan\":\"2592000s\"},\"id\":\"delete-old\"},\"keep-recent\":{\"action\":\"KEEP\",\"id\":\"keep-recent\",\"mostRecentVersions\":{\"keepCount\":5}}},\"dockerConfig\":{\"immutableTags\":true},\"format\":\"DOCKER\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/apps\",\"sizeBytes\":\"12345\",\"vulnerabilityScanningConfig\":{\"enablementConfig\":\"INHERITED\",\"enablementState\":\"SCANNING_ACTIVE\"}},{\"cleanupPolicyDryRun\":true,\"format\":\"DOCKER\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/scratch\"},{\"format\":\"MAVEN\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/libs\",\"vulnerabilityScanningConfig\":{\"enablementState\":\"SCANNING_DISABLED\"}}]}",
+    "headers": {
+      "date": "Wed, 14 Oct 2026 12:00:00 GMT"
+    },
+    "method": "GET",
+    "status": 200,
+    "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations/us-central1/repositories"
   },
-  "body": "{\"repositories\":[{\"cleanupPolicies\":{\"delete-old\":{\"action\":\"DELETE\",\"condition\":{\"olderThan\":\"2592000s\"},\"id\":\"delete-old\"},\"keep-recent\":{\"action\":\"KEEP\",\"id\":\"keep-recent\",\"mostRecentVersions\":{\"keepCount\":5}}},\"dockerConfig\":{\"immutableTags\":true},\"format\":\"DOCKER\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/apps\",\"sizeBytes\":\"12345\",\"vulnerabilityScanningConfig\":{\"enablementConfig\":\"INHERITED\",\"enablementState\":\"SCANNING_ACTIVE\"}},{\"cleanupPolicyDryRun\":true,\"format\":\"DOCKER\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/scratch\"},{\"format\":\"MAVEN\",\"mode\":\"STANDARD_REPOSITORY\",\"name\":\"projects/example-np/locations/us-central1/repositories/libs\",\"vulnerabilityScanningConfig\":{\"enablementState\":\"SCANNING_DISABLED\"}},{\"name\":\"projects/example-np/locations/us-central1/repositories/old\"}]}"
- },
- {
-  "method": "GET",
-  "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations/europe-west1/repositories?pageSize=1000",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
+  {
+    "body": "{}",
+    "headers": {
+      "date": "Wed, 14 Oct 2026 12:00:00 GMT"
+    },
+    "method": "GET",
+    "status": 200,
+    "url_contains": "artifactregistry.googleapis.com/v1/projects/example-np/locations/europe-west1/repositories"
   },
-  "body": "{}"
- },
- {
-  "method": "GET",
-  "url_contains": "containeranalysis.googleapis.com/v1/projects/example-np/occurrences?filter=kind%3D%22VULNERABILITY%22&pageSize=1000",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
-  },
-  "body": "{\"occurrences\":[{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0001\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0001\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0002\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0002\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"HIGH\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0003\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0003\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"MEDIUM\",\"vexAssessment\":{\"state\":\"NOT_AFFECTED\"}}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0004\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0004\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0005\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0005\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"SEVERITY_UNSPECIFIED\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0006\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0006\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"LOW\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"LOW\"}},{\"kind\":\"PACKAGE\",\"name\":\"projects/example-np/occurrences/pkg\",\"resourceUri\":\"https://example.invalid/x\"}]}"
- }
+  {
+    "body": "{\"occurrences\":[{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0001\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0001\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0002\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0002\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"HIGH\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0003\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0003\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"MEDIUM\",\"vexAssessment\":{\"state\":\"NOT_AFFECTED\"}}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0004\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0004\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\"}},{\"createTime\":\"2026-08-01T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0006\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0006\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/web@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"LOW\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"LOW\"}},{\"kind\":\"PACKAGE\",\"name\":\"projects/example-np/occurrences/pkg\",\"resourceUri\":\"https://example.invalid/x\"},{\"createTime\":\"2026-09-14T00:00:00Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0007\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0007\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\",\"vexAssessment\":{\"state\":\"UNDER_INVESTIGATION\"}}},{\"createTime\":\"2026-09-13T11:59:59.5Z\",\"kind\":\"VULNERABILITY\",\"name\":\"projects/example-np/occurrences/CVE-2026-0008\",\"noteName\":\"projects/goog-vulnz/notes/CVE-2026-0008\",\"resourceUri\":\"https://us-central1-docker.pkg.dev/example-np/apps/api@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"vulnerability\":{\"cvssScore\":9.8,\"effectiveSeverity\":\"CRITICAL\",\"packageIssue\":[{\"affectedPackage\":\"openssl\"}],\"severity\":\"CRITICAL\",\"vexAssessment\":{\"state\":\"AFFECTED\"}}}]}",
+    "headers": {
+      "date": "Wed, 14 Oct 2026 12:00:00 GMT"
+    },
+    "method": "GET",
+    "status": 200,
+    "url_contains": "containeranalysis.googleapis.com/v1/projects/example-np/occurrences"
+  }
 ]

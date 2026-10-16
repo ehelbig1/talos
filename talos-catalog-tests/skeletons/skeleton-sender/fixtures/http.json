@@ -1,0 +1,8 @@
+[
+  {
+    "body": "{}",
+    "method": "POST",
+    "status": 201,
+    "url_contains": "api.example.com/v1/messages"
+  }
+]

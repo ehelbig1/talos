@@ -17,16 +17,16 @@
 //! This is a source check, because the property is about every call site,
 //! including ones no behavioural test happens to drive.
 
-use std::path::{Path, PathBuf};
-
 fn template_sources() -> Vec<(String, String)> {
-    let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
-    let mut out: Vec<(String, String)> = std::fs::read_dir(&root)
-        .expect("module-templates")
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let slug = e.file_name().to_string_lossy().into_owned();
-            std::fs::read_to_string(e.path().join("template.rs"))
+    let mut out: Vec<(String, String)> = talos_catalog_tests::template_dirs()
+        .into_iter()
+        .filter_map(|dir| {
+            let slug = dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            std::fs::read_to_string(dir.join("template.rs"))
                 .ok()
                 .map(|text| (slug, text))
         })

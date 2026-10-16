@@ -1,0 +1,4 @@
+{
+  "AUTH_HEADER": "Bearer vault://example/token",
+  "DRY_RUN": false
+}

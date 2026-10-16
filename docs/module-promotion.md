@@ -1,5 +1,10 @@
 # Promoting a module to the catalog
 
+Writing a new template from scratch is `make new-template` (see
+`docs/writing-a-template.md`). This page is for a module that was written and
+proven somewhere else first. Both end at the same check: `make template
+TEMPLATE=<slug>`.
+
 A module has two homes.
 
 * **Your own modules** are written, compiled and run on your platform. Nothing

@@ -482,8 +482,12 @@ const RELEASE: &str = "on: workflow_dispatch\r\njobs:\r\n  r:\r\n    steps:\r\n 
 fn repo(name: &str) -> Value {
     json!({"name": name, "archived": false, "owner": {"login": "Example-Org"}})
 }
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": {"AUTH_HEADER": "Bearer x", "OWNER": "Example-Org"}}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": {"AUTH_HEADER": "Bearer x", "OWNER": "Example-Org"}}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 /// Answers by path: the installation's repositories, each repository's workflows, and each file.
 fn github(repos: Value, workflows: fn(&str) -> (u16, Value), file: fn(&str) -> (u16, String)) {
@@ -562,6 +566,8 @@ fn it_reads_each_repositorys_active_workflow_files_and_hands_on_their_steps() {
     assert_eq!(judged["table"]["rows"][0][2], "dependency review, npm audit, cargo deny, cargo audit");
     // cargo audit runs only by hand; the others run on pushes and pull requests.
     assert_eq!(judged["table"]["rows"][0][3], "dependency review, npm audit, cargo deny");
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=github-workflows-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("github-workflows-evidence", &envelope());
 }
 
 #[test]

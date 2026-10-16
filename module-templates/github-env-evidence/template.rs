@@ -338,8 +338,12 @@ fn github(repos: Value, envs: fn(&str) -> (u16, Value)) {
         })
     });
 }
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": {"AUTH_HEADER": "Bearer x", "OWNER": "Example-Org"}}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": {"AUTH_HEADER": "Bearer x", "OWNER": "Example-Org"}}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 fn two_envs(name: &str) -> (u16, Value) {
     if name == "infra" {
@@ -378,6 +382,8 @@ fn it_reads_the_installations_repositories_and_what_protects_each_environment() 
     for h in ["Authorization", "X-GitHub-Api-Version", "User-Agent"] {
         assert!(seen[0].headers.iter().any(|(k, _)| k == h), "{h}");
     }
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=github-env-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("github-env-evidence", &envelope());
 }
 
 #[test]

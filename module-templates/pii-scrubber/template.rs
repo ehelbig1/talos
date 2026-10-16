@@ -60,7 +60,7 @@ fn run(input: String) -> Result<String, String> {
 
     let mut detections: Vec<Detection> = Vec::new();
 
-    // Email: scan for pattern like word@word.word
+    // Email: scan for the pattern local-part, "@", then a dotted domain
     fn scrub_emails(text: &str, token: &str, preserve: bool) -> (String, usize) {
         let _ = preserve; // Emails don't have a meaningful partial format
         let chars: Vec<char> = text.chars().collect();

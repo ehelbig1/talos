@@ -5,6 +5,9 @@ it is. The next workflow is then mostly blocks that already exist, joined by
 shapes that already exist, and the review of a new block is a review against
 the rules of its role rather than of everything a module could do.
 
+To write one, start from its role's skeleton: `make new-template SLUG=<slug>
+ROLE=<role>` (`docs/writing-a-template.md`).
+
 This page is the standard. It does not repeat the rules it builds on; it
 points at them: the module rules in `CLAUDE.md` ("WASM Module Development
 Rules"), `docs/module-authoring.md`, `docs/module-testing.md`,

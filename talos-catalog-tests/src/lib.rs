@@ -18,6 +18,28 @@
 pub use talos_module_testkit::talos;
 
 include!(concat!(env!("OUT_DIR"), "/modules.rs"));
+
+/// Every template directory a gate holds: the catalog's (`module-templates/`)
+/// and the skeletons `make new-template` copies (`skeletons/`), sorted by
+/// name. A gate that reads templates reads them from here, so a skeleton can
+/// never pass less than a template must.
+#[must_use]
+pub fn template_dirs() -> Vec<std::path::PathBuf> {
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut dirs: Vec<std::path::PathBuf> =
+        [here.join("../module-templates"), here.join("skeletons")]
+            .iter()
+            .flat_map(|root| {
+                std::fs::read_dir(root)
+                    .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+                    .filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_dir())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    dirs.sort_by_key(|d| d.file_name().map(std::ffi::OsStr::to_os_string));
+    dirs
+}
 include!(concat!(env!("OUT_DIR"), "/discovered.rs"));
 
 #[cfg(test)]

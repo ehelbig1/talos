@@ -522,8 +522,12 @@ use talos_module_testkit::host;
 const P: &str = "example-np";
 const DATE: &str = "Wed, 14 Oct 2026 12:00:00 GMT";
 
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 fn dated(status: u16, body: String) -> talos::core::http::Response {
     let mut r = host::http::response(status, body);
@@ -673,6 +677,8 @@ fn what_the_reader_hands_on_is_judged_when_every_row_says() {
     let says: Vec<&str> = judged["findings"].as_array().unwrap()[4..].iter().map(|f| f["says"].as_str().unwrap()).collect();
     assert_eq!(says, ["has 1 CRITICAL finding open for more than 30 days, the oldest 31 days", "has 2 CRITICAL findings open for more than 30 days, the oldest 74 days"]);
     assert_eq!(judged["not_assessed"], json!([]));
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=gcp-artifact-registry-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("gcp-artifact-registry-evidence", &envelope());
 }
 
 #[test]

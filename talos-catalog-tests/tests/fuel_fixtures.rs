@@ -289,19 +289,65 @@ async fn measure(
     let consumed = measured
         .unwrap_or_else(|| panic!("{slug}: the run reported no fuel measurement"))
         .consumed;
+    let measured_bytes = response_bytes + serde_json::to_string(&input).map_or(0, |t| t.len());
     assert!(
         declared.is_some(),
         "{slug}: has a recorded run but declares no recommended_fuel in talos.json. This run \
-         used {consumed} fuel over {response_bytes} bytes of recorded response (a module that \
-         makes no request is measured on its input.json); declare a \
-         recommended_fuel whose limit keeps that under {:.0}% (docs/module-promotion.md).",
-        HIGH_FUEL_UTILISATION * 100.0
+         used {consumed} fuel over {measured_bytes} bytes (recorded responses and input). \
+         A budget that holds this run under {:.0}% of its limit, to paste into talos.json:\n\n  \
+         \"recommended_fuel\": {}\n\n\
+         It is sized for THIS recording. Raise expected_items or bytes_per_item to the largest \
+         payload the module should handle (its own caps on pages and items are the guide), then \
+         run this again (docs/module-promotion.md).",
+        HIGH_FUEL_UTILISATION * 100.0,
+        suggested_budget(consumed, measured_bytes)
     );
     Measured {
         slug,
         consumed,
         limit,
         response_bytes,
+    }
+}
+
+/// A `recommended_fuel` whose computed limit holds a run that used
+/// `consumed` fuel over `bytes` of payload at or under half its limit: one
+/// item at the per-byte rate the run showed (clamped to the formula's
+/// ceiling, with the bytes raised to carry the rest), doubled. Computed with
+/// the formula the catalog row is sized by (`max_fuel_from_budget`), so what
+/// is printed is what the row will get.
+fn suggested_budget(consumed: u64, bytes: usize) -> serde_json::Value {
+    let bytes = (bytes as u64).max(1_000);
+    let per_byte = consumed
+        .div_ceil(bytes)
+        .clamp(1, talos_compilation::scaffold::FUEL_PER_BYTE_MAX);
+    serde_json::json!({
+        "expected_items": 1,
+        "bytes_per_item": bytes.max(consumed.div_ceil(per_byte)),
+        "fuel_per_byte": per_byte,
+        "llm_output_bytes": 0,
+        "safety_multiplier": 2.0,
+    })
+}
+
+#[test]
+fn a_suggested_budget_holds_its_run_with_room_to_spare() {
+    for (consumed, bytes) in [
+        (547_259, 1_598),
+        (10_900_000, 74_000),
+        (400_000, 0),
+        (3_000_000, 2_000),
+    ] {
+        let budget = suggested_budget(consumed, bytes);
+        let limit =
+            talos_compilation::scaffold::max_fuel_from_budget(&budget).expect("a valid budget");
+        // Display and one comparison against a two-decimal threshold.
+        #[allow(clippy::cast_precision_loss)]
+        let share = consumed as f64 / limit as f64;
+        assert!(
+            share <= HIGH_FUEL_UTILISATION,
+            "{consumed} over {bytes}: {budget} gives {limit} ({share:.2})"
+        );
     }
 }
 

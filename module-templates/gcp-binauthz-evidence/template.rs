@@ -380,8 +380,12 @@ use talos::core::http::Method;
 use talos_module_testkit::host;
 
 const P: &str = "example-np";
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 fn policy() -> Value {
     json!({
@@ -483,6 +487,8 @@ fn the_api_the_policy_the_clusters_and_the_services_are_read_with_gets_in_the_sh
         ("cloud-run-not-enforcing", "Cloud Run service us-central1/preview"),
     ]);
     assert_eq!((judged["not_assessed"].clone(), judged["clean"].clone()), (json!([]), json!(false)));
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=gcp-binauthz-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("gcp-binauthz-evidence", &envelope());
 }
 
 #[test]

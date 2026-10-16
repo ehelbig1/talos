@@ -1,0 +1,20 @@
+{
+  "name": "skeleton-decider",
+  "version": "v1.0.0",
+  "display_name": "Skeleton Decider",
+  "description": "TODO(author): what it decides, from which reader's output, and what its output says. Calls nothing.",
+  "category": "Utilities",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "allowed_methods": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "block": {"role": "decider"},
+  "config_schema": {
+    "type": "object",
+    "required": ["WORDS"],
+    "properties": {
+      "WORDS": {"type": "array", "items": {"type": "string"}, "description": "The words that pick an item when its name holds one (1 to 20, matched without regard to case)."}
+    }
+  }
+}

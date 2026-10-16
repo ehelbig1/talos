@@ -1,0 +1,4 @@
+{
+  "AUTH_HEADER": "Bearer vault://example/token",
+  "MAX_ITEMS": 3
+}

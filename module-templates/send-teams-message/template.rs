@@ -51,7 +51,7 @@ fn run(input: String) -> Result<String, String> {
     // Build an Adaptive Card payload compatible with Teams Incoming Webhooks.
     let payload = serde_json::json!({
         "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
+        "@context": "https://schema.org/extensions", // host-not-requested: the MessageCard format's JSON-LD context, never fetched
         "themeColor": color,
         "summary": if title.is_empty() { text } else { title },
         "sections": [{
