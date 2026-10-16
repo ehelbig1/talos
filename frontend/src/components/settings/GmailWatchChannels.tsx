@@ -9,6 +9,7 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import type { QueryKey } from "@tanstack/react-query";
@@ -260,12 +261,12 @@ function CreateGmailWatchDialog({
           >
             {submitting ? (
               <>
-                <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2" />
+                <Spinner className="w-3.5 h-3.5 mr-2" />
                 Creating…
               </>
             ) : watchesFetching ? (
               <>
-                <span className="w-3.5 h-3.5 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin mr-2" />
+                <Spinner className="w-3.5 h-3.5 mr-2" />
                 Syncing…
               </>
             ) : (
@@ -755,7 +756,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                           className="h-8 px-2.5 text-xs"
                         >
                           {cur === "test" ? (
-                            <span className="w-3 h-3 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin" />
+                            <Spinner className="w-3 h-3" />
                           ) : (
                             <Activity size={13} />
                           )}
@@ -769,7 +770,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                           className="h-8 px-2.5 text-xs"
                         >
                           {cur === "renew" ? (
-                            <span className="w-3 h-3 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin" />
+                            <Spinner className="w-3 h-3" />
                           ) : (
                             <RefreshCw size={13} />
                           )}
@@ -788,7 +789,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
                           className="h-8 px-2.5 text-xs text-destructive hover:text-destructive"
                         >
                           {cur === "stop" ? (
-                            <span className="w-3 h-3 border-2 border-destructive/30 border-t-destructive rounded-full animate-spin" />
+                            <Spinner className="w-3 h-3 text-destructive" />
                           ) : (
                             <XCircle size={13} />
                           )}

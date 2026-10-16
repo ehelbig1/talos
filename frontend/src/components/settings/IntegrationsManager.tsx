@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { ExternalLink, HelpCircle } from "lucide-react";
 import { GoogleCalendarWatchChannels } from "./GoogleCalendarWatchChannels";
@@ -79,7 +80,7 @@ export function IntegrationsManager() {
                 <ExternalLink size={28} />
               </div>
               <div className="flex flex-col">
-                <h2 className="text-3xl md:text-4xl font-semibold text-white tracking-tight">
+                <h2 className="text-3xl md:text-2xl font-semibold text-white tracking-tight">
                   Integrations
                 </h2>
                 <div className="flex flex-wrap items-center gap-3 mt-2">
@@ -106,13 +107,7 @@ export function IntegrationsManager() {
       </div>
 
       {loadingServices ? (
-        <div className="flex flex-col items-center justify-center py-32 gap-6">
-          <div className="relative">
-            <div className="w-16 h-16 border-2 border-primary/10 rounded-full" />
-            <div className="w-16 h-16 border-t-2 border-primary rounded-full animate-spin absolute inset-0" />
-          </div>
-          <p className="text-xs text-primary/60 font-semibold">Loading…</p>
-        </div>
+        <LoadingState />
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
           {providers.map((provider) => (

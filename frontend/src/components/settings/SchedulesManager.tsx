@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
@@ -411,7 +413,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
               )}
             >
               {toggleMutation.isPending ? (
-                <div className="w-4 h-4 border-2 border-warning/20 border-t-warning rounded-full animate-spin" />
+                <Spinner className="text-warning" />
               ) : schedule.isEnabled ? (
                 <ToggleRight size={22} />
               ) : (
@@ -544,21 +546,16 @@ export default function SchedulesManager() {
 
       {/* Content */}
       {schedulesLoading ? (
-        <div className="flex flex-col items-center justify-center py-32 gap-6">
-          <div className="w-16 h-16 border-4 border-warning/10 border-t-warning rounded-full animate-spin" />
-          <p className="text-xs text-muted-foreground/70 font-semibold">
-            Synchronizing Time-Stream...
-          </p>
-        </div>
+        <LoadingState label="Loading schedules…" />
       ) : schedules.length === 0 ? (
-        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-24 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
-          <div className="w-24 h-24 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
+        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
+          <div className="w-14 h-14 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
             <Calendar size={48} />
           </div>
           <h3 className="text-2xl font-semibold text-white tracking-tight mb-4">
             No schedules yet
           </h3>
-          <p className="text-sm text-muted-foreground/70 max-w-sm mb-10 leading-relaxed">
+          <p className="text-sm text-muted-foreground/70 max-w-sm mb-6 leading-relaxed">
             Create a schedule to run a workflow automatically.
           </p>
           <Button onClick={() => setShowAdd(true)} className="px-10 h-14">
@@ -583,7 +580,7 @@ export default function SchedulesManager() {
 
       {/* Summary strip */}
       {schedules.length > 0 && (
-        <div className="flex items-center gap-10 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
+        <div className="flex items-center gap-6 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-warning" />
             <span className="text-xs text-muted-foreground/70 font-semibold">

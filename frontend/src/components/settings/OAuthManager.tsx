@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   Github,
   Chrome,
@@ -152,14 +153,7 @@ export default function OAuthManager() {
   };
 
   if (isLoading) {
-    return (
-      <div className="py-12 flex flex-col items-center justify-center gap-4">
-        <LoadingSpinner />
-        <p className="text-xs text-muted-foreground font-bold">
-          Synchronizing connected accounts...
-        </p>
-      </div>
-    );
+    return <LoadingState label="Loading connected accounts…" />;
   }
 
   return (
@@ -268,7 +262,7 @@ export default function OAuthManager() {
                     >
                       {unlinkMutation.isPending &&
                       unlinkMutation.variables?.provider === provider.id ? (
-                        <LoadingSpinner className="py-0 mr-2" />
+                        <Spinner className="mr-2" />
                       ) : (
                         <Unlink className="w-4 h-4 mr-3 opacity-40" />
                       )}
@@ -281,7 +275,7 @@ export default function OAuthManager() {
                       disabled={isLinking}
                     >
                       {isLinking ? (
-                        <LoadingSpinner className="py-0 mr-2" />
+                        <Spinner className="mr-2" />
                       ) : (
                         <LinkIcon className="w-4 h-4 mr-3" />
                       )}

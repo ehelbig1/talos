@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { z } from "zod";
@@ -12,7 +13,6 @@ import {
   AlertCircle,
   Clock,
   IterationCcw,
-  Loader2,
 } from "lucide-react";
 
 /**
@@ -316,7 +316,7 @@ export const NodeConfigForm = React.memo(
                   />
                   {validating && (
                     <div className="absolute top-1/2 -translate-y-1/2 right-4">
-                      <Loader2 className="w-4 h-4 text-primary animate-spin" />
+                      <Spinner className="w-4 h-4 text-primary" />
                     </div>
                   )}
                 </div>

@@ -1,4 +1,5 @@
 import React from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import {
   ArrowRightLeft,
   Building2,
@@ -10,7 +11,6 @@ import {
 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import type { Org, OrgMember, Role } from "./graphql";
 import { MemberRow } from "./MemberRow";
 
@@ -44,7 +44,7 @@ export function OrgDetailsPanel({
   return (
     <div className="space-y-8">
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-10 relative z-10">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-6 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-3xl font-semibold font-outfit text-white">
               {selectedOrg?.name.charAt(0).toUpperCase()}
@@ -89,7 +89,7 @@ export function OrgDetailsPanel({
           </div>
           {isLoadingMembers ? (
             <div className="py-12 flex justify-center">
-              <LoadingSpinner />
+              <LoadingState />
             </div>
           ) : (
             <div className="space-y-3">

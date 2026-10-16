@@ -408,7 +408,7 @@ export default function Briefings() {
             </button>
           </div>
         ) : !hasResults && unreadable.length === 0 ? (
-          <div className="rounded-2xl border border-dashed border-white/10 bg-black/10 p-16 text-center space-y-3">
+          <div className="rounded-2xl border border-dashed border-white/10 bg-black/10 p-10 text-center space-y-3">
             <Sparkles className="w-8 h-8 text-muted-foreground/60 mx-auto" />
             <p className="text-sm text-muted-foreground/60 font-medium max-w-md mx-auto">
               No results yet. When a scheduled workflow runs and writes its

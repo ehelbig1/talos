@@ -121,7 +121,7 @@ export default function CapabilityCeilingManager() {
   if (loading) {
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-4">
           {[1, 2, 3].map((i) => (
             <div
@@ -159,7 +159,7 @@ export default function CapabilityCeilingManager() {
   return (
     <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
       {/* Header */}
-      <div className="flex items-center justify-between mb-10 relative z-10">
+      <div className="flex items-center justify-between mb-6 relative z-10">
         <div className="flex items-center gap-5">
           <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
             <Shield className="w-7 h-7 text-primary" />
@@ -181,7 +181,7 @@ export default function CapabilityCeilingManager() {
       </div>
 
       {/* Current ceiling card */}
-      <div className="mb-10 relative z-10">
+      <div className="mb-6 relative z-10">
         <div
           className={cn(
             "bg-black/40 border-2 rounded-2xl p-8 relative overflow-hidden transition-ui",

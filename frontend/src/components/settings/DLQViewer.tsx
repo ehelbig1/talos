@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -10,7 +12,6 @@ import {
   Bug,
   ExternalLink,
   Webhook,
-  Loader2,
   Database,
   Search,
   Shield,
@@ -197,17 +198,7 @@ export function DLQViewer() {
   const isLoading = activeTab === "nodes" ? nodeLoading : webhookLoading;
 
   if (isLoading) {
-    return (
-      <div className="flex flex-col items-center justify-center py-48 gap-6">
-        <div className="relative">
-          <div className="w-16 h-16 border-2 border-destructive/10 rounded-full" />
-          <div className="w-16 h-16 border-t-2 border-destructive rounded-full animate-spin absolute inset-0" />
-        </div>
-        <p className="text-xs text-destructive/60 font-semibold">
-          Scanning Fault Registry...
-        </p>
-      </div>
-    );
+    return <LoadingState label="Loading failed deliveries…" />;
   }
 
   return (
@@ -237,7 +228,7 @@ export function DLQViewer() {
             </div>
           </div>
 
-          <div className="flex items-center gap-10">
+          <div className="flex items-center gap-6">
             <div className="flex flex-col items-end gap-1">
               <span className="text-3xl font-semibold text-white tracking-tight leading-none">
                 {activeTab === "nodes"
@@ -318,8 +309,8 @@ export function DLQViewer() {
       <div className="space-y-6">
         {activeTab === "nodes" ? (
           pendingNodes.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
-              <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-success/20">
+            <div className="flex flex-col items-center justify-center py-16 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
+              <div className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-success/20">
                 <Shield size={40} />
               </div>
               <h3 className="text-2xl font-semibold text-white/70 tracking-tight mb-4">
@@ -384,7 +375,7 @@ export function DLQViewer() {
                     disabled={isReplayingNode}
                   >
                     {isReplayingNode ? (
-                      <Loader2 size={14} className="animate-spin" />
+                      <Spinner size={14} />
                     ) : (
                       <RotateCcw size={14} />
                     )}
@@ -395,8 +386,8 @@ export function DLQViewer() {
             ))
           )
         ) : pendingWebhooks.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-warning/20">
+          <div className="flex flex-col items-center justify-center py-16 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
+            <div className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-warning/20">
               <Database size={40} />
             </div>
             <h3 className="text-2xl font-semibold text-white/70 tracking-tight mb-4">
@@ -466,7 +457,7 @@ export function DLQViewer() {
                   disabled={isReplayingWebhook}
                 >
                   {isReplayingWebhook ? (
-                    <Loader2 size={14} className="animate-spin" />
+                    <Spinner size={14} />
                   ) : (
                     <RotateCcw size={14} />
                   )}

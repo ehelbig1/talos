@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
@@ -15,7 +16,6 @@ import {
   Globe,
   Key,
   Layers,
-  Loader2,
   Search,
   Shield,
   Webhook,
@@ -253,11 +253,11 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
     return (
       <Dialog open={true} onClose={onClose} title="Module Initialized">
         <div className="text-center p-6">
-          <div className="w-20 h-20 rounded-2xl bg-success/10 border border-success/20 flex items-center justify-center mx-auto mb-8 relative z-10">
+          <div className="w-14 h-14 rounded-2xl bg-success/10 border border-success/20 flex items-center justify-center mx-auto mb-8 relative z-10">
             <CheckCircle2 className="w-10 h-10 text-success" />
           </div>
 
-          <div className="relative z-10 mb-10">
+          <div className="relative z-10 mb-6">
             <p className="text-sm text-muted-foreground/70 leading-relaxed">
               <span className="text-white">{name}</span> was created and added
               to your module library.
@@ -368,7 +368,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           >
             {mutation.isPending ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin mr-3" />
+                <Spinner className="w-4 h-4 mr-3" />
                 Creating…
               </>
             ) : (
@@ -387,8 +387,8 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
 
 function EmptyState({ query }: { query: string }) {
   return (
-    <div className="col-span-full flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10">
-      <div className="w-24 h-24 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-10 relative">
+    <div className="col-span-full flex flex-col items-center justify-center py-16 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10">
+      <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-6 relative">
         <BookOpen className="w-12 h-12 text-muted-foreground/50 relative z-10" />
       </div>
       <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
@@ -496,7 +496,7 @@ export default function Catalog() {
 
         {/* Category filter pills */}
         {categories.length > 1 && (
-          <div className="flex items-center gap-3 flex-wrap mb-12">
+          <div className="flex items-center gap-3 flex-wrap mb-8">
             <button
               onClick={() => setActiveCategory(null)}
               className={cn(
@@ -576,7 +576,7 @@ export default function Catalog() {
                   const meta = getCategoryMeta(cat);
                   return (
                     <section key={cat}>
-                      <div className="flex items-center gap-6 mb-10 relative group">
+                      <div className="flex items-center gap-6 mb-6 relative group">
                         <div
                           className={cn(
                             "w-12 h-12 rounded-2xl flex items-center justify-center transition-ui",

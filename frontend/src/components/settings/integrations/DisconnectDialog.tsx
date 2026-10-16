@@ -5,8 +5,9 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
-import { AlertTriangle, Loader2 } from "lucide-react";
+import { AlertTriangle } from "lucide-react";
 import { Dialog } from "@/components/ui";
 import type { IntegrationService } from "@/lib/graphqlApi";
 
@@ -58,7 +59,7 @@ export function DisconnectDialog({
           >
             {disconnecting ? (
               <div className="flex items-center gap-3">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Spinner className="w-4 h-4" />
                 <span>Disconnecting…</span>
               </div>
             ) : (

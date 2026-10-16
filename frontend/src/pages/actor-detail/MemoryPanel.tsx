@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -16,7 +17,6 @@ import {
   Trash2,
   ChevronDown,
   ChevronUp,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -181,11 +181,7 @@ function MemoryEntryRow({
               title="Refresh TTL to full duration"
               className="text-xs text-muted-foreground/70 hover:text-success transition-ui px-1.5 py-0.5 rounded disabled:opacity-40"
             >
-              {extending ? (
-                <Loader2 className="w-3 h-3 animate-spin" />
-              ) : (
-                "Extend"
-              )}
+              {extending ? <Spinner className="w-3 h-3" /> : "Extend"}
             </button>
           )}
           {isMultiline && (

@@ -1,10 +1,10 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   ShieldAlert,
   KeyRound,
@@ -129,7 +129,7 @@ function RotateDekCard() {
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
-                <LoadingSpinner className="w-4 h-4" />
+                <Spinner className="w-4 h-4" />
                 <span>Rotating…</span>
               </div>
             ) : (
@@ -225,7 +225,7 @@ function ReEncryptSecretsCard() {
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
-                <LoadingSpinner className="w-4 h-4" />
+                <Spinner className="w-4 h-4" />
                 <span>Re-encrypting…</span>
               </div>
             ) : (
@@ -421,11 +421,11 @@ function RotateMasterKeyCard() {
           <Button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
+            className="h-12 px-6 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
-                <LoadingSpinner className="w-5 h-5" />
+                <Spinner className="w-5 h-5" />
                 <span>Rewrapping keys…</span>
               </div>
             ) : (
@@ -507,7 +507,7 @@ function RotateEncryptionKeyCard() {
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
-                <LoadingSpinner className="w-4 h-4" />
+                <Spinner className="w-4 h-4" />
                 <span>Rotating…</span>
               </div>
             ) : (

@@ -1,9 +1,9 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { cn } from "@/lib/utils";
 
 /**
@@ -103,7 +103,7 @@ export function TransferOwnershipDialog({
             disabled={!newOwnerId.trim() || !isTransferConfirmed || isPending}
             onClick={onSubmit}
           >
-            {isPending ? <LoadingSpinner /> : "Transfer ownership"}
+            {isPending ? <Spinner /> : "Transfer ownership"}
           </Button>
         </div>
       </div>

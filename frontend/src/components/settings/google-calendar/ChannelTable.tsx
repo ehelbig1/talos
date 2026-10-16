@@ -7,6 +7,7 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Activity, RefreshCw, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
@@ -143,7 +144,7 @@ export function ChannelTable({
                       className="h-8 px-2.5 text-xs"
                     >
                       {currentAction === "test" ? (
-                        <span className="w-3 h-3 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin" />
+                        <Spinner className="w-3 h-3" />
                       ) : (
                         <Activity size={13} />
                       )}
@@ -158,7 +159,7 @@ export function ChannelTable({
                       className="h-8 px-2.5 text-xs"
                     >
                       {currentAction === "renew" ? (
-                        <span className="w-3 h-3 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin" />
+                        <Spinner className="w-3 h-3" />
                       ) : (
                         <RefreshCw size={13} />
                       )}
@@ -173,7 +174,7 @@ export function ChannelTable({
                       className="h-8 px-2.5 text-xs text-destructive hover:text-destructive"
                     >
                       {currentAction === "stop" ? (
-                        <span className="w-3 h-3 border-2 border-destructive/30 border-t-destructive rounded-full animate-spin" />
+                        <Spinner className="w-3 h-3 text-destructive" />
                       ) : (
                         <XCircle size={13} />
                       )}

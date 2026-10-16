@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { SectionHeader } from "@/components/ui/SectionHeader";
@@ -120,7 +121,7 @@ export function InlineSecretCreator({
               >
                 {createMutation.isPending ? (
                   <div className="flex items-center gap-2">
-                    <div className="w-3 h-3 border-2 border-primary-foreground/20 border-t-primary-foreground rounded-full animate-spin" />
+                    <Spinner className="w-3 h-3" />
                     <span>Creating...</span>
                   </div>
                 ) : (

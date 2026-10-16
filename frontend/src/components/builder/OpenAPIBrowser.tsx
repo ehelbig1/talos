@@ -1,9 +1,10 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import type { OpenAPISpec } from "@/lib/openapi";
 import { discoverOpenAPISpec, parseOpenAPIEndpoints } from "@/lib/openapi";
 import type { Endpoint } from "./EndpointSelector";
 import { EndpointSelector } from "./EndpointSelector";
-import { Search, X, Loader2, Globe, Activity, Zap } from "lucide-react";
+import { Search, X, Globe, Activity, Zap } from "lucide-react";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui";
@@ -86,8 +87,7 @@ export function OpenAPIBrowser({
         >
           {loading ? (
             <>
-              <Loader2 className="h-4 w-4 animate-spin mr-2" /> Deciphering
-              Schema...
+              <Spinner className="h-4 w-4 mr-2" /> Deciphering Schema...
             </>
           ) : (
             <>

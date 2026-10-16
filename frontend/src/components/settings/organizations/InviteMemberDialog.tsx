@@ -1,9 +1,9 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { UserPlus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { cn } from "@/lib/utils";
 import type { Role } from "./graphql";
 import { ROLE_OPTIONS } from "./graphql";
@@ -91,7 +91,7 @@ export function InviteMemberDialog({
             disabled={!userId.trim() || isPending}
             onClick={onSubmit}
           >
-            {isPending ? <LoadingSpinner /> : "Send invite"}
+            {isPending ? <Spinner /> : "Send invite"}
           </Button>
         </div>
       </div>

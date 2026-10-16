@@ -42,6 +42,21 @@ const FORM_PRIMITIVE_SELECTORS = [
     },
 ];
 
+// One loading indicator (src/components/ui/spinner.tsx): Spinner inline,
+// LoadingState for a block. A hand-rolled ring and a bare Loader2 are refused;
+// an icon that spins while a refetch is in flight (RefreshCw + animate-spin) is
+// not a loading indicator and is left alone.
+const LOADING_SELECTORS = [
+    {
+        selector: 'Literal[value=/\\banimate-spin\\b/][value=/\\brounded-full\\b/]',
+        message: "One loading indicator: use Spinner (inline) or LoadingState (block) from @/components/ui/spinner instead of a hand-rolled ring.",
+    },
+    {
+        selector: 'JSXOpeningElement[name.name="Loader2"]',
+        message: "One loading indicator: use Spinner from @/components/ui/spinner, not Loader2 directly.",
+    },
+];
+
 const UI_FLOOR_SELECTORS = [
                 {
                     // An icon-only button (no text anywhere below it) has no
@@ -212,7 +227,7 @@ export default [
         files: ["src/**/*.ts", "src/**/*.tsx"],
         ignores: ["**/*.test.ts", "**/*.test.tsx", "**/__tests__/**", "src/generated/**", "src/components/ui/**", ...KIND_COLOUR_HOMES],
         rules: {
-            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...PALETTE_COLOUR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS],
+            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...PALETTE_COLOUR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS, ...LOADING_SELECTORS],
         },
     },
     // The primitives themselves render the raw elements.
@@ -228,7 +243,7 @@ export default [
     {
         files: KIND_COLOUR_HOMES,
         rules: {
-            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS],
+            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS, ...LOADING_SELECTORS],
         },
     },
     // Test files: allow `any`. Test doubles, mock fetch signatures, and

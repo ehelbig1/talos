@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -38,7 +39,6 @@ import {
   Trash2,
   Calendar,
   Clock,
-  Loader2,
 } from "lucide-react";
 
 const AVAILABLE_ROLES = [
@@ -242,7 +242,7 @@ export default function McpServerSettings() {
               >
                 {creating ? (
                   <div className="flex items-center gap-3">
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                     <span>Creating…</span>
                   </div>
                 ) : (
@@ -342,7 +342,7 @@ export default function McpServerSettings() {
         <div className="lg:col-span-2 space-y-8">
           {/* Active Agents */}
           <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden min-h-[400px]">
-            <div className="flex items-center justify-between mb-10">
+            <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary">
                   <Bot size={24} />
@@ -370,14 +370,14 @@ export default function McpServerSettings() {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {loading ? (
-                <div className="col-span-full py-24 flex flex-col items-center justify-center gap-4">
-                  <Loader2 className="w-8 h-8 text-primary animate-spin" />
+                <div className="col-span-full py-16 flex flex-col items-center justify-center gap-4">
+                  <Spinner className="w-8 h-8 text-primary" />
                   <p className="text-xs text-muted-foreground/70 font-semibold">
                     Loading…
                   </p>
                 </div>
               ) : agents.length === 0 ? (
-                <div className="col-span-full py-24 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01] group">
+                <div className="col-span-full py-16 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01] group">
                   <Bot className="w-16 h-16 text-muted-foreground/30 mb-6 transition-ui group-hover:text-primary/10" />
                   <p className="text-xs text-muted-foreground/60 font-semibold">
                     No agents yet
@@ -412,7 +412,7 @@ export default function McpServerSettings() {
                         disabled={revokingId === agent.id}
                       >
                         {revokingId === agent.id ? (
-                          <Loader2 size={14} className="animate-spin" />
+                          <Spinner size={14} />
                         ) : (
                           <Trash2 size={14} />
                         )}
@@ -518,7 +518,7 @@ export default function McpServerSettings() {
       </div>
 
       <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 relative overflow-hidden group/info">
-        <div className="flex flex-col md:flex-row items-center gap-10 relative z-10">
+        <div className="flex flex-col md:flex-row items-center gap-6 relative z-10">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-6 flex-1">
             {[
               { name: "Compile modules", icon: <Zap size={14} /> },

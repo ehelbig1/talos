@@ -4,8 +4,9 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
-import { Loader2, Bot } from "lucide-react";
+import { Bot } from "lucide-react";
 import type { LaneState } from "./types";
 
 export function RunTicker({ lanes }: { lanes: LaneState[] }) {
@@ -30,7 +31,7 @@ export function RunTicker({ lanes }: { lanes: LaneState[] }) {
         ))}
       </div>
       <div className="flex-1 flex items-center gap-4 text-xs font-semibold text-primary">
-        <Loader2 className="w-4 h-4 animate-spin" />
+        <Spinner className="w-4 h-4" />
         Running all actors…
         <div className="ml-auto flex gap-6">
           <span className="text-white/70">

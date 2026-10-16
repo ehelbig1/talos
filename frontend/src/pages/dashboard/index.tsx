@@ -286,8 +286,8 @@ export default function Dashboard() {
     return (
       <div className="h-full overflow-auto bg-background text-foreground/80 custom-scrollbar">
         <PageContainer>
-          <div className="mb-12 h-12 w-80 rounded-2xl animate-pulse bg-surface-3/40" />
-          <SkeletonStatRow className="mb-12" />
+          <div className="mb-8 h-12 w-80 rounded-2xl animate-pulse bg-surface-3/40" />
+          <SkeletonStatRow className="mb-8" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
             {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
               <div
@@ -412,7 +412,7 @@ export default function Dashboard() {
           {workflows.length === 0 ? (
             <EmptyState onNew={handleNew} />
           ) : filteredWorkflows.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-24 bg-surface-3/40 border border-white/5 rounded-2xl">
+            <div className="flex flex-col items-center justify-center py-16 bg-surface-3/40 border border-white/5 rounded-2xl">
               <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-5">
                 <Search className="w-6 h-6 text-muted-foreground" />
               </div>

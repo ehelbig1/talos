@@ -1,4 +1,5 @@
 import React from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
@@ -95,10 +96,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
 
         <div className="space-y-3 max-h-[60vh] overflow-y-auto pr-2 custom-scrollbar">
           {isLoading ? (
-            <div className="py-20 flex flex-col items-center justify-center text-muted-foreground">
-              <div className="w-8 h-8 border-2 border-primary border-t-transparent rounded-full animate-spin mb-4" />
-              <p className="text-sm font-medium">Fetching audit trail...</p>
-            </div>
+            <LoadingState label="Loading audit log…" />
           ) : error ? (
             <div className="py-12 px-6 text-center text-destructive bg-destructive/5 rounded-2xl border border-destructive/10">
               <AlertCircle className="w-10 h-10 mx-auto mb-3 opacity-50" />
@@ -108,7 +106,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
               </p>
             </div>
           ) : logs?.length === 0 ? (
-            <div className="py-20 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
+            <div className="py-12 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
               <Clock className="w-10 h-10 mx-auto mb-3 opacity-20" />
               <p className="text-sm font-medium">No activity recorded yet</p>
               <p className="text-xs opacity-60">

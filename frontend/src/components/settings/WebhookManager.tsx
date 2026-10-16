@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import { Dialog } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { useQueryClient } from "@tanstack/react-query";
@@ -12,7 +13,6 @@ import {
   XCircle,
   Zap,
   Clock,
-  X,
   Shield,
   TrendingUp,
 } from "lucide-react";
@@ -91,150 +91,126 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
 
   if (result) {
     return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60">
-        <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-lg relative overflow-hidden">
-          <div className="flex items-center gap-5 mb-10 relative z-10">
-            <div className="w-14 h-14 bg-success/10 border border-success/20 rounded-2xl flex items-center justify-center">
-              <CheckCircle2 className="w-7 h-7 text-success" />
-            </div>
-            <div>
-              <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
-                Webhook created
-              </h3>
-              <p className="text-xs text-muted-foreground/70 font-bold mt-1">
-                Save these details now; the secret is shown once
-              </p>
+      <Dialog
+        open
+        onClose={onClose}
+        title="Webhook created"
+        className="max-w-lg"
+      >
+        <p className="text-sm text-muted-foreground -mt-4 mb-6">
+          Save these details now; the secret is shown once.
+        </p>
+
+        <div className="space-y-6 relative z-10">
+          <div className="space-y-2">
+            <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
+              Webhook URL
+            </p>
+            <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 group">
+              <code className="text-xs font-mono text-primary flex-1 truncate selection:bg-primary/30">
+                {result.webhookUrl}
+              </code>
+              <CopyButton value={result.webhookUrl} />
             </div>
           </div>
-
-          <div className="space-y-6 relative z-10">
+          {result.verificationToken && (
             <div className="space-y-2">
               <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
-                Webhook URL
+                Verification token
               </p>
               <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 group">
-                <code className="text-xs font-mono text-primary flex-1 truncate selection:bg-primary/30">
-                  {result.webhookUrl}
+                <code className="text-xs font-mono text-warning/80 flex-1 truncate selection:bg-warning/30">
+                  {result.verificationToken}
                 </code>
-                <CopyButton value={result.webhookUrl} />
+                <CopyButton value={result.verificationToken} />
               </div>
             </div>
-            {result.verificationToken && (
-              <div className="space-y-2">
-                <p className="text-xs font-semibold text-muted-foreground/70 ml-1">
-                  Verification token
-                </p>
-                <div className="flex items-center gap-4 bg-black/40 border border-white/5 rounded-2xl px-5 py-4 group">
-                  <code className="text-xs font-mono text-warning/80 flex-1 truncate selection:bg-warning/30">
-                    {result.verificationToken}
-                  </code>
-                  <CopyButton value={result.verificationToken} />
-                </div>
-              </div>
-            )}
-          </div>
-
-          <Button
-            className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm"
-            onClick={onClose}
-          >
-            Done
-          </Button>
+          )}
         </div>
-      </div>
+
+        <Button
+          className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm"
+          onClick={onClose}
+        >
+          Done
+        </Button>
+      </Dialog>
     );
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60">
-      <div className="bg-surface-3/90 border border-white/10 rounded-2xl p-10 w-full max-w-md relative overflow-hidden">
-        <div className="flex items-center justify-between mb-10 relative z-10">
-          <div className="space-y-1">
-            <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
-              New webhook
-            </h3>
-            <p className="text-xs text-muted-foreground/70 font-bold">
-              Start a workflow from an HTTP request
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="p-2.5 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl transition-ui text-muted-foreground hover:text-white"
-          >
-            <X className="w-4 h-4" />
-          </button>
+    <Dialog open onClose={onClose} title="New webhook" className="max-w-md">
+      <p className="text-sm text-muted-foreground -mt-4 mb-6">
+        Start a workflow from an HTTP request.
+      </p>
+
+      <div className="space-y-6 relative z-10">
+        <div className="space-y-2">
+          <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+            Name
+          </label>
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. GitHub push"
+          />
         </div>
 
-        <div className="space-y-6 relative z-10">
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
-              Name
-            </label>
-            <Input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. GitHub push"
-            />
-          </div>
-
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
-              Workflow
-            </label>
-            <Select
-              value={moduleId}
-              onChange={(e) => setModuleId(e.target.value)}
-            >
-              <option value="" className="bg-surface-3">
-                Select a workflow…
+        <div className="space-y-2">
+          <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+            Workflow
+          </label>
+          <Select
+            value={moduleId}
+            onChange={(e) => setModuleId(e.target.value)}
+          >
+            <option value="" className="bg-surface-3">
+              Select a workflow…
+            </option>
+            {workflowsData?.map((w) => (
+              <option key={w.id} value={w.id} className="bg-surface-3">
+                {w.name}
               </option>
-              {workflowsData?.map((w) => (
-                <option key={w.id} value={w.id} className="bg-surface-3">
-                  {w.name}
-                </option>
-              ))}
-            </Select>
-          </div>
+            ))}
+          </Select>
+        </div>
 
-          <div className="space-y-2">
-            <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
-              Rate Threshold (Req/Min)
-            </label>
-            <Input
-              type="number"
-              min={1}
-              max={1000}
-              value={rateLimit}
-              onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
-              className="text-xs"
-            />
-          </div>
+        <div className="space-y-2">
+          <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
+            Rate Threshold (Req/Min)
+          </label>
+          <Input
+            type="number"
+            min={1}
+            max={1000}
+            value={rateLimit}
+            onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
+            className="text-xs"
+          />
+        </div>
 
-          <div className="flex gap-4 pt-4">
-            <Button
-              className="flex-1 h-14 rounded-2xl"
-              disabled={!name.trim() || !moduleId || createMutation.isPending}
-              onClick={() =>
-                createMutation.mutate({
-                  input: { name, moduleId, maxRequestsPerMinute: rateLimit },
-                })
-              }
-            >
-              {createMutation.isPending ? "Creating…" : "Create webhook"}
-            </Button>
-            <Button
-              variant="ghost"
-              className="px-6 h-14 rounded-2xl text-xs font-semibold tracking-wider"
-              onClick={onClose}
-            >
-              Cancel
-            </Button>
-          </div>
+        <div className="flex gap-4 pt-4">
+          <Button
+            className="flex-1 h-14 rounded-2xl"
+            disabled={!name.trim() || !moduleId || createMutation.isPending}
+            onClick={() =>
+              createMutation.mutate({
+                input: { name, moduleId, maxRequestsPerMinute: rateLimit },
+              })
+            }
+          >
+            {createMutation.isPending ? "Creating…" : "Create webhook"}
+          </Button>
+          <Button
+            variant="ghost"
+            className="px-6 h-14 rounded-2xl text-xs font-semibold tracking-wider"
+            onClick={onClose}
+          >
+            Cancel
+          </Button>
         </div>
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -250,7 +226,7 @@ export default function WebhookManager() {
   if (isLoading) {
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
             <div
@@ -271,7 +247,7 @@ export default function WebhookManager() {
 
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
         {/* Header */}
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-12 relative z-10">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-8 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
               <Webhook className="w-8 h-8 text-primary" />
@@ -295,7 +271,7 @@ export default function WebhookManager() {
         </div>
 
         {triggers.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
+          <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
             <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-ui" />
             <p className="text-sm text-muted-foreground font-semibold">
               No webhooks yet

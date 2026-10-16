@@ -334,7 +334,7 @@ export default function ExecutionPanel() {
           {/* Feed area */}
           <div className="max-h-[40vh] overflow-y-auto px-6 py-8 custom-scrollbar relative z-10">
             {events.length === 0 ? (
-              <div className="py-20 flex flex-col items-center justify-center text-center">
+              <div className="py-12 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
                   <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 transition-ui group-hover:border-primary/20">
                     <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-ui stroke-[1px]" />

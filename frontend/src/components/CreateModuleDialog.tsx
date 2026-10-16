@@ -1,4 +1,5 @@
 import { toast } from "sonner";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -16,7 +17,6 @@ import {
   Sparkles,
   Filter,
   Check,
-  Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -209,12 +209,12 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           {/* Template Grid */}
           <div className="max-h-[480px] overflow-y-auto pr-2 custom-scrollbar">
             {templatesLoading ? (
-              <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-                <Loader2 className="w-10 h-10 animate-spin text-primary" />
+              <div className="flex flex-col items-center justify-center py-16 gap-4 text-muted-foreground/50">
+                <Spinner className="w-10 h-10 text-primary" />
                 <p className="text-xs font-semibold">Loading…</p>
               </div>
             ) : filteredTemplates.length === 0 ? (
-              <div className="flex flex-col items-center justify-center py-20 px-8 text-center border-2 border-dashed border-white/5 rounded-2xl bg-surface-1/20 grayscale opacity-20">
+              <div className="flex flex-col items-center justify-center py-12 px-8 text-center border-2 border-dashed border-white/5 rounded-2xl bg-surface-1/20 opacity-60">
                 <Search className="w-12 h-12 text-muted-foreground/70 mb-4" />
                 <p className="text-xs font-semibold text-muted-foreground">
                   No templates match your search
@@ -309,7 +309,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             <div className="flex items-center gap-4">
               <div className="flex items-center justify-center w-14 h-14 bg-surface-3/60 border border-white/10 rounded-2xl relative">
                 {selectedTemplate?.icon ? (
-                  <span className="text-4xl relative z-10">
+                  <span className="text-2xl relative z-10">
                     {selectedTemplate.icon}
                   </span>
                 ) : (
@@ -416,7 +416,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           >
             {creating ? (
               <div className="flex items-center gap-3">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Spinner className="w-4 h-4" />
                 <span>Creating…</span>
               </div>
             ) : (

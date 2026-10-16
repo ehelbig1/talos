@@ -1,8 +1,8 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { ArrowRightLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import type { Role } from "./graphql";
 
 export interface RoleChangeTarget {
@@ -33,7 +33,7 @@ export function RoleChangeDialog({
           </p>
         </div>
 
-        <div className="flex items-center justify-center gap-12 py-4 relative">
+        <div className="flex items-center justify-center gap-8 py-4 relative">
           <div className="flex flex-col items-center gap-3">
             <div className="text-xs font-semibold text-muted-foreground/60 mb-1">
               Current
@@ -72,7 +72,7 @@ export function RoleChangeDialog({
             disabled={isPending}
             onClick={onConfirm}
           >
-            {isPending ? <LoadingSpinner /> : "Change role"}
+            {isPending ? <Spinner /> : "Change role"}
           </Button>
         </div>
       </div>

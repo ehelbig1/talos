@@ -5,9 +5,10 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { CheckCircle2, Clock, Loader2, Bot } from "lucide-react";
+import { CheckCircle2, Clock, Bot } from "lucide-react";
 import type { ActorSummary } from "@/lib/graphqlApi";
 import type { WorkflowOption } from "./types";
 
@@ -45,7 +46,7 @@ export function SetupPanel({
         </h2>
         {loadingWorkflows ? (
           <div className="flex items-center gap-3 text-muted-foreground/60 py-4">
-            <Loader2 className="w-4 h-4 animate-spin" />
+            <Spinner className="w-4 h-4" />
             <span className="text-xs font-bold">Accessing Registry...</span>
           </div>
         ) : workflows.length === 0 ? (
@@ -89,7 +90,7 @@ export function SetupPanel({
         </h2>
         {loadingActors ? (
           <div className="flex items-center gap-3 text-muted-foreground/60 py-4">
-            <Loader2 className="w-4 h-4 animate-spin" />
+            <Spinner className="w-4 h-4" />
             <span className="text-xs font-bold">Loading actors…</span>
           </div>
         ) : activeActors.length === 0 ? (

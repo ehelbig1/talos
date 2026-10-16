@@ -7,6 +7,7 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
@@ -261,12 +262,12 @@ export function CreateGcpWatchDialog({
             >
               {submitting ? (
                 <>
-                  <span className="w-3.5 h-3.5 border-2 border-white/30 border-t-white rounded-full animate-spin mr-2" />
+                  <Spinner className="w-3.5 h-3.5 mr-2" />
                   Creating…
                 </>
               ) : watchesFetching ? (
                 <>
-                  <span className="w-3.5 h-3.5 border-2 border-foreground/30 border-t-foreground rounded-full animate-spin mr-2" />
+                  <Spinner className="w-3.5 h-3.5 mr-2" />
                   Syncing…
                 </>
               ) : (

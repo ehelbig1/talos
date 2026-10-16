@@ -1,7 +1,7 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
@@ -201,7 +201,7 @@ export default function WorkflowExecutionHistoryDialog({
         <div className="max-h-[520px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {isLoading ? (
             <div className="p-20 flex flex-col items-center justify-center gap-4">
-              <LoadingSpinner className="w-8 h-8 text-primary" />
+              <Spinner className="w-8 h-8 text-primary" />
               <p className="text-xs text-muted-foreground/60 font-semibold">
                 Loading History...
               </p>
@@ -428,7 +428,7 @@ export default function WorkflowExecutionHistoryDialog({
               >
                 {actionPending ? (
                   <div className="flex items-center gap-2">
-                    <LoadingSpinner className="w-4 h-4" />
+                    <Spinner className="w-4 h-4" />
                     <span>Working…</span>
                   </div>
                 ) : (

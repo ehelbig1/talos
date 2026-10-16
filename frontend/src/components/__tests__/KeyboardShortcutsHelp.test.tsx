@@ -17,9 +17,8 @@ describe("KeyboardShortcutsHelp", () => {
     expect(screen.getAllByText(/navigation/i)).toHaveLength(1);
     expect(screen.getAllByText(/actions/i)).toHaveLength(1);
 
-    // Ensure the dialog can be closed by clicking the backdrop
-    const dialogElement = screen.getByRole("dialog");
-    fireEvent.click(dialogElement);
+    // Escape closes the dialog
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
 
     expect(screen.queryByText(/navigation/i)).toBeNull();
   });

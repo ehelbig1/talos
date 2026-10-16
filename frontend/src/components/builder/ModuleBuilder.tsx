@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Dialog, Button, Badge } from "@/components/ui";
 import { CopyField } from "@/components/ui/CopyField";
@@ -22,7 +23,6 @@ import {
   Webhook,
   CheckCircle,
   X,
-  Loader2,
   Database,
   Shield,
   Zap,
@@ -179,8 +179,8 @@ export function ModuleBuilder({
           <div>
             <Suspense
               fallback={
-                <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-                  <Loader2 className="w-10 h-10 animate-spin text-primary" />
+                <div className="flex flex-col items-center justify-center py-16 gap-4 text-muted-foreground/50">
+                  <Spinner className="w-10 h-10 text-primary" />
                   <p className="text-xs font-semibold">
                     Initializing Library...
                   </p>
@@ -195,8 +195,8 @@ export function ModuleBuilder({
             </Suspense>
           </div>
         ) : templateLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-            <Loader2 className="w-10 h-10 animate-spin text-primary" />
+          <div className="flex flex-col items-center justify-center py-16 gap-4 text-muted-foreground/50">
+            <Spinner className="w-10 h-10 text-primary" />
             <p className="text-xs font-semibold">Loading template…</p>
           </div>
         ) : templateError ? (
@@ -243,7 +243,7 @@ export function ModuleBuilder({
               <div className="flex items-center gap-4 relative z-10">
                 <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-2xl relative">
                   {selectedTemplate.icon ? (
-                    <span className="text-4xl relative z-10">
+                    <span className="text-2xl relative z-10">
                       {selectedTemplate.icon}
                     </span>
                   ) : (
@@ -330,7 +330,7 @@ export function ModuleBuilder({
                       </Badge>
                     </div>
 
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-10">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       <div className="space-y-4">
                         <label className="block text-xs font-semibold text-white/70 ml-1">
                           Rate Limit Threshold
@@ -459,7 +459,7 @@ export function ModuleBuilder({
                 }
                 disabled={!moduleName || createModuleMutation.isPending}
                 className={cn(
-                  "h-14 px-12 text-sm font-semibold transition-ui rounded-2xl",
+                  "h-12 px-6 text-sm font-semibold transition-ui rounded-2xl",
                   "bg-primary hover:bg-primary/90 text-white border-none",
                   (!moduleName || createModuleMutation.isPending) &&
                     "opacity-50 grayscale cursor-not-allowed",
@@ -467,7 +467,7 @@ export function ModuleBuilder({
               >
                 {createModuleMutation.isPending ? (
                   <div className="flex items-center gap-3">
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                     <span>Deploying Unit...</span>
                   </div>
                 ) : (
@@ -540,10 +540,10 @@ function WebhookSuccessView({
   return (
     <div className="space-y-10">
       <div className="text-center relative">
-        <div className="inline-flex items-center justify-center w-24 h-24 rounded-2xl bg-success/10 border border-success/20 mb-10 relative z-10">
+        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-success/10 border border-success/20 mb-6 relative z-10">
           <CheckCircle className="h-12 w-12 text-success" />
         </div>
-        <h2 className="text-4xl font-semibold text-white tracking-tight font-outfit leading-none mb-4 relative z-10">
+        <h2 className="text-2xl font-semibold text-white tracking-tight font-outfit leading-none mb-4 relative z-10">
           Webhook ready
         </h2>
         <p className="text-xs text-success font-semibold tracking-[0.5em] relative z-10">
@@ -562,7 +562,7 @@ function WebhookSuccessView({
 
       {isSlackWebhook ? (
         <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-12 relative overflow-hidden bg-surface-3 border border-white/10">
-          <div className="flex items-center gap-4 mb-10">
+          <div className="flex items-center gap-4 mb-6">
             <Webhook className="w-6 h-6 text-primary" />
             <h3 className="text-xs font-semibold text-white">
               Set up Slack events
@@ -605,7 +605,7 @@ function WebhookSuccessView({
         </div>
       ) : (
         <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-12 relative overflow-hidden bg-surface-3 border border-white/10">
-          <div className="flex items-center gap-4 mb-10">
+          <div className="flex items-center gap-4 mb-6">
             <div className="p-2.5 rounded-xl bg-primary/10 border border-primary/20">
               <Zap className="w-6 h-6 text-primary" />
             </div>

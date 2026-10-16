@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -19,7 +20,6 @@ import {
   Server,
   CloudUpload,
   Check,
-  Loader2,
 } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
@@ -76,7 +76,7 @@ export default function AuditSettings() {
   if (isLoading)
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-6">
           <div className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl" />
           <div className="grid grid-cols-2 gap-6">
@@ -114,13 +114,13 @@ export default function AuditSettings() {
 
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
         <div className="relative z-10">
-          <p className="text-sm text-muted-foreground/70 leading-relaxed mb-10 max-w-2xl">
+          <p className="text-sm text-muted-foreground/70 leading-relaxed mb-6 max-w-2xl">
             Stream signed run logs to your existing SIEM over OpenTelemetry.
             Every run is signed and non-repudiable.
           </p>
 
           <div className="bg-black/40 border border-white/5 rounded-2xl p-8 transition-ui group/box">
-            <div className="flex items-center justify-between mb-10">
+            <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-6">
                 <div
                   className={cn(
@@ -229,11 +229,11 @@ export default function AuditSettings() {
             <Button
               onClick={handleSave}
               disabled={saving}
-              className="h-16 px-12 rounded-2xl"
+              className="h-12 px-6 rounded-2xl"
             >
               {saving ? (
                 <div className="flex items-center gap-3">
-                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <Spinner className="w-5 h-5" />
                   <span>Saving…</span>
                 </div>
               ) : isUpdated ? (

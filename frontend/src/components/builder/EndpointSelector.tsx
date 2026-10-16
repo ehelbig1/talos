@@ -364,7 +364,7 @@ export function EndpointSelector({
             )}
 
             {totalParams === 0 && (
-              <div className="py-20 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl">
+              <div className="py-12 text-center bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl">
                 <p className="text-xs font-semibold text-muted-foreground/50">
                   Zero Parameters Required for Operation
                 </p>

@@ -5,9 +5,9 @@ import React, {
   useSyncExternalStore,
 } from "react";
 import { useNavigate } from "react-router";
+import { LoadingState } from "@/components/ui/spinner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   ReactFlow,
   Background,
@@ -254,7 +254,7 @@ function Workspace() {
               </div>
             )}
           >
-            <Suspense fallback={<LoadingSpinner />}>
+            <Suspense fallback={<LoadingState />}>
               <Inspector />
             </Suspense>
           </ErrorBoundary>
@@ -275,7 +275,7 @@ function Workspace() {
             </div>
           }
         >
-          <Suspense fallback={<LoadingSpinner />}>
+          <Suspense fallback={<LoadingState />}>
             <Terminal />
           </Suspense>
         </ErrorBoundary>

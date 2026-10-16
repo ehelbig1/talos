@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useMemo } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { subscribeWorkflowExecutions } from "@/lib/graphqlClient";
 import {
@@ -18,7 +19,6 @@ import { formatDistanceToNow } from "date-fns";
 import {
   CheckCircle2,
   XCircle,
-  Loader2,
   Clock,
   ChevronRight,
   RefreshCw,
@@ -55,7 +55,7 @@ function StatusIcon({ status }: { status: string }) {
     case "failed":
       return <XCircle className="w-4 h-4 text-destructive shrink-0" />;
     case "running":
-      return <Loader2 className="w-4 h-4 text-primary shrink-0 animate-spin" />;
+      return <Spinner className="w-4 h-4 text-primary shrink-0" />;
     case "awaiting_approval":
       return <Clock className="w-4 h-4 text-warning shrink-0" />;
     default:
@@ -240,7 +240,7 @@ function ExecutionRow({
                     className="h-11 px-6 text-sm font-semibold rounded-2xl bg-primary/10 border border-primary/20 text-primary hover:bg-primary/20 transition-ui"
                   >
                     {isRetrying ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <Spinner className="w-4 h-4" />
                     ) : (
                       <RotateCcw className="w-4 h-4" />
                     )}
@@ -257,7 +257,7 @@ function ExecutionRow({
                   className="h-11 px-6 text-sm font-semibold rounded-2xl bg-success/10 border border-success/20 text-success hover:bg-success/20 transition-ui"
                 >
                   {isResuming ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                   ) : (
                     <PlayCircle className="w-4 h-4" />
                   )}
@@ -465,15 +465,15 @@ export const WorkflowExecutionHistoryPanel = React.memo(
 
         {/* Content */}
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/50">
+          <div className="flex flex-col items-center justify-center py-16 gap-6 text-muted-foreground/50">
             <div className="relative">
-              <Loader2 className="w-12 h-12 animate-spin text-primary/70" />
+              <Spinner className="w-12 h-12 text-primary/70" />
             </div>
             <p className="text-xs font-semibold">Synchronizing Registry...</p>
           </div>
         ) : history.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 px-10 text-center bg-white/[0.02] rounded-2xl border border-white/5 border-dashed">
-            <div className="w-20 h-20 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
+          <div className="flex flex-col items-center justify-center py-16 px-10 text-center bg-white/[0.02] rounded-2xl border border-white/5 border-dashed">
+            <div className="w-14 h-14 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
               <Clock className="w-8 h-8 text-muted-foreground/50" />
             </div>
             <p className="text-xs font-semibold text-muted-foreground/30">

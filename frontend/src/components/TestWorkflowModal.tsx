@@ -1,4 +1,6 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
+import { LoadingState } from "@/components/ui/spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -22,7 +24,6 @@ import { useTestWorkflowMutation } from "@/generated/graphql";
 import { subscribeExecution, type ExecutionUpdate } from "@/lib/graphqlClient";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { Dialog } from "@/components/ui/dialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 
 /** Terminal phases of a detached test run (driven by executionUpdates). */
 type RunPhase = "idle" | "running" | "completed" | "failed" | "waiting";
@@ -94,7 +95,7 @@ function NodeTraceCard({
       color: "text-destructive bg-destructive/10 border-destructive/20",
     },
     running: {
-      icon: <LoadingSpinner className="w-3 h-3" />,
+      icon: <Spinner className="w-3 h-3" />,
       color: "text-primary bg-primary/10 border-primary/20",
     },
     skipped: {
@@ -424,7 +425,7 @@ export function TestWorkflowModal({
             >
               {testMutation.isPending || isRunning ? (
                 <>
-                  <LoadingSpinner className="w-4 h-4" />
+                  <Spinner className="w-4 h-4" />
                   <span>{isRunning ? "Running…" : "Starting…"}</span>
                 </>
               ) : (
@@ -440,7 +441,7 @@ export function TestWorkflowModal({
         {/* Results */}
         <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {phase === "idle" && !testMutation.isPending && (
-            <div className="flex flex-col items-center justify-center py-24 text-center px-6 opacity-20">
+            <div className="flex flex-col items-center justify-center py-16 text-center px-6 opacity-60">
               <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6">
                 <Terminal size={32} className="text-muted-foreground" />
               </div>
@@ -473,7 +474,7 @@ export function TestWorkflowModal({
                   ) : phase === "waiting" ? (
                     <PauseCircle className="w-3.5 h-3.5" />
                   ) : (
-                    <LoadingSpinner className="w-3.5 h-3.5" />
+                    <Spinner className="w-3.5 h-3.5" />
                   )}
                   {isTerminal ? phase : "running"}
                 </div>
@@ -554,12 +555,7 @@ export function TestWorkflowModal({
                 </div>
               ) : (
                 !isTerminal && (
-                  <div className="flex flex-col items-center justify-center py-16 gap-6">
-                    <LoadingSpinner className="w-10 h-10 text-primary" />
-                    <p className="text-xs font-semibold text-primary/70">
-                      Waiting for the first node…
-                    </p>
-                  </div>
+                  <LoadingState label="Waiting for the first node…" />
                 )
               )}
             </div>
