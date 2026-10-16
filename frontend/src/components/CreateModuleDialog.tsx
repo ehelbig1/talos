@@ -257,7 +257,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                       {template.allowedHosts.length > 0 && (
                         <Badge
                           variant="outline"
-                          className="bg-primary/5 text-primary border-primary/20 text-2xs font-semibold px-2 py-0.5 uppercase tracking-wider"
+                          className="bg-primary/5 text-primary border-primary/20 text-2xs font-semibold px-2 py-0.5"
                         >
                           <Globe className="h-2.5 w-2.5 mr-1.5" />
                           {template.allowedHosts.length} host
@@ -369,7 +369,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                 </div>
                 <Badge
                   variant="outline"
-                  className="bg-primary/5 border-primary/20 text-2xs font-semibold uppercase tracking-wider text-primary px-2"
+                  className="bg-primary/5 border-primary/20 text-2xs font-semibold text-primary px-2"
                 >
                   <Check className="w-2.5 h-2.5 mr-1.5" /> Schema valid
                 </Badge>

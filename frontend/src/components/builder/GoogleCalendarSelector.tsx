@@ -340,7 +340,7 @@ export function GoogleCalendarSelector({
                                 {calendar.summary}
                               </span>
                               {calendar.primary && (
-                                <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-1.5 py-0 uppercase tracking-wider">
+                                <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-1.5 py-0">
                                   Primary
                                 </Badge>
                               )}

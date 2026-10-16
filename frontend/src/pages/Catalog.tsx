@@ -183,7 +183,7 @@ function TemplateCard({
           </span>
         )}
         {hasNetworkAccess && (
-          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold uppercase tracking-wider text-primary/60 bg-primary/5 border border-primary/20 shadow-sm">
+          <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl text-2xs font-semibold text-primary/60 bg-primary/5 border border-primary/20 shadow-sm">
             <Globe className="w-3 h-3 opacity-60" />
             Network access
           </span>

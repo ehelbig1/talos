@@ -92,7 +92,7 @@ export function KeysTable({
                             {k.scopes.map((s) => (
                               <span
                                 key={s}
-                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-2xs text-primary uppercase tracking-wider font-bold"
+                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-2xs text-primary font-bold"
                               >
                                 {s.split(":").pop()}
                               </span>

@@ -115,7 +115,7 @@ function TriggerBadge({ triggerType }: { triggerType: string | null }) {
   const cfg = configs[triggerType];
   if (!cfg)
     return (
-      <span className="px-3 py-1 rounded-full text-2xs font-semibold uppercase tracking-wider border bg-surface-4 text-muted-foreground/70 border-white/5">
+      <span className="px-3 py-1 rounded-full text-2xs font-semibold border bg-surface-4 text-muted-foreground/70 border-white/5">
         {triggerType.replace(/_/g, " ")}
       </span>
     );

@@ -51,7 +51,7 @@ export function NewKeyDialog({
               </p>
             </div>
             <div className="relative group">
-              <div className="absolute top-3 left-4 text-2xs font-bold uppercase tracking-wider text-muted-foreground pointer-events-none">
+              <div className="absolute top-3 left-4 text-2xs font-semibold uppercase tracking-wider text-muted-foreground pointer-events-none">
                 API key
               </div>
               <pre className="bg-black border border-white/5 text-warning p-6 pt-10 rounded-xl text-[14px] font-mono break-all whitespace-pre-wrap leading-relaxed">

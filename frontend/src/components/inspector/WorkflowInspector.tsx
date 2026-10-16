@@ -367,7 +367,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     Intent Metadata (JSON)
                   </label>
                   {jsonError && (
-                    <span className="text-2xs text-destructive font-semibold uppercase tracking-wider bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
+                    <span className="text-2xs text-destructive font-semibold bg-destructive/10 px-2 py-0.5 rounded border border-destructive/20">
                       Invalid JSON
                     </span>
                   )}
