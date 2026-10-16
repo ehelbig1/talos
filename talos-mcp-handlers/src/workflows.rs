@@ -10951,9 +10951,9 @@ async fn handle_get_workflow_quickstart(
                 // Vault path × effective allowed_secrets: flag vault:// config values
                 // blocked by the installed module's permissions. Uses vault_path_permitted()
                 // which mirrors get_secret() logic exactly (same prefix/glob semantics).
-                // Same empty-list fix as validate_workflow: skip only on wildcard, not on empty.
-                let has_wildcard = secrets.iter().any(|s| s == "*");
-                if !has_wildcard {
+                // Every reference is checked: a `*` grant covers nothing
+                // since 2026-10-15 (D2-D), so it no longer skips the check.
+                {
                     if let Some(cfg_obj) = node_config.as_object() {
                         for (field_key, field_val) in cfg_obj {
                             if let Some(val_str) = field_val.as_str() {

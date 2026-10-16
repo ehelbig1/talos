@@ -163,7 +163,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": format!("Secret key_paths this module can access via secrets::get_secret(). Supports prefix matching: 'anthropic' grants 'anthropic' and 'anthropic/api_key' but NOT 'anthropic-test/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] to allow all secrets. {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
+                        "description": format!("Secret key_paths this module can access via secrets::get_secret(). Supports prefix matching: 'anthropic' grants 'anthropic' and 'anthropic/api_key' but NOT 'anthropic-test/key' — the separator must be '/'. Default: [] (deny all). A '*' is refused (it would grant every stored secret); a '<prefix>/*' glob needs a two-factor session. {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
                     },
                     "allowed_hosts": {
                         "type": "array",
@@ -242,7 +242,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Secret key_paths this sandbox can access via secrets::get_secret(). Supports separator-aware prefix matching: 'stripe' grants 'stripe' and 'stripe/key' but NOT 'stripe-live/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] for all. A path whose value is MINTED rather than stored (gcp/impersonated/<service account>/access_token, .../as/<connection key>/access_token, github_app:<owner>) is minted for this run, from your own connection, only when this list covers it: a vault:// reference in the input alone does not mint."
+                        "description": "Secret key_paths this sandbox can access via secrets::get_secret(). Supports separator-aware prefix matching: 'stripe' grants 'stripe' and 'stripe/key' but NOT 'stripe-live/key' — the separator must be '/'. Default: [] (deny all). A '*' is refused; a '<prefix>/*' glob needs a two-factor session. A path whose value is MINTED rather than stored (gcp/impersonated/<service account>/access_token, .../as/<connection key>/access_token, github_app:<owner>) is minted for this run, from your own connection, only when this list covers it: a vault:// reference in the input alone does not mint."
                     },
                     "actor_id": {
                         "type": "string",
@@ -422,7 +422,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": format!("New allowed_secrets list. Replaces the existing list. Use prefix paths for broad grants (e.g., 'oauth/gmail' grants all gmail tokens). Use ['*'] for unrestricted access (not recommended). {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
+                        "description": format!("New allowed_secrets list. Replaces the existing list. Use prefix paths for broad grants (e.g., 'oauth/gmail' grants all gmail tokens). A '*' is refused for every caller; a '<prefix>/*' glob needs a two-factor session. {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
                     }
                 },
                 "required": ["module_id", "allowed_secrets"]

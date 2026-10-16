@@ -1480,9 +1480,8 @@ pub fn analyze_workflow_for_quickstart(
             }
         }
 
-        // Vault-reference warnings. Wildcard short-circuits — no need
-        // to validate per-key when the module accepts everything.
-        let has_wildcard = meta.allowed_secrets.iter().any(|s| s == "*");
+        // Vault-reference warnings, every reference by the one matcher (a
+        // `*` grant no longer short-circuits: it grants nothing — D2-D).
         if let Some(cfg_obj) = node_config.as_object() {
             for (field_key, field_val) in cfg_obj {
                 let Some(val_str) = field_val.as_str() else {
@@ -1499,12 +1498,7 @@ pub fn analyze_workflow_for_quickstart(
                     ));
                     continue;
                 }
-                if !has_wildcard
-                    && !talos_workflow_job_protocol::vault_path_permitted(
-                        &meta.allowed_secrets,
-                        path,
-                    )
-                {
+                if !talos_workflow_job_protocol::vault_path_permitted(&meta.allowed_secrets, path) {
                     analysis.vault_warnings.push(format!(
                         "Node '{}' config key '{}' references vault://{} \
                          but the module's allowed_secrets does not include \
@@ -3081,8 +3075,10 @@ mod tests {
         assert!(w.contains("inaccessible at runtime"));
     }
 
+    /// D2-D (2026-10-15): a `*` grant grants nothing, so it no longer
+    /// silences the per-reference check — the reference is warned about.
     #[test]
-    fn quickstart_vault_wildcard_grant_silences_path_warnings() {
+    fn quickstart_vault_star_grant_does_not_silence_path_warnings() {
         let metas = meta_map(vec![(
             "m",
             meta_with(
@@ -3097,10 +3093,13 @@ mod tests {
             "config": {"AUTH": "vault://anything/at/all"},
         })];
         let analysis = analyze_workflow_for_quickstart(&nodes, &metas).unwrap();
-        assert!(
-            analysis.vault_warnings.is_empty(),
-            "wildcard grant short-circuits per-key validation"
+        assert_eq!(
+            analysis.vault_warnings.len(),
+            1,
+            "{:?}",
+            analysis.vault_warnings
         );
+        assert!(analysis.vault_warnings[0].contains("inaccessible at runtime"));
     }
 
     #[test]

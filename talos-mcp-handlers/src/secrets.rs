@@ -407,19 +407,11 @@ async fn handle_list_secret_usage(
             "module_id": m.module_id,
             "module_name": m.module_name,
             "module_type": m.source.as_str(),
-            "access_type": if m.wildcard { "wildcard" } else { "explicit" },
             "workflows": workflows,
         }));
     }
 
-    let explicit_references: Vec<&serde_json::Value> = results
-        .iter()
-        .filter(|r| r.get("access_type").and_then(|v| v.as_str()) == Some("explicit"))
-        .collect();
-    let wildcard_access: Vec<&serde_json::Value> = results
-        .iter()
-        .filter(|r| r.get("access_type").and_then(|v| v.as_str()) == Some("wildcard"))
-        .collect();
+    let explicit_references = &results;
 
     // ── Pass 2: graph_json direct-reference scan ──────────────────────────────
     // The allowed_secrets join is only populated when modules are installed via
@@ -514,12 +506,10 @@ async fn handle_list_secret_usage(
         "key_path": key_path,
         "namespace": secret_namespace,
         "explicit_references": explicit_references,
-        "wildcard_access": wildcard_access,
         "direct_references": direct_references,
         "host_consumers": host_consumers,
         "note": "explicit_references = modules with this secret in allowed_secrets; \
                  direct_references = workflows whose node configs reference the key_path or name directly; \
-                 wildcard_access = modules that can access ANY secret via '*'; \
                  host_consumers = controller-side code that resolves this key automatically (LLM provider keys only) — not visible in module allowlists or node config but rotation-safe."
     });
 
@@ -613,7 +603,7 @@ async fn handle_get_unused_secrets(
         );
     }
 
-    let (referenced, has_wildcard) = match state
+    let referenced = match state
         .secrets_manager
         .list_referenced_secret_names(user_id)
         .await
@@ -624,15 +614,6 @@ async fn handle_get_unused_secrets(
             return mcp_error(req_id, -32000, "Failed to scan module references");
         }
     };
-
-    // If any module uses wildcard, all secrets are potentially referenced
-    if has_wildcard {
-        return mcp_text(req_id, &serde_json::to_string_pretty(&serde_json::json!({
-            "unused_secrets": [],
-            "message": "At least one module uses wildcard (*) allowed_secrets, so all secrets are potentially referenced.",
-            "total_secrets": secrets.len(),
-        })).unwrap_or_default());
-    }
 
     // M-E (2026-05-06): exclude host-managed vault paths from the
     // "unused" classification. Per

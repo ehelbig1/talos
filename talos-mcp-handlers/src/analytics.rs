@@ -6888,24 +6888,9 @@ async fn handle_get_workflow_risk_assessment(
                 continue;
             };
 
-            // Risk A: wildcard grant — module can read any vault path.
-            if secrets.iter().any(|s| s == "*") {
-                risks.push(serde_json::json!({
-                    "risk_level": "medium",
-                    "category": "wildcard_secret_grant",
-                    "node_id": node_id,
-                    "description": format!(
-                        "Node '{}' (module: '{}') has wildcard secret access \
-                         (allowed_secrets: [\"*\"]) — can read any vault path. \
-                         Blast radius: all secrets in the vault.",
-                        node_id, tmpl_name
-                    ),
-                    "recommendation": "Reinstall the module with explicit allowed_secrets paths \
-                        to restrict access to only the secrets it needs."
-                }));
-                // Wildcard covers everything — no need for vault_path_blocked check.
-                continue;
-            }
+            // (Risk A, a `*` grant reading every vault path, is gone: a `*`
+            // grants nothing and no row holds one since 2026-10-15 — D2-D.
+            // A reference it would have "covered" is reported blocked below.)
 
             // Risk B: empty grant — only flag when the node's config actually
             // references vault:// paths. An empty allowed_secrets on a module that
@@ -6933,8 +6918,9 @@ async fn handle_get_workflow_risk_assessment(
                          Every execution will fail with 'unauthorized'.",
                         node_id, tmpl_name
                     ),
-                    "recommendation": "Reinstall the module with allowed_secrets: [\"path/to/key\"] \
-                        or [\"*\"] to enable secret access."
+                    "recommendation": "Grant the exact paths the node references with \
+                        update_module_secrets (allowed_secrets: [\"path/to/key\"]); a '*' grant \
+                        is not accepted."
                 }));
             }
 

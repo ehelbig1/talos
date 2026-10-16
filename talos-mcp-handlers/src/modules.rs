@@ -5658,13 +5658,12 @@ async fn handle_install_module_from_catalog(
     // captured up-front because catalog_secrets/talos_json_secrets are
     // moved into `allowed_secrets` earlier.)
     let grant_empty = stored_allowed_secrets.is_empty() && template_requires_secrets;
-    let has_wildcard_grant = stored_allowed_secrets.iter().any(|s| s == "*");
     // setup_required: true when the operator needs to do something before secrets work.
     //   - grant_empty: true  → deny-all grant on a template that needs secrets, must reinstall
-    //   - non-empty, non-wildcard → specific paths need provisioning in the vault
-    //   - wildcard grant → any existing secret is accessible, no specific provisioning
+    //   - non-empty → specific paths need provisioning in the vault (a `*`,
+    //     which needed none, grants nothing since 2026-10-15 — D2-D)
     //   - template declares zero secrets → no setup needed
-    let setup_required = grant_empty || (!has_wildcard_grant && !stored_allowed_secrets.is_empty());
+    let setup_required = grant_empty || !stored_allowed_secrets.is_empty();
     // Return wasm_modules.id when available so this response is consistent with
     // list_modules (which also returns wasm_modules.id for installed catalog modules).
     // Fall back to node_templates.id when the wasm_modules write failed.
@@ -5710,15 +5709,10 @@ async fn handle_install_module_from_catalog(
     });
     if grant_empty {
         resp["grant_empty_warning"] = serde_json::json!(
-                    "No secrets granted — allowed_secrets is empty (deny-all). \
+            "No secrets granted — allowed_secrets is empty (deny-all). \
                      This module cannot read any vault paths. \
-                     Reinstall with allowed_secrets: [\"path/to/key\"] or [\"*\"] to enable secret access."
-                );
-    } else if has_wildcard_grant {
-        resp["wildcard_grant_warning"] = serde_json::json!(
-            "Module has wildcard secret access (allowed_secrets: [\"*\"]) — \
-                     can read any vault path. Consider restricting to specific paths \
-                     for least-privilege operation."
+                     Grant the exact paths it reads with update_module_secrets \
+                     (allowed_secrets: [\"path/to/key\"]); a '*' grant is not accepted."
         );
     }
     if let Some(w) = pin_warning {
