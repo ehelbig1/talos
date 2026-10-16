@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -183,10 +184,10 @@ export default function AuditSettings() {
                       Transport protocol
                     </Label>
                     <div className="relative">
-                      <select
+                      <Select
                         value={protocol}
                         onChange={(e) => setProtocol(e.target.value)}
-                        className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer hover:bg-black/60"
+                        className="text-xs font-mono"
                       >
                         {/* MCP-866 (2026-05-14): only gRPC is wired through
                             talos-audit-ledger today. HTTP/Protobuf was offered
@@ -194,7 +195,7 @@ export default function AuditSettings() {
                             regardless, so selecting it silently kept gRPC. Will
                             reinstate when the HTTP exporter branch lands. */}
                         <option value="grpc">gRPC (Binary/Protobuf)</option>
-                      </select>
+                      </Select>
                       <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/70">
                         <ArrowRight className="w-4 h-4 rotate-90" />
                       </div>

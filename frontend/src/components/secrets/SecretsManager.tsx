@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { gql } from "@/lib/graphqlClient";
@@ -200,13 +201,13 @@ function SecretsManager() {
                   New value
                 </label>
                 <div className="relative group/input">
-                  <input
+                  <Input
                     type="password"
                     autoFocus
                     value={editValue}
                     onChange={(e) => setEditValue(e.target.value)}
                     placeholder="Enter the new secret value"
-                    className="relative w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm text-foreground focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui placeholder:text-muted-foreground/50"
+                    className="relative"
                   />
                 </div>
               </div>

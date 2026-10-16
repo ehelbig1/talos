@@ -24,6 +24,24 @@ const PALETTE_COLOUR_SELECTORS = [
     { selector: `Literal[value=/${PALETTE_CLASS}/]`, message: PALETTE_MESSAGE },
     { selector: `TemplateElement[value.raw=/${PALETTE_CLASS}/]`, message: PALETTE_MESSAGE },
 ];
+// One input, one select, one textarea (src/components/ui/{input,select,textarea}.tsx).
+// A checkbox, radio, range, file, hidden or colour input is a different control
+// and stays a raw <input>.
+const FORM_PRIMITIVE_SELECTORS = [
+    {
+        selector: 'JSXOpeningElement[name.name="input"]:not(:has(JSXAttribute[name.name="type"] > Literal[value=/^(checkbox|radio|range|file|hidden|color)$/]))',
+        message: "One input: use Input from @/components/ui/input (a checkbox, radio, range, file, hidden or color input stays raw).",
+    },
+    {
+        selector: 'JSXOpeningElement[name.name="select"]',
+        message: "One select: use Select from @/components/ui/select.",
+    },
+    {
+        selector: 'JSXOpeningElement[name.name="textarea"]',
+        message: "One textarea: use Textarea from @/components/ui/textarea.",
+    },
+];
+
 const UI_FLOOR_SELECTORS = [
                 {
                     // An icon-only button (no text anywhere below it) has no
@@ -192,7 +210,15 @@ export default [
     // primitive in src/components/ui before reaching for a one-off.
     {
         files: ["src/**/*.ts", "src/**/*.tsx"],
-        ignores: ["**/*.test.ts", "**/*.test.tsx", "**/__tests__/**", "src/generated/**", ...KIND_COLOUR_HOMES],
+        ignores: ["**/*.test.ts", "**/*.test.tsx", "**/__tests__/**", "src/generated/**", "src/components/ui/**", ...KIND_COLOUR_HOMES],
+        rules: {
+            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...PALETTE_COLOUR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS],
+        },
+    },
+    // The primitives themselves render the raw elements.
+    {
+        files: ["src/components/ui/**/*.ts", "src/components/ui/**/*.tsx"],
+        ignores: ["**/*.test.ts", "**/*.test.tsx"],
         rules: {
             "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...PALETTE_COLOUR_SELECTORS],
         },
@@ -202,7 +228,7 @@ export default [
     {
         files: KIND_COLOUR_HOMES,
         rules: {
-            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS],
+            "no-restricted-syntax": ["error", ...UI_FLOOR_SELECTORS, ...FORM_PRIMITIVE_SELECTORS],
         },
     },
     // Test files: allow `any`. Test doubles, mock fetch signatures, and

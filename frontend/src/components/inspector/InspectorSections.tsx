@@ -1,4 +1,7 @@
 import React from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Brain, ShieldCheck, ChevronDown, Activity } from "lucide-react";
 import { CopyField } from "@/components/ui";
@@ -57,9 +60,6 @@ export function LlmConfigSection({
 
   if (!hasLlm) return null;
 
-  const selectBase =
-    "w-full px-4 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
-
   return (
     <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl space-y-6 relative overflow-hidden group">
       <div className="flex items-center justify-between relative z-10">
@@ -84,8 +84,8 @@ export function LlmConfigSection({
               Provider
             </label>
             <div className="relative">
-              <select
-                className={selectBase}
+              <Select
+                className="text-xs"
                 value={(data.config?.llm_provider as string) || "anthropic"}
                 onChange={(e) =>
                   updateNodeData(nodeId, {
@@ -96,7 +96,7 @@ export function LlmConfigSection({
                 <option value="anthropic">ANTHROPIC (CLAUDE)</option>
                 <option value="openai">OPENAI (GPT)</option>
                 <option value="gemini">GOOGLE (GEMINI)</option>
-              </select>
+              </Select>
               <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
             </div>
           </div>
@@ -106,8 +106,8 @@ export function LlmConfigSection({
               Model
             </label>
             <div className="relative">
-              <select
-                className={selectBase}
+              <Select
+                className="text-xs"
                 value={(data.config?.llm_model as string) || ""}
                 onChange={(e) =>
                   updateNodeData(nodeId, {
@@ -130,7 +130,7 @@ export function LlmConfigSection({
                   <option value="gemini-1.5-pro">GEMINI 1.5 PRO</option>
                   <option value="gemini-1.5-flash">GEMINI 1.5 FLASH</option>
                 </optgroup>
-              </select>
+              </Select>
               <ChevronDown className="absolute right-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
             </div>
           </div>
@@ -141,12 +141,12 @@ export function LlmConfigSection({
             <label className="text-xs text-muted-foreground/60 font-medium ml-1">
               Temperature
             </label>
-            <input
+            <Input
               type="number"
               min="0"
               max="2"
               step="0.1"
-              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30"
+              className="text-xs"
               value={(data.config?.llm_temperature as number) ?? 0.7}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -165,10 +165,10 @@ export function LlmConfigSection({
             <label className="text-xs text-muted-foreground/60 font-medium ml-1">
               Maximum tokens
             </label>
-            <input
+            <Input
               type="number"
               min="1"
-              className="w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30"
+              className="text-xs"
               value={(data.config?.llm_max_tokens as number) ?? 4096}
               onChange={(e) =>
                 updateNodeData(nodeId, {
@@ -190,9 +190,9 @@ export function LlmConfigSection({
             System prompt
           </label>
           <div className="relative group/directive">
-            <textarea
+            <Textarea
               rows={4}
-              className="relative w-full px-5 py-4 text-xs font-medium bg-black/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:outline-none transition-ui resize-none font-sans leading-relaxed selection:bg-primary/30 placeholder:text-muted-foreground/50"
+              className="relative text-xs resize-none font-sans"
               placeholder="Tell the model what to do…"
               value={(data.config?.llm_system_prompt as string) || ""}
               onChange={(e) =>
@@ -217,9 +217,6 @@ export function RetryPolicySection({
   data: WorkflowNodeData;
   updateNodeData: (id: string, data: Partial<WorkflowNodeData>) => void;
 }) {
-  const inputBase =
-    "w-full px-5 py-3.5 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30";
-
   return (
     <div className="space-y-8">
       <div className="grid grid-cols-2 gap-6">
@@ -227,12 +224,12 @@ export function RetryPolicySection({
           <label className="text-xs text-muted-foreground/60 font-medium ml-1">
             Threshold
           </label>
-          <input
+          <Input
             type="number"
             // Empty = no declared count: the engine's method-aware default
             // applies. That is NOT 0, which means "never retry".
             placeholder="default"
-            className={inputBase}
+            className="text-xs"
             value={data.retryPolicy?.maxRetries ?? ""}
             onChange={(e) => {
               const currentPolicy = data.retryPolicy || {};
@@ -253,10 +250,10 @@ export function RetryPolicySection({
           <label className="text-xs text-muted-foreground/60 font-medium ml-1">
             Backoff (ms)
           </label>
-          <input
+          <Input
             type="number"
             placeholder="1000"
-            className={inputBase}
+            className="text-xs"
             value={data.retryPolicy?.backoffMs ?? 1000}
             onChange={(e) => {
               const currentPolicy = data.retryPolicy || {};
@@ -276,9 +273,9 @@ export function RetryPolicySection({
           Condition (Rhai)
         </label>
         <div className="relative group/logic">
-          <textarea
+          <Textarea
             placeholder="ctx.last_error.code == 503"
-            className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-xs min-h-[140px] transition-ui rounded-2xl selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40"
+            className="relative font-mono text-xs min-h-[140px]"
             value={data.retryPolicy?.retryCondition ?? ""}
             onChange={(e) => {
               const currentPolicy = data.retryPolicy || {};

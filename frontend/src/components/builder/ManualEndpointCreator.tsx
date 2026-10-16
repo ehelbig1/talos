@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { Plus, X, Check, Target, Shield } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { EndpointSelector } from "./EndpointSelector";
@@ -147,7 +149,7 @@ export function ManualEndpointCreator({
             <label className="text-xs font-medium text-white/70 px-1">
               Method
             </label>
-            <select
+            <Select
               value={currentEndpoint.method}
               onChange={(e) =>
                 setCurrentEndpoint({
@@ -155,28 +157,27 @@ export function ManualEndpointCreator({
                   method: e.target.value,
                 })
               }
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white outline-none focus:border-success/40 transition-ui"
             >
               <option value="GET">GET</option>
               <option value="POST">POST</option>
               <option value="PUT">PUT</option>
               <option value="PATCH">PATCH</option>
               <option value="DELETE">DELETE</option>
-            </select>
+            </Select>
           </div>
 
           <div className="flex-1 space-y-2">
             <label className="text-xs font-medium text-white/70 px-1">
               Path <span className="text-success">*</span>
             </label>
-            <input
+            <Input
               type="text"
               value={currentEndpoint.path}
               onChange={(e) =>
                 setCurrentEndpoint({ ...currentEndpoint, path: e.target.value })
               }
               placeholder="/API/V1/RESOURCES/{ID}"
-              className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-mono font-semibold text-white placeholder-white/10 outline-none focus:border-success/40 transition-ui"
+              className="font-mono"
             />
           </div>
         </div>
@@ -186,7 +187,7 @@ export function ManualEndpointCreator({
           <label className="text-xs font-medium text-white/70 px-1">
             Description
           </label>
-          <input
+          <Input
             type="text"
             value={currentEndpoint.summary}
             onChange={(e) =>
@@ -196,7 +197,6 @@ export function ManualEndpointCreator({
               })
             }
             placeholder="e.g. Get a user by ID"
-            className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 outline-none focus:border-success/40 transition-ui"
           />
         </div>
 
@@ -245,23 +245,23 @@ export function ManualEndpointCreator({
                     >
                       {param.in}
                     </Badge>
-                    <input
+                    <Input
                       type="text"
                       value={param.name}
                       onChange={(e) =>
                         updateParameter(index, "name", e.target.value)
                       }
                       placeholder="KEY"
-                      className="flex-1 h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-success/40"
+                      className="flex-1"
                     />
-                    <input
+                    <Input
                       type="text"
                       value={param.description}
                       onChange={(e) =>
                         updateParameter(index, "description", e.target.value)
                       }
                       placeholder="Description"
-                      className="flex-[2] h-8 bg-surface-4 border border-white/5 rounded-lg px-3 text-sm font-semibold text-white outline-none focus:border-success/40"
+                      className="flex-[2]"
                     />
                     <label className="flex items-center gap-2 cursor-pointer group/check">
                       <input

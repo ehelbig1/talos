@@ -1,4 +1,5 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
+import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
@@ -361,7 +362,7 @@ export default function Settings() {
         <label htmlFor="settings-section" className="sr-only">
           Settings section
         </label>
-        <select
+        <Select
           id="settings-section"
           value={active}
           onChange={(e) => {
@@ -369,7 +370,6 @@ export default function Settings() {
             if (item?.to) navigate(item.to);
             else setActive(e.target.value);
           }}
-          className="w-full h-10 bg-surface-3/60 border border-white/10 text-white rounded-xl px-3 text-sm focus:outline-none focus:border-primary/40"
         >
           {SIDEBAR_CATEGORIES.map((category) => (
             <optgroup key={category.label} label={category.label}>
@@ -380,7 +380,7 @@ export default function Settings() {
               ))}
             </optgroup>
           ))}
-        </select>
+        </Select>
       </div>
 
       {/* Two-column layout */}

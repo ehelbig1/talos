@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { LoadingSpinner } from "@/components/LoadingSpinner";
@@ -178,12 +180,12 @@ export default function WorkflowVersionsPanel({
                 Publishing version
               </p>
             </div>
-            <textarea
+            <Textarea
               placeholder="Description (optional) — e.g. Add retry logic to Step 3"
               value={publishDescription}
               onChange={(e) => setPublishDescription(e.target.value)}
               rows={2}
-              className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/20 rounded-xl px-4 py-3 text-sm text-foreground placeholder:text-muted-foreground/50 resize-none transition-ui font-medium"
+              className="resize-none"
             />
             <div className="flex justify-end gap-3">
               <Button
@@ -455,13 +457,13 @@ export default function WorkflowVersionsPanel({
                 </div>
                 <div className="flex gap-4">
                   <div className="relative flex-1 group">
-                    <input
+                    <Input
                       type="number"
                       min={1}
                       value={concurrencyInput}
                       onChange={(e) => setConcurrencyInput(e.target.value)}
                       placeholder="No limit"
-                      className="w-full bg-surface-4/60 border border-white/10 focus:border-primary/40 focus:outline-none focus:ring-1 focus:ring-primary/40 rounded-xl px-5 py-3 text-sm text-white placeholder:text-muted-foreground/50 transition-ui relative z-10 font-medium"
+                      className="relative z-10"
                     />
                   </div>
                   <Button

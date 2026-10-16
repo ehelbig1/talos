@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Select } from "@/components/ui/select";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
@@ -175,13 +176,13 @@ export function SecretField({
         <p className="text-xs text-muted-foreground">{description}</p>
       )}
       <div className="flex gap-2 items-start">
-        <select
+        <Select
           value={selectedSecret}
           onChange={(e) => {
             setSelectedSecret(e.target.value);
             onChange(e.target.value);
           }}
-          className="flex-1 h-9 px-3 py-2 border border-input rounded-md text-sm bg-background"
+          className="flex-1"
         >
           <option value="">Select secret...</option>
           {availableSecrets.map((secret) => (
@@ -189,7 +190,7 @@ export function SecretField({
               {secret}
             </option>
           ))}
-        </select>
+        </Select>
       </div>
       <InlineSecretCreator
         onSecretCreated={handleSecretCreated}

@@ -13,6 +13,7 @@
  */
 
 import React from "react";
+import { Select } from "@/components/ui/select";
 
 export interface WorkflowOption {
   id: string;
@@ -39,7 +40,7 @@ export function WorkflowBindingSelect({
   const bound = value ?? NONE;
   const known = (workflows ?? []).some((w) => w.id === bound);
   return (
-    <select
+    <Select
       aria-label={`Workflow started by ${channelLabel}`}
       value={bound}
       disabled={disabled || workflows === undefined}
@@ -47,7 +48,7 @@ export function WorkflowBindingSelect({
         const next = e.target.value;
         if (next !== bound) onChange(next === NONE ? null : next);
       }}
-      className="h-8 max-w-[14rem] rounded-md border border-border/60 bg-background px-2 text-xs text-foreground disabled:opacity-60"
+      className="max-w-[14rem] text-xs"
     >
       <option value={NONE}>None</option>
       {bound !== NONE && !known && (
@@ -62,6 +63,6 @@ export function WorkflowBindingSelect({
           {w.name}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }

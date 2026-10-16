@@ -1,4 +1,7 @@
 import React, { useState, useMemo } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -162,21 +165,19 @@ export function SummaryPanel({
                       <label className="text-xs font-semibold text-muted-foreground ml-1">
                         Name
                       </label>
-                      <input
+                      <Input
                         value={editName}
                         onChange={(e) => setEditName(e.target.value)}
                         maxLength={100}
-                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui"
                       />
                     </div>
                     <div className="space-y-2">
                       <label className="text-xs font-semibold text-muted-foreground ml-1">
                         Capability Ceiling
                       </label>
-                      <select
+                      <Select
                         value={editWorld}
                         onChange={(e) => setEditWorld(e.target.value)}
-                        className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui appearance-none cursor-pointer"
                       >
                         {editOptions.map(({ world, permitted }) => (
                           <option
@@ -190,7 +191,7 @@ export function SummaryPanel({
                             {getCapabilityConfig(world).label} Level
                           </option>
                         ))}
-                      </select>
+                      </Select>
                     </div>
                   </div>
 
@@ -198,12 +199,12 @@ export function SummaryPanel({
                     <label className="text-xs font-semibold text-muted-foreground ml-1">
                       Functional Description
                     </label>
-                    <textarea
+                    <Textarea
                       value={editDesc}
                       onChange={(e) => setEditDesc(e.target.value)}
                       rows={3}
                       placeholder="What does this actor do?"
-                      className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-ui resize-none"
+                      className="resize-none"
                     />
                   </div>
 

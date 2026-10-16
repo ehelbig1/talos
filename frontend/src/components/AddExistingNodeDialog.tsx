@@ -1,5 +1,6 @@
 import React, { memo, useState } from "react";
-import { ErrorBanner, Dialog, Button, DarkInput } from "@/components/ui";
+import { Input } from "@/components/ui/input";
+import { ErrorBanner, Dialog, Button } from "@/components/ui";
 import { ModuleItem } from "@/components/dialogs/ModuleItem";
 import { useAddExistingNode } from "@/hooks/useAddExistingNode";
 import { useUIStore } from "@/store/uiStore";
@@ -80,7 +81,7 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
 
         <div className="relative group/search">
           <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
-          <DarkInput
+          <Input
             type="text"
             placeholder="Search modules…"
             value={searchQuery}

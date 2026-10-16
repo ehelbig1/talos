@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
@@ -119,10 +120,9 @@ function AddScheduleDialog({
               Target Workflow
             </label>
             <div className="relative group">
-              <select
+              <Select
                 value={workflowId}
                 onChange={(e) => setWorkflowId(e.target.value)}
-                className="w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white focus:outline-none focus:border-warning/40 focus:ring-4 focus:ring-warning/10 transition-ui appearance-none cursor-pointer"
               >
                 <option value="" disabled className="bg-surface-3">
                   Select a workflow…
@@ -132,7 +132,7 @@ function AddScheduleDialog({
                     {wf.name}
                   </option>
                 ))}
-              </select>
+              </Select>
               <div className="absolute right-5 top-1/2 -translate-y-1/2 pointer-events-none text-muted-foreground/60">
                 <ChevronRight size={14} className="rotate-90" />
               </div>

@@ -1,4 +1,6 @@
 import React, { useRef, useState } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import { Dialog, Section } from "@/components/ui";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
@@ -151,13 +153,13 @@ export function SlackAppCreator({
               >
                 App Name *
               </label>
-              <input
+              <Input
                 id="slack-app-name"
                 type="text"
                 value={appName}
                 onChange={(e) => setAppName(e.target.value)}
                 placeholder="My Webhook App"
-                className="w-full p-2 border-2 border-white/10 rounded text-sm"
+
                 autoFocus
               />
             </Section>
@@ -169,13 +171,12 @@ export function SlackAppCreator({
               >
                 Description (Optional)
               </label>
-              <textarea
+              <Textarea
                 id="slack-app-desc"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 placeholder="Receives events from Slack and processes them"
                 rows={3}
-                className="w-full p-2 border-2 border-white/10 rounded text-sm"
               />
             </Section>
 
@@ -271,12 +272,12 @@ export function SlackAppCreator({
               </label>
               {/* Uncontrolled input — value is read via ref only at submit time
                   so the token is never held in React component state. */}
-              <input
+              <Input
                 id="slack-token"
                 type="password"
                 ref={userTokenRef}
                 placeholder="xoxp-your-user-token"
-                className="w-full p-2 border-2 border-white/10 rounded text-sm"
+
                 autoComplete="off"
               />
               <p className="mt-2 text-xs text-muted-foreground">

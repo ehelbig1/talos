@@ -1,4 +1,5 @@
 import { config } from "@/config";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import React, { useState } from "react";
 import { userFacingErrorMessage } from "@/lib/sanitize";
@@ -8,7 +9,6 @@ import {
   verifyTwoFactor,
 } from "@/lib/auth";
 import { useAuth } from "@/contexts/AuthContext";
-import { DarkInput } from "@/components/ui/DarkInput";
 import { Zap, Loader2, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -124,7 +124,7 @@ export function AuthForm() {
                   <label htmlFor="name" className={labelClass}>
                     Name
                   </label>
-                  <DarkInput
+                  <Input
                     id="name"
                     type="text"
                     value={name}
@@ -139,7 +139,7 @@ export function AuthForm() {
                 <label htmlFor="email" className={labelClass}>
                   Email
                 </label>
-                <DarkInput
+                <Input
                   id="email"
                   type="email"
                   value={email}
@@ -154,7 +154,7 @@ export function AuthForm() {
                 <label htmlFor="password" className={labelClass}>
                   Password
                 </label>
-                <DarkInput
+                <Input
                   id="password"
                   type="password"
                   value={password}
@@ -205,7 +205,7 @@ export function AuthForm() {
               </div>
 
               <div>
-                <DarkInput
+                <Input
                   id="twoFactorCode"
                   type="text"
                   inputMode="numeric"

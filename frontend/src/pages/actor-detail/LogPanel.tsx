@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, Download, Filter, RefreshCw } from "lucide-react";
@@ -78,11 +79,11 @@ export function LogPanel({ actorId }: { actorId: string }) {
         <div className="flex items-center gap-2">
           <div className="relative">
             <Filter className="w-3.5 h-3.5 text-muted-foreground/70 absolute left-2.5 top-1/2 -translate-y-1/2" />
-            <input
+            <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search…"
-              className="bg-surface-3/60 border border-white/5 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 w-40"
+              className="pl-7 pr-3 text-xs w-40"
             />
           </div>
           {entries.length > 0 && (

@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect } from "react";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
@@ -170,11 +172,10 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Name
             </label>
-            <input
+            <Input
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. GitHub push"
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui"
             />
           </div>
 
@@ -182,10 +183,9 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Workflow
             </label>
-            <select
+            <Select
               value={moduleId}
               onChange={(e) => setModuleId(e.target.value)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer"
             >
               <option value="" className="bg-surface-3">
                 Select a workflow…
@@ -195,20 +195,20 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
                   {w.name}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
 
           <div className="space-y-2">
             <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
               Rate Threshold (Req/Min)
             </label>
-            <input
+            <Input
               type="number"
               min={1}
               max={1000}
               value={rateLimit}
               onChange={(e) => setRateLimit(parseInt(e.target.value, 10) || 60)}
-              className="w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-xs font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui"
+              className="text-xs"
             />
           </div>
 

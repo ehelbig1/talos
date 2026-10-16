@@ -1,4 +1,5 @@
 import React, { useMemo, useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { toast } from "sonner";
@@ -12,7 +13,7 @@ import {
   AlertTriangle,
   ArrowUpRight,
 } from "lucide-react";
-import { Input, Textarea, Button, DarkSelect } from "@/components/ui";
+import { Input, Textarea, Button } from "@/components/ui";
 import { cn } from "@/lib/utils";
 import { listActors } from "@/lib/graphqlApi";
 import { lifecycleStyle, lifecycleLabel } from "@/lib/mlLifecycle";
@@ -77,10 +78,6 @@ interface SmartClassifierConfigProps {
 }
 
 const labelStyle = "text-xs text-muted-foreground/60 font-medium ml-1";
-const inputBase =
-  "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui placeholder:text-muted-foreground/50";
-const textareaBase =
-  "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-ui resize-none leading-relaxed custom-scrollbar";
 
 /**
  * First-class configuration surface for a `smart-classifier` module node.
@@ -316,12 +313,12 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="support-email-urgency"
-              className={inputBase}
+              className="text-xs"
             />
           </div>
           <div className="space-y-3">
             <label className={labelStyle}>Owning Actor</label>
-            <DarkSelect
+            <Select
               value={actorId}
               onChange={(e) => setActorId(e.target.value)}
               className="w-full"
@@ -332,7 +329,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                   {a.name}
                 </option>
               ))}
-            </DarkSelect>
+            </Select>
             <p className="text-2xs text-muted-foreground/70 font-medium px-1 leading-relaxed">
               The actor owns the model and receives the disagreement digest.
               Serving and learning run under its tenancy.
@@ -368,7 +365,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           value={systemPrompt}
           onChange={(e) => setField("SYSTEM_PROMPT", e.target.value)}
           placeholder="Classify this support email by urgency."
-          className={textareaBase}
+          className="text-xs font-mono resize-none custom-scrollbar"
         />
         <p className="text-2xs text-muted-foreground/70 font-medium px-1">
           The allowed labels and JSON response format are appended
@@ -407,7 +404,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
               }
             }}
             placeholder="Add a label…"
-            className={inputBase}
+            className="text-xs"
           />
           <Button
             onClick={addLabel}
@@ -443,7 +440,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
           <div className="space-y-4">
             <div className="space-y-3">
               <label className={labelStyle}>Provider</label>
-              <DarkSelect
+              <Select
                 value={provider}
                 onChange={(e) => setField("PROVIDER", e.target.value)}
                 className="w-full"
@@ -453,7 +450,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                     {p}
                   </option>
                 ))}
-              </DarkSelect>
+              </Select>
               {external && (
                 <label className="flex items-start gap-2 px-1 cursor-pointer">
                   <input
@@ -478,7 +475,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                 value={model}
                 onChange={(e) => setField("MODEL", e.target.value)}
                 placeholder={DEFAULT_MODEL}
-                className={inputBase}
+                className="text-xs"
               />
             </div>
             <div className="space-y-3">
@@ -490,7 +487,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                   const n = parseInt(e.target.value, 10);
                   setField("MAX_TOKENS", Number.isNaN(n) ? 256 : n);
                 }}
-                className={inputBase}
+                className="text-xs"
               />
               <p className="text-2xs text-muted-foreground/70 font-medium px-1">
                 Cap for the LLM classification response (one label is small).

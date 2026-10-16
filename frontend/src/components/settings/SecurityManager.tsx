@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Input } from "@/components/ui/input";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -360,7 +361,7 @@ function RotateMasterKeyCard() {
               New master key (64 hex characters)
             </label>
             <div className="relative group/input">
-              <input
+              <Input
                 type={showKey ? "text" : "password"}
                 placeholder="64 hex characters"
                 value={newMasterKey}
@@ -368,7 +369,7 @@ function RotateMasterKeyCard() {
                   setNewMasterKey(e.target.value)
                 }
                 className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-xs font-mono text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-destructive/10 transition-ui",
+                  "text-xs font-mono",
                   newMasterKey.length > 0 &&
                     !isKeyValid &&
                     "border-destructive/40 focus:border-destructive/60",
@@ -402,17 +403,14 @@ function RotateMasterKeyCard() {
               Confirmation
             </label>
             <div className="relative">
-              <input
+              <Input
                 type="text"
                 placeholder="Type 'I understand' to confirm..."
                 value={confirmPhrase}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setConfirmPhrase(e.target.value)
                 }
-                className={cn(
-                  "w-full h-14 px-6 bg-black/40 border border-white/5 rounded-2xl text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui",
-                  isConfirmed && "border-success/40",
-                )}
+                className={cn(isConfirmed && "border-success/40")}
               />
             </div>
           </div>

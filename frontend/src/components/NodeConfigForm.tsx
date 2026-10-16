@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { z } from "zod";
 import { Input, Textarea, Button } from "@/components/ui";
@@ -164,13 +165,6 @@ export const NodeConfigForm = React.memo(
       [handleJsonChange],
     );
 
-    const inputBase =
-      "w-full px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui selection:bg-primary/30 placeholder:text-muted-foreground/50";
-    const selectBase =
-      "w-full h-12 px-5 py-3 text-xs font-bold bg-surface-4/40 border border-white/5 rounded-2xl text-foreground focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:outline-none transition-ui cursor-pointer hover:bg-surface-4/60 appearance-none selection:bg-primary/30";
-    const textareaBase =
-      "w-full px-5 py-4 text-xs font-mono bg-black/40 border border-white/5 rounded-2xl text-foreground/80 focus:border-primary/40 focus:outline-none transition-ui resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar";
-
     // Render specialized UI per node type (legacy support for hardcoded types).
     switch (type) {
       case "http-request":
@@ -181,9 +175,9 @@ export const NodeConfigForm = React.memo(
                 Method
               </label>
               <div className="relative">
-                <select
+                <Select
                   id="method-select"
-                  className={selectBase}
+                  className="text-xs"
                   value={(config.method as string) ?? "GET"}
                   onChange={handleMethodChange}
                 >
@@ -192,7 +186,7 @@ export const NodeConfigForm = React.memo(
                       {m}
                     </option>
                   ))}
-                </select>
+                </Select>
                 <ChevronDown className="absolute right-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
               </div>
             </div>
@@ -206,7 +200,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="https://api.example.com/v1/resource"
                 value={(config.url as string) ?? ""}
                 onChange={handleUrlChange}
-                className={inputBase}
+                className="text-xs"
               />
             </div>
 
@@ -219,7 +213,7 @@ export const NodeConfigForm = React.memo(
                 placeholder='{"Authorization": "Bearer ...", "Content-Type": "application/json"}'
                 value={JSON.stringify(config.headers ?? {}, null, 2)}
                 onChange={handleHeadersChange}
-                className={textareaBase}
+                className="text-xs font-mono resize-none custom-scrollbar"
               />
             </div>
 
@@ -232,7 +226,7 @@ export const NodeConfigForm = React.memo(
                 placeholder='{"key": "value"}'
                 value={JSON.stringify(config.body ?? {}, null, 2)}
                 onChange={handleBodyChange}
-                className={textareaBase}
+                className="text-xs font-mono resize-none custom-scrollbar"
               />
             </div>
           </div>
@@ -249,7 +243,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="Model name"
                 value={(config.model as string) ?? ""}
                 onChange={handleModelChange}
-                className={inputBase}
+                className="text-xs"
               />
             </div>
             <div className="space-y-3">
@@ -262,7 +256,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="Summarize the input into a structured report…"
                 value={(config.prompt as string) ?? ""}
                 onChange={handlePromptChange}
-                className={textareaBase}
+                className="text-xs font-mono resize-none custom-scrollbar"
               />
             </div>
           </div>
@@ -279,7 +273,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="$.results[*].identity.identifier"
                 value={(config.path as string) ?? ""}
                 onChange={handlePathChange}
-                className={inputBase}
+                className="text-xs"
               />
             </div>
             <div className="flex items-center gap-4 px-5 py-4 bg-primary/5 border border-primary/10 rounded-2xl">
@@ -315,8 +309,7 @@ export const NodeConfigForm = React.memo(
                     value={(config.input_path as string) ?? ""}
                     onChange={handleInputPathChange}
                     className={cn(
-                      inputBase,
-                      "relative",
+                      "text-xs relative",
                       rhaiError &&
                         "border-destructive/40 text-destructive placeholder:text-destructive/20",
                     )}
@@ -353,7 +346,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="element_instance"
                 value={(config.output_handle as string) ?? "item"}
                 onChange={handleOutputHandleChange}
-                className={inputBase}
+                className="text-xs"
               />
               <p className="text-xs text-muted-foreground/50 font-medium px-1">
                 The local scope identifier for individual collection members.
@@ -397,8 +390,7 @@ export const NodeConfigForm = React.memo(
                   setField("loopCondition", e.target.value)
                 }
                 className={cn(
-                  textareaBase,
-                  "min-h-[120px]",
+                  "text-xs font-mono resize-none custom-scrollbar min-h-[120px]",
                   rhaiError && "border-destructive/40",
                 )}
               />
@@ -420,7 +412,7 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setField("maxIterations", parseInt(e.target.value, 10) || 100)
                 }
-                className={inputBase}
+                className="text-xs"
               />
             </div>
           </div>
@@ -439,7 +431,7 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setField("repeatCount", parseInt(e.target.value, 10) || 1)
                 }
-                className={inputBase}
+                className="text-xs"
               />
             </div>
           </div>
@@ -452,9 +444,9 @@ export const NodeConfigForm = React.memo(
                 Combine
               </label>
               <div className="relative">
-                <select
+                <Select
                   id="join-mode"
-                  className={selectBase}
+                  className="text-xs"
                   value={(config.joinMode as string) ?? "All"}
                   onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
                     setField("joinMode", e.target.value)
@@ -464,7 +456,7 @@ export const NodeConfigForm = React.memo(
                   <option value="Any">First branch to succeed</option>
                   <option value="Majority">Majority of branches (50%+)</option>
                   <option value="N">Exact number of branches (N)</option>
-                </select>
+                </Select>
                 <ChevronDown className="absolute right-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/70 pointer-events-none" />
               </div>
             </div>
@@ -480,7 +472,7 @@ export const NodeConfigForm = React.memo(
                   onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                     setField("joinN", parseInt(e.target.value, 10) || 1)
                   }
-                  className={inputBase}
+                  className="text-xs"
                 />
               </div>
             )}
@@ -496,8 +488,7 @@ export const NodeConfigForm = React.memo(
                   setField("aggregationExpr", e.target.value)
                 }
                 className={cn(
-                  textareaBase,
-                  "min-h-[140px]",
+                  "text-xs font-mono resize-none custom-scrollbar min-h-[140px]",
                   rhaiError && "border-destructive/40",
                 )}
               />
@@ -518,7 +509,7 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setField("errorPattern", e.target.value)
                 }
-                className={inputBase}
+                className="text-xs"
               />
               <p className="text-2xs text-muted-foreground/50 px-1 leading-relaxed">
                 Matched against the error message to decide whether this
@@ -541,7 +532,7 @@ export const NodeConfigForm = React.memo(
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   setField("subWorkflowId", e.target.value)
                 }
-                className={inputBase}
+                className="text-xs"
               />
             </div>
           </div>
@@ -557,7 +548,7 @@ export const NodeConfigForm = React.memo(
                 placeholder="Awaiting Executive Override..."
                 value={(config.message as string) ?? ""}
                 onChange={(e) => setField("message", e.target.value)}
-                className={inputBase}
+                className="text-xs"
               />
             </div>
             <div className="flex items-center gap-4 px-6 py-5 bg-warning/5 border border-warning/20 rounded-2xl relative overflow-hidden group">
@@ -592,12 +583,11 @@ export const NodeConfigForm = React.memo(
                     : "bg-primary/5 group-hover/json:opacity-100",
                 )}
               />
-              <textarea
+              <Textarea
                 id="config-json"
                 rows={12}
                 className={cn(
-                  textareaBase,
-                  "relative border-white/10 group-hover/json:border-white/20 h-96 p-8",
+                  "text-xs font-mono resize-none custom-scrollbar relative group-hover/json:border-white/20 h-96",
                   jsonError && "border-destructive/40 text-destructive",
                 )}
                 value={jsonText}

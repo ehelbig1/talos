@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui/button";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -92,10 +93,10 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                     Select Execution Logic
                   </label>
                   <div className="relative group/select">
-                    <select
+                    <Select
                       value={selectedWorkflowId}
                       onChange={(e) => setSelectedWorkflowId(e.target.value)}
-                      className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui appearance-none relative z-10 font-medium"
+                      className="relative z-10"
                     >
                       <option value="" className="bg-surface-3">
                         Select a workflow…
@@ -109,7 +110,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                           {w.name.toUpperCase()}
                         </option>
                       ))}
-                    </select>
+                    </Select>
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 pointer-events-none z-20">
                       <ChevronRight className="w-4 h-4 text-muted-foreground/50 rotate-90" />
                     </div>

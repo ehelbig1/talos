@@ -1,4 +1,6 @@
 import { toast } from "sonner";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import React, { useState, useMemo, memo } from "react";
 import { type NodeTemplate, useTemplates } from "@/lib/useTemplates";
@@ -18,15 +20,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-import {
-  Dialog,
-  Button,
-  Badge,
-  Label,
-  DarkInput,
-  DarkSelect,
-  ErrorBanner,
-} from "@/components/ui";
+import { Dialog, Button, Badge, Label, ErrorBanner } from "@/components/ui";
 
 interface CreateModuleDialogProps {
   onModuleCreated: (
@@ -184,7 +178,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
           <div className="flex items-center gap-4">
             <div className="relative flex-1 group">
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/70 group-focus-within:text-primary transition-ui" />
-              <DarkInput
+              <Input
                 type="text"
                 placeholder="Search templates…"
                 value={searchQuery}
@@ -196,7 +190,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
             </div>
             <div className="relative group">
               <Filter className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/70 group-hover:text-white transition-ui z-10" />
-              <DarkSelect
+              <Select
                 value={selectedCategory}
                 onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
                   setSelectedCategory(e.target.value)
@@ -208,7 +202,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
                     {cat === "all" ? "All categories" : cat}
                   </option>
                 ))}
-              </DarkSelect>
+              </Select>
             </div>
           </div>
 
@@ -347,7 +341,7 @@ export const CreateModuleDialog = memo(function CreateModuleDialog({
               </Label>
             </div>
             <div className="relative group">
-              <DarkInput
+              <Input
                 id="module-name"
                 value={moduleName}
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
