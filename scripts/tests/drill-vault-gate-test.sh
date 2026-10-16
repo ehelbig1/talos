@@ -15,7 +15,8 @@ REPO="$(cd "$HERE/../.." && pwd)"
 fails=0
 check() { # check <label> <expected yes|no> <haystack> <needle>
     local got=no
-    if printf '%s' "$3" | grep -qF -- "$4"; then got=yes; fi
+    # In the shell, not `printf | grep -q`: under pipefail that can report a match as none.
+    if [[ "$3" == *"$4"* ]]; then got=yes; fi
     if [ "$got" = "$2" ]; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s\n       expected %s for: %s\n' "$1" "$2" "$4"; fails=$((fails+1)); fi
 }
 
