@@ -68,7 +68,6 @@ export function RoleChangeDialog({
             Cancel
           </Button>
           <Button
-            variant="premium"
             className="flex-1 h-14 rounded-xl"
             disabled={isPending}
             onClick={onConfirm}

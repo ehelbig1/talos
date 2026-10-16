@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useQuery, useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Play, Loader2, ChevronRight } from "lucide-react";
@@ -68,12 +69,9 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                   </p>
                 </div>
               </div>
-              <button
-                onClick={onClose}
-                className="w-full py-4 text-sm font-semibold text-white bg-white/5 border border-white/5 rounded-2xl hover:bg-white/10 hover:border-white/20 transition-ui bg-white/[0.03] border border-white/5"
-              >
-                Abort Viewport
-              </button>
+              <Button variant="outline" className="w-full" onClick={onClose}>
+                Close
+              </Button>
             </div>
           ) : (
             <div className="space-y-8">
@@ -119,17 +117,18 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                 </div>
               )}
 
-              <button
+              <Button
+                size="lg"
+                className="w-full"
                 onClick={() =>
                   selectedWorkflowId && triggerMut.mutate(selectedWorkflowId)
                 }
                 disabled={!selectedWorkflowId || triggerMut.isPending}
-                className="w-full flex items-center justify-center gap-4 bg-primary hover:bg-primary/90 disabled:opacity-20 disabled:cursor-not-allowed text-white text-sm font-semibold py-5 rounded-2xl transition-ui border border-white/20"
               >
                 {triggerMut.isPending ? (
                   <>
                     <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
-                    Initializing Trigger...
+                    Starting…
                   </>
                 ) : (
                   <>
@@ -137,7 +136,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                     Run workflow
                   </>
                 )}
-              </button>
+              </Button>
             </div>
           )}
         </div>

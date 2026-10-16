@@ -135,6 +135,15 @@ export default [
             "no-restricted-syntax": [
                 "error",
                 {
+                    // An icon-only button (no text anywhere below it) has no
+                    // accessible name unless it says aria-label; a title is a
+                    // tooltip, not a name. Spread props may carry one.
+                    selector:
+                        'JSXElement[openingElement.name.name="button"]:not(:has(JSXText[value=/\\S/])):not(:has(JSXElement > JSXExpressionContainer, JSXFragment > JSXExpressionContainer)):not(:has(JSXAttribute[name.name=/^aria-label(ledby)?$/])):not(:has(JSXSpreadAttribute))',
+                    message:
+                        "An icon-only button names itself: add aria-label (keep title for the tooltip if you want one).",
+                },
+                {
                     selector:
                         'JSXOpeningElement[name.name="label"] > JSXAttribute[name.name="className"] > Literal[value=/\\buppercase\\b/]',
                     message:

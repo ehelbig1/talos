@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import {
   useGetResourceQuotasQuery,
   useUpdateResourceQuotasMutation,
@@ -185,31 +186,24 @@ export function ResourceQuotas() {
         <div className="flex items-center gap-4">
           {isEditing ? (
             <>
-              <button
+              <Button
+                variant="outline"
                 onClick={() => setIsEditing(false)}
-                className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-muted-foreground transition-ui"
                 disabled={isUpdating}
               >
                 <X className="w-4 h-4" />
                 Cancel
-              </button>
-              <button
-                onClick={handleSave}
-                disabled={isUpdating}
-                className="flex items-center gap-3 px-8 py-3 bg-primary hover:bg-primary/90 text-black rounded-2xl text-sm font-semibold transition-ui disabled:opacity-50"
-              >
+              </Button>
+              <Button onClick={handleSave} disabled={isUpdating}>
                 <Save className="w-4 h-4" />
                 {isUpdating ? "Saving…" : "Save limits"}
-              </button>
+              </Button>
             </>
           ) : (
-            <button
-              onClick={() => setIsEditing(true)}
-              className="flex items-center gap-3 px-6 py-3 bg-white/5 hover:bg-white/10 border border-white/10 rounded-2xl text-sm font-semibold text-white transition-ui group/edit"
-            >
+            <Button variant="outline" onClick={() => setIsEditing(true)}>
               <Edit2 className="w-4 h-4 text-primary transition-ui" />
               Edit limits
-            </button>
+            </Button>
           )}
         </div>
       </div>

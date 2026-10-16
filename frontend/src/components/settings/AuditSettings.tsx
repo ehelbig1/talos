@@ -228,7 +228,6 @@ export default function AuditSettings() {
             <Button
               onClick={handleSave}
               disabled={saving}
-              variant="premium"
               className="h-16 px-12 rounded-2xl"
             >
               {saving ? (

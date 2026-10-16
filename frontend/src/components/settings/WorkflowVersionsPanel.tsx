@@ -531,7 +531,7 @@ export default function WorkflowVersionsPanel({
                 onClick={() => setRollbackTargetId(null)}
                 className="flex-1 text-sm font-semibold h-12 rounded-2xl"
               >
-                Abort
+                Cancel
               </Button>
               <Button
                 onClick={handleRollback}

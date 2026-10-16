@@ -414,7 +414,7 @@ export default function WorkflowExecutionHistoryDialog({
                 onClick={() => setConfirmAction(null)}
                 className="flex-1 text-sm font-semibold h-12 rounded-2xl"
               >
-                Abort
+                Cancel
               </Button>
               <Button
                 onClick={handleConfirm}

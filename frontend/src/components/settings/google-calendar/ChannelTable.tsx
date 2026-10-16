@@ -9,6 +9,7 @@
 import React from "react";
 import { Activity, RefreshCw, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import {
   RecentFailureBadge,
@@ -39,8 +40,22 @@ export function ChannelTable({
   onRenew: (channelUuid: string) => void;
   onStop: (channelUuid: string) => void;
 }): React.ReactElement {
+  const [channelToStop, setChannelToStop] =
+    React.useState<WatchChannelSummary | null>(null);
   return (
     <div className="border border-border/40 rounded-2xl overflow-hidden">
+      <ConfirmDialog
+        open={channelToStop !== null}
+        title="Stop this watch channel?"
+        message={`Google stops telling Talos about changes to ${channelToStop?.calendar_id ?? "this calendar"}. A module or workflow bound to this channel is not started by calendar changes again until you create the channel again.`}
+        confirmLabel="Stop channel"
+        destructive
+        onConfirm={() => {
+          if (channelToStop) onStop(channelToStop.channel_uuid);
+          setChannelToStop(null);
+        }}
+        onCancel={() => setChannelToStop(null)}
+      />
       <table className="w-full text-sm">
         <thead className="bg-muted/30 text-xs text-muted-foreground">
           <tr>
@@ -152,15 +167,7 @@ export function ChannelTable({
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => {
-                        if (
-                          window.confirm(
-                            `Stop watch channel for ${ch.calendar_id}? A module or workflow bound to this channel will stop being started by calendar changes until you recreate it.`,
-                          )
-                        ) {
-                          onStop(ch.channel_uuid);
-                        }
-                      }}
+                      onClick={() => setChannelToStop(ch)}
                       disabled={currentAction !== null}
                       title="Tears down the channel on Google's side and removes the row."
                       className="h-8 px-2.5 text-xs text-destructive hover:text-destructive"

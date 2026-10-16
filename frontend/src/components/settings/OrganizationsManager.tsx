@@ -20,6 +20,7 @@ import {
 } from "@/generated/graphql";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { Building2, Plus } from "lucide-react";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -41,6 +42,7 @@ export default function OrganizationsManager() {
   const { user } = useAuth();
 
   const [showCreate, setShowCreate] = useState(false);
+  const [memberToRemove, setMemberToRemove] = useState<string | null>(null);
   const [selectedOrgId, setSelectedOrgId] = useState<string | null>(null);
   const [newOrgName, setNewOrgName] = useState("");
   const [newOrgSlug, setNewOrgSlug] = useState("");
@@ -194,7 +196,6 @@ export default function OrganizationsManager() {
         </div>
         <Button
           onClick={() => setShowCreate(true)}
-          variant="premium"
           className="h-14 px-8 rounded-2xl flex items-center gap-3 w-full md:w-auto"
         >
           <Plus className="w-5 h-5" />
@@ -220,18 +221,31 @@ export default function OrganizationsManager() {
               onShowTransfer={() => setShowTransfer(true)}
               onShowInvite={() => setShowInvite(true)}
               onRoleChange={setRoleChangeTarget}
-              onRemoveMember={(userId) =>
-                removeMemberMutation.mutate({
-                  orgId: selectedOrgId!,
-                  userId,
-                })
-              }
+              onRemoveMember={setMemberToRemove}
             />
           ) : (
             <NoOrgSelected />
           )}
         </div>
       </div>
+
+      <ConfirmDialog
+        open={memberToRemove !== null}
+        title="Remove this member?"
+        message="They lose access to the organization's workflows, modules and secrets. Their own personal workspace is not affected."
+        confirmLabel="Remove member"
+        destructive
+        isLoading={removeMemberMutation.isPending}
+        onConfirm={() => {
+          if (memberToRemove && selectedOrgId) {
+            removeMemberMutation.mutate(
+              { orgId: selectedOrgId, userId: memberToRemove },
+              { onSettled: () => setMemberToRemove(null) },
+            );
+          }
+        }}
+        onCancel={() => setMemberToRemove(null)}
+      />
 
       <CreateOrgDialog
         open={showCreate}

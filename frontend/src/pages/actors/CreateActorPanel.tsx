@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useQuery } from "@tanstack/react-query";
 import { X, ChevronRight, Info, Zap, Shield, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -291,6 +292,7 @@ export function CreateActorPanel({
           </div>
           <button
             onClick={handleClose}
+            aria-label="Close"
             className="w-12 h-12 flex items-center justify-center rounded-2xl text-muted-foreground/70 hover:text-white hover:bg-white/10 border border-transparent hover:border-white/10 transition-ui"
           >
             <X className="w-6 h-6" />
@@ -591,30 +593,20 @@ export function CreateActorPanel({
 
         {/* Footer nav */}
         <div className="px-10 py-10 border-t border-white/5 flex items-center justify-between shrink-0 bg-white/2">
-          <button
-            type="button"
+          <Button
+            variant="outline"
+            size="lg"
             onClick={step === 0 ? handleClose : () => setStep(0)}
-            className="px-10 py-5 text-sm font-semibold text-muted-foreground/70 bg-white/5 border border-white/5 rounded-2xl hover:text-white hover:bg-white/10 hover:border-white/20 transition-ui"
           >
-            {step === 0 ? "Abort" : "Previous Step"}
-          </button>
+            {step === 0 ? "Cancel" : "Back"}
+          </Button>
 
           {step === 0 ? (
-            <button
-              type="button"
-              onClick={() => setStep(1)}
-              disabled={!canAdvance}
-              className="flex items-center gap-4 px-10 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-ui disabled:opacity-20 disabled:cursor-not-allowed border border-white/20"
-            >
+            <Button size="lg" onClick={() => setStep(1)} disabled={!canAdvance}>
               Next <ChevronRight className="w-5 h-5" />
-            </button>
+            </Button>
           ) : (
-            <button
-              type="button"
-              onClick={handleCreate}
-              disabled={isPending}
-              className="flex items-center gap-4 px-12 py-5 text-sm font-semibold text-white bg-primary rounded-2xl transition-ui disabled:opacity-50 disabled:cursor-not-allowed border border-white/20"
-            >
+            <Button size="lg" onClick={handleCreate} disabled={isPending}>
               {isPending ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
@@ -623,7 +615,7 @@ export function CreateActorPanel({
               ) : (
                 "Create actor"
               )}
-            </button>
+            </Button>
           )}
         </div>
       </div>

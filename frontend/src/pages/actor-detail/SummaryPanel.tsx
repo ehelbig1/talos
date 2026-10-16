@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -207,25 +208,24 @@ export function SummaryPanel({
                   </div>
 
                   <div className="flex gap-3 pt-2">
-                    <button
+                    <Button
                       onClick={() => doUpdate()}
                       disabled={updatePending || !editName.trim()}
-                      className="flex items-center gap-2 text-sm font-semibold bg-primary text-primary-foreground px-6 py-3 rounded-xl transition-ui disabled:opacity-50"
                     >
                       <Save className="w-4 h-4" />
                       {updatePending ? "Saving…" : "Save"}
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      variant="outline"
                       onClick={() => {
                         setEditing(false);
                         setEditName(actor.name);
                         setEditDesc(actor.description ?? "");
                         setEditWorld(actor.maxCapabilityWorld);
                       }}
-                      className="text-sm font-semibold text-muted-foreground bg-white/5 px-6 py-3 rounded-xl hover:bg-white/10 hover:text-foreground transition-ui"
                     >
                       Cancel
-                    </button>
+                    </Button>
                   </div>
                 </div>
               ) : (
@@ -285,6 +285,7 @@ export function SummaryPanel({
                         onClick={() => setEditing(true)}
                         className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-primary hover:bg-surface-4 hover:border-primary/20 transition-ui group/btn"
                         title="Edit actor"
+                        aria-label="Edit actor"
                       >
                         <Pencil className="w-4 h-4 transition-transform" />
                       </button>
@@ -293,6 +294,7 @@ export function SummaryPanel({
                         disabled={clonePending}
                         className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-sky-400 hover:bg-surface-4 hover:border-sky-400/20 transition-ui group/btn disabled:opacity-30"
                         title="Duplicate actor"
+                        aria-label="Duplicate actor"
                       >
                         <Copy className="w-4 h-4 transition-transform" />
                       </button>
@@ -301,6 +303,7 @@ export function SummaryPanel({
                         onClick={() => setShowTerminateConfirm(true)}
                         className="p-3 rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/60 hover:text-destructive hover:bg-destructive/10 transition-ui group/btn"
                         title="Delete actor"
+                        aria-label="Delete actor"
                       >
                         <Square className="w-4 h-4 transition-transform" />
                       </button>

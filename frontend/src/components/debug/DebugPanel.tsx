@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
+import { Button } from "@/components/ui/button";
 import {
   Tabs,
   TabsList,
@@ -284,14 +285,15 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
             <TooltipProvider>
               <Tooltip>
                 <TooltipTrigger asChild>
-                  <button
-                    type="button"
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="w-full"
                     disabled
-                    className="w-full flex items-center justify-center gap-2 py-2.5 rounded-xl border border-cyan-500/20 bg-cyan-500/5 text-cyan-400/50 text-xs font-bold cursor-not-allowed transition-ui"
                   >
                     <Play className="w-3.5 h-3.5" />
                     Replay from here
-                  </button>
+                  </Button>
                 </TooltipTrigger>
                 <TooltipContent side="top">
                   <p>Coming soon</p>

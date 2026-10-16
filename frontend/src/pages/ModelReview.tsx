@@ -393,12 +393,14 @@ export default function ModelReview() {
                   <p className="text-xs text-muted-foreground/70 font-bold mt-2">
                     The pending count in the model list is still accurate.
                   </p>
-                  <button
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-6"
                     onClick={() => refetchFeed()}
-                    className="mt-6 px-5 py-2 text-xs font-semibold text-foreground/80 bg-white/[0.04] border border-white/10 rounded-full hover:bg-white/[0.08] transition-ui"
                   >
                     Retry
-                  </button>
+                  </Button>
                 </div>
               ) : pending.length === 0 ? (
                 <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl group">

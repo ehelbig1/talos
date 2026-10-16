@@ -292,20 +292,12 @@ export function SlackAppCreator({
             )}
 
             <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={handleCreate}
-                className="flex-1 px-4 py-2 bg-green-600 text-white rounded font-bold"
-              >
+              <Button className="flex-1" onClick={handleCreate}>
                 Create App
-              </button>
-              <button
-                type="button"
-                onClick={() => setStep("info")}
-                className="px-4 py-2 bg-surface-3/60 text-muted-foreground border-2 border-white/10 rounded"
-              >
+              </Button>
+              <Button variant="outline" onClick={() => setStep("info")}>
                 Back
-              </button>
+              </Button>
             </div>
           </>
         )}
@@ -374,13 +366,9 @@ export function SlackAppCreator({
               </div>
             </Section>
 
-            <button
-              type="button"
-              onClick={onCancel}
-              className="w-full py-2 bg-green-600 text-white rounded font-bold"
-            >
+            <Button className="w-full" onClick={onCancel}>
               Done
-            </button>
+            </Button>
           </>
         )}
 
@@ -411,41 +399,18 @@ export function SlackAppCreator({
             </Section>
 
             <div style={{ display: "flex", gap: "0.75rem" }}>
-              <button
-                type="button"
+              <Button
+                className="flex-1"
                 onClick={() => {
                   setStep("token");
                   setError(null);
                 }}
-                style={{
-                  flex: 1,
-                  padding: "0.875rem",
-                  background: "#007a5a",
-                  color: "white",
-                  border: "none",
-                  borderRadius: "6px",
-                  cursor: "pointer",
-                  fontSize: "0.9375rem",
-                  fontWeight: "bold",
-                }}
               >
-                Try Again
-              </button>
-              <button
-                type="button"
-                onClick={onCancel}
-                style={{
-                  padding: "0.875rem 1.5rem",
-                  background: "white",
-                  color: "#616061",
-                  border: "2px solid #e1e1e1",
-                  borderRadius: "6px",
-                  cursor: "pointer",
-                  fontSize: "0.9375rem",
-                }}
-              >
+                Try again
+              </Button>
+              <Button variant="outline" onClick={onCancel}>
                 Cancel
-              </button>
+              </Button>
             </div>
           </>
         )}

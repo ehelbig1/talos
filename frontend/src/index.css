@@ -109,6 +109,24 @@
     font-family: var(--font-heading);
     letter-spacing: -0.02em;
   }
+
+  /* Keyboard focus is visible on every control, including the ones that are
+     not built on a primitive. A primitive that draws its own ring says
+     focus-visible:outline-none, which wins over this base rule. */
+  :where(
+    a[href],
+    button,
+    input,
+    select,
+    textarea,
+    summary,
+    [role="button"],
+    [role="tab"],
+    [tabindex]:not([tabindex="-1"])
+  ):focus-visible {
+    outline: 2px solid hsl(var(--ring) / 0.6);
+    outline-offset: 2px;
+  }
 }
 
 /* Performance Optimizations */

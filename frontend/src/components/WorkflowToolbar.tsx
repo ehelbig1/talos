@@ -58,7 +58,7 @@ function ToolbarButton({
   label: string;
   icon: React.ComponentType<{ className?: string }>;
   iconClassName?: string;
-  variant?: "outline" | "premium";
+  variant?: "outline" | "default";
 } & Pick<React.ComponentProps<typeof Button>, "onClick" | "disabled">) {
   return (
     <Button
@@ -329,7 +329,6 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               Cancel
             </Button>
             <Button
-              variant="premium"
               onClick={handleNameDialogConfirm}
               disabled={modal.kind === "name" && !modal.pendingName.trim()}
               className="h-12 px-10"
@@ -383,7 +382,6 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
               Cancel
             </Button>
             <Button
-              variant="premium"
               onClick={() => {
                 if (workflowId && modal.kind === "publish")
                   publishVersionMutation.mutate({
@@ -426,7 +424,7 @@ export const WorkflowToolbar = memo(function WorkflowToolbar() {
         label={isSaving ? "Saving…" : "Save"}
         icon={isSaving ? Loader2 : Save}
         iconClassName={isSaving ? "animate-spin" : undefined}
-        variant={isDirty && nodeCount > 0 && !isSaving ? "premium" : "outline"}
+        variant={isDirty && nodeCount > 0 && !isSaving ? "default" : "outline"}
         onClick={handleSaveWithName}
         disabled={isSaving || nodeCount === 0}
       />

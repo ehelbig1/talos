@@ -270,7 +270,6 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
                 onClose();
                 navigate("/library#installed");
               }}
-              variant="premium"
               className="w-full py-7"
             >
               Open library
@@ -360,7 +359,6 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
             Cancel
           </Button>
           <Button
-            variant="premium"
             onClick={() =>
               mutation.mutate({
                 input: { templateId: template.id, name: name.trim(), config },

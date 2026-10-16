@@ -1,4 +1,5 @@
 import * as React from "react";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import {
@@ -139,20 +140,14 @@ export function ErrorMessage({
           {/* Actions */}
           <div className="flex gap-2 pt-2">
             {onRetry && (
-              <button
-                onClick={onRetry}
-                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-primary-foreground bg-primary rounded hover:bg-primary/90 transition-ui"
-              >
+              <Button size="sm" onClick={onRetry}>
                 Retry
-              </button>
+              </Button>
             )}
             {onDismiss && (
-              <button
-                onClick={onDismiss}
-                className="inline-flex items-center px-3 py-1.5 text-sm font-medium text-foreground border border-input rounded hover:bg-accent transition-ui"
-              >
+              <Button variant="outline" size="sm" onClick={onDismiss}>
                 Dismiss
-              </button>
+              </Button>
             )}
             <a
               href="https://github.com/anthropics/talos/issues"

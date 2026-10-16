@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useNavigate } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -103,7 +104,9 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                 </td>
                 <td className="px-5 py-3 text-right">
                   <div className="flex items-center justify-end gap-2">
-                    <button
+                    <Button
+                      variant="outline"
+                      size="sm"
                       onClick={() => handleTrigger(wf.id.toString())}
                       disabled={
                         triggeringId === wf.id.toString() ||
@@ -114,7 +117,6 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                           ? "Publish workflow to enable triggering"
                           : "Run as this actor"
                       }
-                      className="flex items-center gap-1 text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-30 disabled:cursor-not-allowed transition-ui px-2 py-1 rounded-md border border-emerald-500/20 hover:bg-emerald-500/10"
                     >
                       {triggeringId === wf.id.toString() ? (
                         <RefreshCw className="w-3 h-3 animate-spin" />
@@ -122,13 +124,14 @@ export function WorkflowsPanel({ actorId }: { actorId: string }) {
                         <Play className="w-3 h-3 fill-current" />
                       )}
                       Run
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
                       onClick={() => navigate(`/editor/${wf.id}`)}
-                      className="text-xs text-violet-400 hover:text-violet-300 transition-ui px-2 py-1 rounded-md border border-violet-500/20 hover:bg-violet-500/10"
                     >
                       Open
-                    </button>
+                    </Button>
                   </div>
                 </td>
               </tr>

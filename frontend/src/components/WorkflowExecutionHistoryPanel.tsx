@@ -301,7 +301,8 @@ function ExecutionRow({
                     toast.success("Output copied to clipboard");
                   }}
                   className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white transition-ui"
-                  title="Copy Output"
+                  title="Copy output"
+                  aria-label="Copy output"
                 >
                   <Copy className="w-4 h-4" />
                 </button>

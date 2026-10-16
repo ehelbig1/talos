@@ -87,7 +87,6 @@ export function InviteMemberDialog({
             Cancel
           </Button>
           <Button
-            variant="premium"
             className="flex-1 h-14 rounded-xl"
             disabled={!userId.trim() || isPending}
             onClick={onSubmit}

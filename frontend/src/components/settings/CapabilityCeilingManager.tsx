@@ -1,4 +1,6 @@
-import React, { useCallback } from "react";
+import React, { useCallback, useState } from "react";
+import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import {
   useGetCapabilityCeilingDetailQuery,
   useGetCapabilityWorldHierarchyQuery,
@@ -105,6 +107,7 @@ export default function CapabilityCeilingManager() {
     },
   });
 
+  const [confirmRevoke, setConfirmRevoke] = useState(false);
   const handleRevoke = () => {
     if (!ceiling) return;
     const userId = currentUserQuery.data?.me?.id;
@@ -135,13 +138,10 @@ export default function CapabilityCeilingManager() {
     return (
       <div className="bg-destructive/5 border border-destructive/20 rounded-2xl p-10 text-center">
         <p className="text-sm text-destructive font-semibold mb-6">{error}</p>
-        <button
-          onClick={loadData}
-          className="inline-flex items-center gap-3 px-6 py-3 bg-white/5 border border-white/10 rounded-2xl text-sm font-semibold text-white hover:bg-white/10 transition-ui"
-        >
+        <Button variant="outline" onClick={loadData}>
           <RefreshCw className="w-4 h-4" />
           Retry
-        </button>
+        </Button>
       </div>
     );
   }
@@ -174,13 +174,10 @@ export default function CapabilityCeilingManager() {
           </div>
         </div>
 
-        <button
-          onClick={loadData}
-          className="flex items-center gap-2 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-xl text-2xs font-semibold text-muted-foreground hover:text-white transition-ui"
-        >
+        <Button variant="outline" size="sm" onClick={loadData}>
           <RefreshCw className="w-3.5 h-3.5" />
-          Synchronize
-        </button>
+          Refresh
+        </Button>
       </div>
 
       {/* Current ceiling card */}
@@ -257,11 +254,25 @@ export default function CapabilityCeilingManager() {
                 </span>
               )}
               <button
-                onClick={handleRevoke}
-                className="ml-auto text-destructive/40 hover:text-destructive transition-ui font-semibold tracking-wider"
+                type="button"
+                onClick={() => setConfirmRevoke(true)}
+                className="ml-auto text-destructive/70 hover:text-destructive transition-ui font-medium"
               >
                 Revoke grant
               </button>
+              <ConfirmDialog
+                open={confirmRevoke}
+                title="Revoke this grant?"
+                message="Your capability ceiling goes back to the default. A workflow that needs the granted world stops running until a new grant is made."
+                confirmLabel="Revoke grant"
+                destructive
+                isLoading={revokeMutation.isPending}
+                onConfirm={() => {
+                  setConfirmRevoke(false);
+                  handleRevoke();
+                }}
+                onCancel={() => setConfirmRevoke(false)}
+              />
             </div>
           )}
         </div>

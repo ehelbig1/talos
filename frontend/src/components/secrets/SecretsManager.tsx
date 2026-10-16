@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { gql } from "@/lib/graphqlClient";
 import type { Secret } from "@/generated/graphql";
@@ -186,6 +187,7 @@ function SecretsManager() {
                   setSecretToEdit(null);
                   setEditValue("");
                 }}
+                aria-label="Cancel"
                 className="p-2.5 hover:bg-white/5 rounded-xl transition-ui text-muted-foreground/70 hover:text-white"
               >
                 <X className="w-5 h-5" />
@@ -210,8 +212,8 @@ function SecretsManager() {
               </div>
 
               <div className="flex gap-4">
-                <button
-                  className="flex-1 bg-primary text-black font-semibold py-4 rounded-2xl text-sm transition-ui disabled:opacity-50 disabled:grayscale"
+                <Button
+                  className="flex-1"
                   disabled={!editValue.trim() || updateSecretMutation.isPending}
                   onClick={() =>
                     updateSecretMutation.mutate({
@@ -223,16 +225,16 @@ function SecretsManager() {
                   }
                 >
                   {updateSecretMutation.isPending ? "Saving…" : "Save"}
-                </button>
-                <button
-                  className="px-8 py-4 rounded-2xl text-sm font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 transition-ui"
+                </Button>
+                <Button
+                  variant="ghost"
                   onClick={() => {
                     setSecretToEdit(null);
                     setEditValue("");
                   }}
                 >
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           </div>
@@ -255,13 +257,10 @@ function SecretsManager() {
           </div>
         </div>
 
-        <button
-          onClick={() => setShowCreate(true)}
-          className="relative z-10 bg-primary text-white font-semibold px-5 h-11 rounded-xl flex items-center gap-2 transition-ui hover:bg-primary/90 whitespace-nowrap"
-        >
+        <Button onClick={() => setShowCreate(true)}>
           <Plus className="w-4 h-4" />
-          <span className="text-sm">New secret</span>
-        </button>
+          New secret
+        </Button>
       </div>
 
       <div className="bg-surface-3/30 border border-white/5 rounded-2xl overflow-hidden min-h-[500px] relative group/registry">
@@ -294,12 +293,9 @@ function SecretsManager() {
                 seeing them in plain text.
               </p>
             </div>
-            <button
-              onClick={() => setShowCreate(true)}
-              className="px-8 py-4 border border-primary/20 text-primary text-sm font-semibold rounded-2xl hover:bg-primary/10 transition-ui"
-            >
+            <Button variant="outline" onClick={() => setShowCreate(true)}>
               Add secret
-            </button>
+            </Button>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -351,7 +347,8 @@ function SecretsManager() {
                           <button
                             onClick={() => setRevealedSecretId(null)}
                             className="p-2.5 text-muted-foreground/70 hover:text-white transition-ui rounded-xl hover:bg-white/5"
-                            title="Obscure Payload"
+                            title="Hide value"
+                            aria-label="Hide value"
                           >
                             <EyeOff size={16} />
                           </button>
@@ -368,6 +365,7 @@ function SecretsManager() {
                             </button>
                             <button
                               onClick={() => setConfirmReveal(null)}
+                              aria-label="Cancel"
                               className="p-1 text-muted-foreground/70 hover:text-white transition-ui"
                             >
                               <X size={14} />
@@ -377,7 +375,8 @@ function SecretsManager() {
                           <button
                             onClick={() => setConfirmReveal(secret.id)}
                             className="p-2.5 text-primary/60 hover:text-primary transition-ui rounded-xl hover:bg-primary/10"
-                            title="Reveal Payload"
+                            title="Show value"
+                            aria-label="Show value"
                           >
                             <Eye size={16} />
                           </button>
@@ -410,6 +409,7 @@ function SecretsManager() {
                           }}
                           className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/5 border border-white/5 transition-ui rounded-xl"
                           title="Audit log"
+                          aria-label="Audit log"
                         >
                           <History size={18} />
                         </button>
@@ -419,14 +419,16 @@ function SecretsManager() {
                             setEditValue("");
                           }}
                           className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-primary hover:bg-primary/10 border border-white/5 transition-ui rounded-xl"
-                          title="Reconfigure Payload"
+                          title="Edit secret"
+                          aria-label="Edit secret"
                         >
                           <Pencil size={18} />
                         </button>
                         <button
                           onClick={() => handleDelete(secret)}
                           className="w-11 h-11 flex items-center justify-center text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 border border-white/5 transition-ui rounded-xl"
-                          title="Purge Entity"
+                          title="Delete secret"
+                          aria-label="Delete secret"
                         >
                           <Trash2 size={18} />
                         </button>
@@ -476,8 +478,9 @@ function SecretsManager() {
             </p>
           </div>
 
-          <button
-            className="bg-amber-500 text-black font-semibold text-sm px-12 h-20 rounded-2xl transition-ui flex items-center gap-4 shadow-amber-500/20 group/rotate relative overflow-hidden shrink-0"
+          <Button
+            variant="outline"
+            size="lg"
             onClick={() => {
               setConfirmRotateKey(true);
             }}
@@ -491,7 +494,7 @@ function SecretsManager() {
             <span className="relative z-10">
               {rotateKeyMutation.isPending ? "Rotating…" : "Rotate master key"}
             </span>
-          </button>
+          </Button>
         </div>
       </div>
 

@@ -103,7 +103,6 @@ export function CreateOrgDialog({
             Cancel
           </Button>
           <Button
-            variant="premium"
             className="flex-1 h-14 rounded-xl"
             disabled={!name || !slug || isPending}
             onClick={onSubmit}

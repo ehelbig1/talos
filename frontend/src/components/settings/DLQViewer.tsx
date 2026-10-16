@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Button } from "@/components/ui/button";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -251,6 +252,7 @@ export function DLQViewer() {
               onClick={() =>
                 activeTab === "nodes" ? refetchNodes() : refetchWebhooks()
               }
+              aria-label="Refresh"
               className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-ui"
             >
               <RotateCcw
@@ -376,10 +378,10 @@ export function DLQViewer() {
                     Open workflow
                   </button>
 
-                  <button
+                  <Button
+                    variant="destructive"
                     onClick={() => handleNodeReplay(entry.id)}
                     disabled={isReplayingNode}
-                    className="h-12 px-8 bg-destructive text-white rounded-2xl text-sm font-semibold transition-ui disabled:opacity-50 flex items-center gap-3"
                   >
                     {isReplayingNode ? (
                       <Loader2 size={14} className="animate-spin" />
@@ -387,7 +389,7 @@ export function DLQViewer() {
                       <RotateCcw size={14} />
                     )}
                     Replay job
-                  </button>
+                  </Button>
                 </div>
               </div>
             ))
@@ -459,10 +461,9 @@ export function DLQViewer() {
                   </div>
                 </div>
 
-                <button
+                <Button
                   onClick={() => replayWebhook({ id: entry.id })}
                   disabled={isReplayingWebhook}
-                  className="h-12 px-8 bg-amber-500 text-black rounded-2xl text-sm font-semibold transition-ui disabled:opacity-50 flex items-center gap-3"
                 >
                   {isReplayingWebhook ? (
                     <Loader2 size={14} className="animate-spin" />
@@ -470,7 +471,7 @@ export function DLQViewer() {
                     <RotateCcw size={14} />
                   )}
                   Replay delivery
-                </button>
+                </Button>
               </div>
             </div>
           ))

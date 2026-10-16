@@ -234,6 +234,7 @@ export function EndpointSelector({
           <button
             type="button"
             onClick={() => setSelectedEndpoint(null)}
+            aria-label="Clear selection"
             className="p-2 rounded-xl hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
           >
             <X className="h-5 w-5" />
@@ -449,7 +450,7 @@ export function EndpointSelector({
           variant="ghost"
           className="h-14 px-10 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-ui"
         >
-          Abort
+          Cancel
         </Button>
       </div>
 

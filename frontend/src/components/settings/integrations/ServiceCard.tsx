@@ -96,6 +96,7 @@ export function ServiceCard({
             onClick={onConnect}
             className="p-2.5 bg-white/5 border border-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary transition-ui rounded-xl"
             title="Connect account"
+            aria-label="Connect account"
           >
             <Plus size={18} />
           </button>
@@ -153,6 +154,7 @@ export function ServiceCard({
                 onClick={() =>
                   onDisconnect(serviceType, i.id, i.accountIdentifier)
                 }
+                aria-label="Disconnect account"
                 className="opacity-0 group-hover/item:opacity-100 p-2 text-muted-foreground/70 hover:text-destructive hover:bg-destructive/10 rounded-xl transition-ui"
               >
                 <XCircle size={16} />

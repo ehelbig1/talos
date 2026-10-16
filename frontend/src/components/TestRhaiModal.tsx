@@ -119,7 +119,6 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
             <Button
               onClick={handleTest}
               disabled={loading || !script}
-              variant="premium"
               className="w-full h-16 rounded-2xl"
             >
               {loading ? (

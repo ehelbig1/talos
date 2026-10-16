@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Button } from "@/components/ui/button";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
@@ -23,7 +24,7 @@ import {
   deleteActorMemory,
   type ActorMemoryEntry,
 } from "@/lib/graphqlApi";
-import { SkeletonBlock } from "@/components/ui";
+import { ConfirmDialog, SkeletonBlock } from "@/components/ui";
 
 // ── Memory type metadata ──────────────────────────────────────────────────────
 
@@ -350,22 +351,19 @@ function MemoryForm({
       </div>
 
       <div className="flex justify-end gap-2">
-        <button
-          onClick={onCancel}
-          className="text-xs text-muted-foreground hover:text-white px-3 py-1.5 rounded-lg border border-white/10 hover:border-white/20 transition-ui"
-        >
+        <Button variant="outline" size="sm" onClick={onCancel}>
           Cancel
-        </button>
-        <button
+        </Button>
+        <Button
+          size="sm"
           onClick={() => mutate()}
           disabled={
             isPending || !key.trim() || !value.trim() || jsonError !== null
           }
-          className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 disabled:opacity-50 text-white px-4 py-1.5 rounded-lg transition-ui"
         >
           <Save className="w-3.5 h-3.5" />
           {isPending ? "Saving…" : "Save"}
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -380,6 +378,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
   const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<ActorMemoryEntry | null>(null);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [keyToDelete, setKeyToDelete] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
   const importRef = React.useRef<HTMLInputElement>(null);
 
@@ -545,6 +544,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
           {memSearch && (
             <button
               onClick={() => setMemSearch("")}
+              aria-label="Clear search"
               className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground/70 hover:text-white transition-ui"
             >
               <X className="w-3.5 h-3.5" />
@@ -589,24 +589,26 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
         </div>
         <div className="flex items-center gap-2">
           {memories.length > 0 && (
-            <button
+            <Button
+              variant="outline"
+              size="sm"
               onClick={handleExport}
               title="Export memories as JSON"
-              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-ui"
             >
               <Download className="w-3.5 h-3.5" />
               Export
-            </button>
+            </Button>
           )}
-          <button
+          <Button
+            variant="outline"
+            size="sm"
             onClick={() => importRef.current?.click()}
             disabled={isImporting}
             title="Import memories from JSON"
-            className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-white border border-white/10 hover:border-[rgba(255,255,255,0.16)] px-3 py-1.5 rounded-lg transition-ui disabled:opacity-50"
           >
             <Upload className="w-3.5 h-3.5" />
             {isImporting ? "Importing…" : "Import"}
-          </button>
+          </Button>
           <input
             ref={importRef}
             type="file"
@@ -615,16 +617,16 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             onChange={handleImportFile}
           />
           {!showForm && (
-            <button
+            <Button
+              size="sm"
               onClick={() => {
                 setEditing(null);
                 setShowForm(true);
               }}
-              className="flex items-center gap-1.5 text-xs font-semibold bg-violet-600 hover:bg-violet-500 text-white px-3 py-1.5 rounded-lg transition-ui"
             >
               <Plus className="w-3.5 h-3.5" />
               Add memory
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -682,7 +684,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
                       setEditing(e);
                       setShowForm(true);
                     }}
-                    onDelete={doDelete}
+                    onDelete={setKeyToDelete}
                     deleting={deletingKey === entry.key}
                   />
                 ))}
@@ -691,6 +693,18 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
           ))}
         </div>
       )}
+      <ConfirmDialog
+        open={keyToDelete !== null}
+        title="Delete this memory?"
+        message={`“${keyToDelete ?? ""}” is removed from the actor's memory. This cannot be undone.`}
+        confirmLabel="Delete"
+        destructive
+        onConfirm={() => {
+          if (keyToDelete) doDelete(keyToDelete);
+          setKeyToDelete(null);
+        }}
+        onCancel={() => setKeyToDelete(null)}
+      />
     </div>
   );
 }

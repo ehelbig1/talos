@@ -28,7 +28,7 @@ import {
   KeyRound,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Dialog } from "@/components/ui";
+import { ConfirmDialog, Dialog } from "@/components/ui";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
 // Shared CSRF-aware fetch: seeds the CSRF cookie via GET /auth/csrf before
@@ -289,6 +289,10 @@ export function GmailWatchChannels(): React.ReactElement | null {
   const qc = useQueryClient();
   const [flashedAt, setFlashedAt] = useState<Record<string, number>>({});
   const [createOpen, setCreateOpen] = useState(false);
+  const [watchToStop, setWatchToStop] = useState<{
+    uuid: string;
+    email: string;
+  } | null>(null);
 
   const watchesQuery = useQuery({
     queryKey: WATCHES_KEY,
@@ -774,15 +778,12 @@ export function GmailWatchChannels(): React.ReactElement | null {
                         <Button
                           variant="outline"
                           size="sm"
-                          onClick={() => {
-                            if (
-                              window.confirm(
-                                `Stop Gmail watch for ${w.email_address}?`,
-                              )
-                            ) {
-                              stopMutation.mutate(w.channel_uuid);
-                            }
-                          }}
+                          onClick={() =>
+                            setWatchToStop({
+                              uuid: w.channel_uuid,
+                              email: w.email_address,
+                            })
+                          }
                           disabled={cur !== null}
                           className="h-8 px-2.5 text-xs text-destructive hover:text-destructive"
                         >
@@ -802,6 +803,19 @@ export function GmailWatchChannels(): React.ReactElement | null {
           </table>
         </div>
       )}
+
+      <ConfirmDialog
+        open={watchToStop !== null}
+        title="Stop this Gmail watch?"
+        message={`Gmail stops telling Talos about new mail for ${watchToStop?.email ?? ""}. A workflow bound to this watch is not started by mail again until you create the watch again.`}
+        confirmLabel="Stop watch"
+        destructive
+        onConfirm={() => {
+          if (watchToStop) stopMutation.mutate(watchToStop.uuid);
+          setWatchToStop(null);
+        }}
+        onCancel={() => setWatchToStop(null)}
+      />
 
       <CreateGmailWatchDialog
         integrations={integrations}

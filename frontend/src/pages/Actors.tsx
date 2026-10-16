@@ -181,7 +181,7 @@ export default function Actors() {
               <>
                 {compareMode && (
                   <Button
-                    variant={compareSet.size >= 2 ? "premium" : "outline"}
+                    variant={compareSet.size >= 2 ? "default" : "outline"}
                     disabled={compareSet.size < 2}
                     onClick={() => {
                       navigate(

@@ -2,17 +2,27 @@ import * as React from "react";
 import { cn } from "@/lib/utils";
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
-  variant?:
-    "default" | "destructive" | "outline" | "ghost" | "premium" | "secondary";
+  variant?: "default" | "destructive" | "outline" | "ghost" | "secondary";
   size?: "default" | "sm" | "lg" | "xl" | "icon";
 }
 
 /**
  * The one button. Sentence-case label at a readable size; emphasis comes from
- * the variant's fill, not from weight, caps or glow.
+ * the variant's fill, not from weight, caps or glow. The type is "button"
+ * unless a form's submit button says `type="submit"`, so a button inside a
+ * form never submits it by accident.
  */
 const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
-  ({ className, variant = "default", size = "default", ...props }, ref) => {
+  (
+    {
+      className,
+      variant = "default",
+      size = "default",
+      type = "button",
+      ...props
+    },
+    ref,
+  ) => {
     const base =
       "inline-flex items-center justify-center gap-2 rounded-xl font-semibold transition-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30 disabled:opacity-40 disabled:pointer-events-none select-none leading-none whitespace-nowrap";
 
@@ -26,8 +36,6 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
       secondary:
         "bg-surface-4 text-foreground border border-white/5 hover:bg-white/5",
       ghost: "hover:bg-white/5 text-muted-foreground hover:text-foreground",
-      premium:
-        "bg-gradient-to-br from-primary to-indigo-600 text-white border border-white/10 hover:brightness-110",
     };
 
     const sizes = {
@@ -40,6 +48,7 @@ const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
 
     return (
       <button
+        type={type}
         className={cn(base, variants[variant], sizes[size], className)}
         ref={ref}
         {...props}

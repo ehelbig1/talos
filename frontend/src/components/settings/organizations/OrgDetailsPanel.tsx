@@ -75,7 +75,6 @@ export function OrgDetailsPanel({
               <ArrowRightLeft className="w-4 h-4 mr-3" /> Transfer ownership
             </Button>
             <Button
-              variant="premium"
               className="flex-1 md:flex-none h-12 px-8 rounded-xl"
               onClick={onShowInvite}
             >

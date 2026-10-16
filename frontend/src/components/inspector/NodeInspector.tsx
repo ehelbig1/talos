@@ -179,6 +179,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
         <button
           type="button"
           onClick={onClose}
+          aria-label="Close inspector"
           className="w-10 h-10 flex items-center justify-center rounded-xl bg-white/5 border border-white/10 text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-ui"
         >
           <X className="h-5 w-5" />
@@ -489,7 +490,8 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       }
                     }}
                     className="w-10 h-10 flex items-center justify-center hover:bg-white/10 rounded-xl border border-white/5 text-muted-foreground/70 hover:text-white transition-ui"
-                    title="Copy Payload"
+                    title="Copy output"
+                    aria-label="Copy output"
                   >
                     <Copy className="w-4 h-4" />
                   </button>
