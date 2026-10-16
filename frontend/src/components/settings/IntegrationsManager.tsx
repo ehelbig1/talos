@@ -80,7 +80,7 @@ export function IntegrationsManager() {
                 <ExternalLink size={28} />
               </div>
               <div className="flex flex-col">
-                <h2 className="text-3xl md:text-4xl font-semibold text-white tracking-tight">
+                <h2 className="text-3xl md:text-2xl font-semibold text-white tracking-tight">
                   Integrations
                 </h2>
                 <div className="flex flex-wrap items-center gap-3 mt-2">

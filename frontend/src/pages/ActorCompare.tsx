@@ -128,9 +128,9 @@ export default function ActorCompare() {
 
         {/* Empty prompt */}
         {lanes.length === 0 && (
-          <div className="flex flex-col items-center justify-center py-20 gap-8 text-center">
+          <div className="flex flex-col items-center justify-center py-12 gap-8 text-center">
             <div className="relative">
-              <GitCompare className="w-24 h-24 text-white/5 relative z-10" />
+              <GitCompare className="w-14 h-14 text-white/5 relative z-10" />
             </div>
             <div className="space-y-3 relative z-10">
               <p className="text-sm font-semibold text-white/70 font-outfit">

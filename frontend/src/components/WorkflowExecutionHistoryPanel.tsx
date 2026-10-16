@@ -465,15 +465,15 @@ export const WorkflowExecutionHistoryPanel = React.memo(
 
         {/* Content */}
         {isLoading ? (
-          <div className="flex flex-col items-center justify-center py-24 gap-6 text-muted-foreground/50">
+          <div className="flex flex-col items-center justify-center py-16 gap-6 text-muted-foreground/50">
             <div className="relative">
               <Spinner className="w-12 h-12 text-primary/70" />
             </div>
             <p className="text-xs font-semibold">Synchronizing Registry...</p>
           </div>
         ) : history.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 px-10 text-center bg-white/[0.02] rounded-2xl border border-white/5 border-dashed">
-            <div className="w-20 h-20 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
+          <div className="flex flex-col items-center justify-center py-16 px-10 text-center bg-white/[0.02] rounded-2xl border border-white/5 border-dashed">
+            <div className="w-14 h-14 rounded-full bg-white/5 border border-white/5 flex items-center justify-center mb-6 opacity-40">
               <Clock className="w-8 h-8 text-muted-foreground/50" />
             </div>
             <p className="text-xs font-semibold text-muted-foreground/30">

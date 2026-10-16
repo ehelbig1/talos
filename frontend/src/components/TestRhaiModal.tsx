@@ -181,7 +181,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
           <Button
             variant="ghost"
             onClick={handleClose}
-            className="h-14 px-12 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
+            className="h-12 px-6 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
           >
             Close Diagnostics
           </Button>

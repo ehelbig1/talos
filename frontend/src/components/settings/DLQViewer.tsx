@@ -228,7 +228,7 @@ export function DLQViewer() {
             </div>
           </div>
 
-          <div className="flex items-center gap-10">
+          <div className="flex items-center gap-6">
             <div className="flex flex-col items-end gap-1">
               <span className="text-3xl font-semibold text-white tracking-tight leading-none">
                 {activeTab === "nodes"
@@ -309,8 +309,8 @@ export function DLQViewer() {
       <div className="space-y-6">
         {activeTab === "nodes" ? (
           pendingNodes.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
-              <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-success/20">
+            <div className="flex flex-col items-center justify-center py-16 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
+              <div className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-success/20">
                 <Shield size={40} />
               </div>
               <h3 className="text-2xl font-semibold text-white/70 tracking-tight mb-4">
@@ -386,8 +386,8 @@ export function DLQViewer() {
             ))
           )
         ) : pendingWebhooks.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-32 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-warning/20">
+          <div className="flex flex-col items-center justify-center py-16 bg-surface-3/20 border border-dashed border-white/5 rounded-2xl text-center group">
+            <div className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/30 mb-8 transition-ui group-hover:text-warning/20">
               <Database size={40} />
             </div>
             <h3 className="text-2xl font-semibold text-white/70 tracking-tight mb-4">

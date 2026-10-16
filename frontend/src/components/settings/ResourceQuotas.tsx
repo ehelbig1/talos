@@ -152,7 +152,7 @@ export function ResourceQuotas() {
   if (isLoading) {
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {[1, 2, 3, 4].map((i) => (
             <div
@@ -167,7 +167,7 @@ export function ResourceQuotas() {
 
   return (
     <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
-      <div className="flex items-center justify-between mb-10 relative z-10">
+      <div className="flex items-center justify-between mb-6 relative z-10">
         <div className="flex items-center gap-5">
           <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
             <Gauge className="w-7 h-7 text-primary" />

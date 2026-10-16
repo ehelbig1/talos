@@ -226,7 +226,7 @@ export default function WebhookManager() {
   if (isLoading) {
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
             <div
@@ -247,7 +247,7 @@ export default function WebhookManager() {
 
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
         {/* Header */}
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-12 relative z-10">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-8 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
               <Webhook className="w-8 h-8 text-primary" />
@@ -271,7 +271,7 @@ export default function WebhookManager() {
         </div>
 
         {triggers.length === 0 ? (
-          <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
+          <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
             <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-ui" />
             <p className="text-sm text-muted-foreground font-semibold">
               No webhooks yet

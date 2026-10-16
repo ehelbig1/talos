@@ -242,7 +242,7 @@ export function SummaryPanel({
                           </span>
                         )}
                       </div>
-                      <h2 className="text-4xl font-semibold text-white tracking-tight leading-none group-hover:text-primary transition-colors">
+                      <h2 className="text-2xl font-semibold text-white tracking-tight leading-none group-hover:text-primary transition-colors">
                         {actor.name}
                       </h2>
                       {actor.description ? (

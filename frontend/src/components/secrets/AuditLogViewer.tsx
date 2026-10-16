@@ -106,7 +106,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
               </p>
             </div>
           ) : logs?.length === 0 ? (
-            <div className="py-20 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
+            <div className="py-12 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
               <Clock className="w-10 h-10 mx-auto mb-3 opacity-20" />
               <p className="text-sm font-medium">No activity recorded yet</p>
               <p className="text-xs opacity-60">

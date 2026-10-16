@@ -21,7 +21,7 @@ export const SectionHeader: React.FC<SectionHeaderProps> = ({
   const Tag = level;
 
   const styles = {
-    h1: "text-3xl sm:text-4xl font-bold tracking-tight text-white",
+    h1: "text-2xl sm:text-3xl font-semibold tracking-tight text-white",
     h2: "text-xl sm:text-2xl font-semibold tracking-tight text-white",
     h3: "text-base sm:text-lg font-semibold tracking-tight text-white",
     h4: "text-2xs font-semibold uppercase tracking-wider text-muted-foreground",

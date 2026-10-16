@@ -548,14 +548,14 @@ export default function SchedulesManager() {
       {schedulesLoading ? (
         <LoadingState label="Loading schedules…" />
       ) : schedules.length === 0 ? (
-        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-24 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
-          <div className="w-24 h-24 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
+        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
+          <div className="w-14 h-14 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
             <Calendar size={48} />
           </div>
           <h3 className="text-2xl font-semibold text-white tracking-tight mb-4">
             No schedules yet
           </h3>
-          <p className="text-sm text-muted-foreground/70 max-w-sm mb-10 leading-relaxed">
+          <p className="text-sm text-muted-foreground/70 max-w-sm mb-6 leading-relaxed">
             Create a schedule to run a workflow automatically.
           </p>
           <Button onClick={() => setShowAdd(true)} className="px-10 h-14">
@@ -580,7 +580,7 @@ export default function SchedulesManager() {
 
       {/* Summary strip */}
       {schedules.length > 0 && (
-        <div className="flex items-center gap-10 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
+        <div className="flex items-center gap-6 px-10 py-6 bg-surface-3/40 border border-white/5 rounded-2xl relative overflow-hidden group">
           <div className="flex items-center gap-3 relative z-10">
             <div className="w-2 h-2 rounded-full bg-warning" />
             <span className="text-xs text-muted-foreground/70 font-semibold">

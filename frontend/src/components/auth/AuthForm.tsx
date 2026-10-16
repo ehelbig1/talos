@@ -76,7 +76,7 @@ export function AuthForm() {
       <div className="relative z-10 w-full max-w-[420px] px-6 py-12">
         <div className="bg-surface-1/80 border border-white/10 rounded-2xl p-10 relative overflow-hidden">
           {/* Logo & Branding */}
-          <div className="text-center mb-10 relative">
+          <div className="text-center mb-6 relative">
             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 mb-5">
               <Zap className="w-7 h-7 text-primary" fill="currentColor" />
             </div>

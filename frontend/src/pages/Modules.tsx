@@ -177,7 +177,7 @@ function ModuleCard({
       {/* Expanded details */}
       {expanded && (
         <div className="border-t border-white/5 px-8 py-8 space-y-8 bg-surface-4/40 bg-surface-3 border border-white/10">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-10">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-6">
             <div className="space-y-3">
               <p className="text-xs font-semibold text-muted-foreground/60">
                 Module Identifier
@@ -243,8 +243,8 @@ function ModuleCard({
 
 function EmptyState({ hasSearch }: { hasSearch: boolean }) {
   return (
-    <div className="flex flex-col items-center justify-center py-40 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10">
-      <div className="w-24 h-24 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-10 relative">
+    <div className="flex flex-col items-center justify-center py-16 text-center px-10 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10">
+      <div className="w-14 h-14 rounded-2xl bg-surface-4/60 border border-white/10 flex items-center justify-center mb-6 relative">
         <Box className="w-12 h-12 text-muted-foreground/50 relative z-10" />
       </div>
       <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
@@ -340,7 +340,7 @@ export default function Modules() {
 
       {/* World filter pills */}
       {worlds.length > 1 && (
-        <div className="flex items-center gap-3 flex-wrap mb-12">
+        <div className="flex items-center gap-3 flex-wrap mb-8">
           <button
             onClick={() => setWorldFilter(null)}
             className={cn(

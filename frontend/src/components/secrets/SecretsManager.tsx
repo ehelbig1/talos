@@ -233,7 +233,7 @@ function SecretsManager() {
             <Key className="w-8 h-8 text-primary" />
           </div>
           <div className="flex flex-col">
-            <h2 className="text-4xl font-semibold text-white tracking-tight">
+            <h2 className="text-2xl font-semibold text-white tracking-tight">
               Secrets
             </h2>
             <p className="text-sm text-muted-foreground mt-1">
@@ -258,8 +258,8 @@ function SecretsManager() {
             <p className="font-semibold text-xs">Could not load secrets</p>
           </div>
         ) : secrets && secrets.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-48 text-center px-10 space-y-8">
-            <div className="w-20 h-20 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-ui">
+          <div className="flex flex-col items-center justify-center py-16 text-center px-10 space-y-8">
+            <div className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-white/10 group-hover/registry:text-primary/20 transition-ui">
               <LockIcon size={40} />
             </div>
             <div className="space-y-3">
@@ -422,7 +422,7 @@ function SecretsManager() {
 
       {/* Advanced Security Section */}
       <div className="bg-warning/5 border border-warning/20 rounded-2xl p-12 group relative overflow-hidden transition-ui hover:border-warning/40">
-        <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-12 relative z-10">
+        <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-8 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-6">
               <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center transition-ui">

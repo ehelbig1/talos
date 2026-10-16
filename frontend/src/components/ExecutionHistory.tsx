@@ -410,12 +410,12 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
       </div>
 
       {isLoading ? (
-        <div className="flex flex-col items-center justify-center py-32 gap-6 opacity-20 grayscale">
+        <div className="flex flex-col items-center justify-center py-16 gap-6 opacity-60">
           <Spinner className="w-12 h-12 text-primary" />
           <p className="text-xs font-semibold">Loading…</p>
         </div>
       ) : history.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-32 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl">
+        <div className="flex flex-col items-center justify-center py-16 bg-surface-2/20 border border-white/5 border-dashed rounded-2xl">
           <HistoryIcon className="w-16 h-16 text-muted-foreground/5 mb-6" />
           <p className="text-xs font-semibold text-muted-foreground/50">
             Zero Execution Cycles Logged
