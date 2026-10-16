@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Button } from "@/components/ui/button";
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, Download, Filter, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -85,13 +86,14 @@ export function LogPanel({ actorId }: { actorId: string }) {
             />
           </div>
           {entries.length > 0 && (
-            <button
+            <Button
+              variant="outline"
+              size="sm"
               onClick={() => downloadLogCsv(entries)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-muted-foreground bg-surface-3/60 border border-white/5 rounded-lg hover:text-white hover:bg-surface-4/60 transition-ui"
             >
               <Download className="w-3.5 h-3.5" />
               CSV
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -121,13 +123,15 @@ export function LogPanel({ actorId }: { actorId: string }) {
 
       {entries.length >= limit && (
         <div className="text-center">
-          <button
+          <Button
+            variant="ghost"
+            size="sm"
+            className="mx-auto"
             onClick={() => setLimit((l) => l + 50)}
-            className="text-sm text-muted-foreground hover:text-white transition-ui px-4 py-2 flex items-center gap-2 mx-auto"
           >
             <RefreshCw className="w-3.5 h-3.5" />
-            Load more from server
-          </button>
+            Load more
+          </Button>
         </div>
       )}
     </div>

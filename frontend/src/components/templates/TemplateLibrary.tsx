@@ -228,6 +228,8 @@ function TemplateCard({
         }}
         className="absolute top-5 right-5 p-2 rounded-xl bg-surface-4/40 border border-white/5 text-muted-foreground/70 hover:text-amber-400 transition-ui z-20"
         title={isFavorite ? "Remove from favorites" : "Add to favorites"}
+        aria-label={isFavorite ? "Remove from favorites" : "Add to favorites"}
+        aria-pressed={isFavorite}
       >
         <Star
           size={16}

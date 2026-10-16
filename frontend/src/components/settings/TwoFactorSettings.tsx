@@ -224,7 +224,6 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
 
             <Button
               className="w-full h-16 text-base font-semibold rounded-2xl"
-              variant="premium"
               onClick={() => setupMutation.mutate({})}
               disabled={setupMutation.isPending}
             >
@@ -310,7 +309,6 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 Cancel
               </Button>
               <Button
-                variant="premium"
                 className="px-12 h-14 rounded-xl"
                 onClick={() => setStep("verify")}
               >
@@ -356,7 +354,6 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   Back
                 </Button>
                 <Button
-                  variant="premium"
                   className="flex-1 h-14 rounded-2xl"
                   disabled={
                     verificationCode.length !== 6 || enableMutation.isPending

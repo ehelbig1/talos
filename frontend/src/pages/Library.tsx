@@ -52,7 +52,7 @@ export default function Library() {
               <Button
                 role="tab"
                 aria-selected={tab === "templates"}
-                variant={tab === "templates" ? "premium" : "ghost"}
+                variant={tab === "templates" ? "default" : "ghost"}
                 size="sm"
                 onClick={() => setTab("templates")}
               >
@@ -61,7 +61,7 @@ export default function Library() {
               <Button
                 role="tab"
                 aria-selected={tab === "installed"}
-                variant={tab === "installed" ? "premium" : "ghost"}
+                variant={tab === "installed" ? "default" : "ghost"}
                 size="sm"
                 onClick={() => setTab("installed")}
               >

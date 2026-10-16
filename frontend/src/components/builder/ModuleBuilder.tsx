@@ -412,6 +412,7 @@ export function ModuleBuilder({
                                 {ip}
                                 <button
                                   type="button"
+                                  aria-label="Remove IP address"
                                   onClick={() => {
                                     setWebhookSettings({
                                       ...webhookSettings,
@@ -443,7 +444,7 @@ export function ModuleBuilder({
                 onClick={onClose}
                 className="h-14 px-10 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2/60 hover:bg-surface-3 rounded-2xl border border-white/5"
               >
-                Abort Architect
+                Cancel
               </Button>
               <Button
                 onClick={() =>

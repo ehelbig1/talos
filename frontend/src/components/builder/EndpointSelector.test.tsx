@@ -148,7 +148,7 @@ describe("EndpointSelector", () => {
     fireEvent.click(screen.getByText("Get user profile"));
     expect(screen.getByText("/users/{id}")).toBeInTheDocument();
 
-    fireEvent.click(screen.getByText("Abort"));
+    fireEvent.click(screen.getByText("Cancel"));
     expect(screen.getByText("Get user profile")).toBeInTheDocument();
   });
 });

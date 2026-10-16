@@ -44,6 +44,7 @@ export function GithubAppCard({
           onClick={onConnect}
           className="p-2.5 bg-white/5 border border-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary transition-ui rounded-xl"
           title="Install GitHub App"
+          aria-label="Install GitHub App"
         >
           <Plus size={18} />
         </button>

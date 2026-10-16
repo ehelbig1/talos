@@ -138,6 +138,7 @@ export function OpenAPIBrowser({
         <button
           type="button"
           onClick={() => setShowBrowser(false)}
+          aria-label="Close"
           className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
         >
           <X className="h-4 w-4" />

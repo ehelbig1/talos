@@ -89,6 +89,7 @@ export function CreateKeyDialog({
           <button
             type="button"
             onClick={onClose}
+            aria-label="Close"
             className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/5 text-muted-foreground hover:text-white transition-ui"
           >
             <X size={20} />

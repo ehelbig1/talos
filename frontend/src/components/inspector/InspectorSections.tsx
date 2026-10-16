@@ -1,4 +1,5 @@
 import React from "react";
+import { Button } from "@/components/ui/button";
 import { Brain, ShieldCheck, ChevronDown, Activity } from "lucide-react";
 import { CopyField } from "@/components/ui";
 import { cn } from "@/lib/utils";
@@ -300,8 +301,9 @@ export function RetryPolicySection({
             },
             { label: "Always", value: "true" },
           ].map((snippet) => (
-            <button
-              type="button"
+            <Button
+              variant="outline"
+              size="sm"
               key={snippet.label}
               onClick={() => {
                 const currentPolicy = data.retryPolicy || {};
@@ -312,10 +314,9 @@ export function RetryPolicySection({
                   },
                 });
               }}
-              className="text-2xs font-semibold px-4 py-2 bg-white/5 hover:bg-primary/10 border border-white/5 rounded-xl text-muted-foreground/70 hover:text-primary transition-ui"
             >
               {snippet.label}
-            </button>
+            </Button>
           ))}
         </div>
       </div>
@@ -364,13 +365,13 @@ export function SystemInternalsSection({
       </div>
 
       <div className="pt-8 border-t border-white/5">
-        <button
-          type="button"
+        <Button
+          variant="outline"
+          className="w-full text-destructive border-destructive/20 hover:bg-destructive/10 hover:text-destructive"
           onClick={onDelete}
-          className="w-full py-4 rounded-2xl border border-destructive/20 bg-destructive/5 text-destructive text-sm font-semibold hover:bg-destructive/10 hover:border-destructive/40 transition-ui group overflow-hidden relative"
         >
           <span className="relative z-10">Delete node</span>
-        </button>
+        </Button>
       </div>
     </div>
   );

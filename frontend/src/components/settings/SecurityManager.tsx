@@ -124,7 +124,6 @@ function RotateDekCard() {
           <Button
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
-            variant="premium"
             className="shrink-0 h-14 px-8 rounded-2xl"
           >
             {mutation.isPending ? (
@@ -221,7 +220,6 @@ function ReEncryptSecretsCard() {
           <Button
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
-            variant="premium"
             className="shrink-0 h-14 px-8 rounded-2xl"
           >
             {mutation.isPending ? (
@@ -425,7 +423,6 @@ function RotateMasterKeyCard() {
           <Button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            variant="premium"
             className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
           >
             {mutation.isPending ? (
@@ -508,7 +505,6 @@ function RotateEncryptionKeyCard() {
           <Button
             onClick={() => setConfirmOpen(true)}
             disabled={mutation.isPending}
-            variant="premium"
             className="shrink-0 h-14 px-8 rounded-2xl bg-white/5 hover:bg-white/10 text-white border border-white/10"
           >
             {mutation.isPending ? (

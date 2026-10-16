@@ -6,6 +6,7 @@
  */
 
 import React from "react";
+import { Button } from "@/components/ui/button";
 import {
   Collapsible,
   CollapsibleTrigger,
@@ -133,14 +134,17 @@ export function renderField(
                   onClick={() =>
                     onChange(arrayValue.filter((_, i) => i !== index))
                   }
+                  aria-label="Remove item"
                   className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-ui"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             ))}
-            <button
-              type="button"
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-primary"
               onClick={() => {
                 const newItem: Record<string, unknown> = {};
                 Object.keys(schema.items?.properties || {}).forEach((key) => {
@@ -148,10 +152,9 @@ export function renderField(
                 });
                 onChange([...arrayValue, newItem]);
               }}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-ui flex items-center gap-2"
             >
               <Plus className="h-4 w-4" /> Add entry
-            </button>
+            </Button>
           </div>
         );
       }
@@ -249,19 +252,21 @@ export function renderField(
                   onClick={() =>
                     onChange(arrayValue.filter((_, i) => i !== index))
                   }
+                  aria-label="Remove item"
                   className="shrink-0 w-12 h-12 flex items-center justify-center bg-destructive/5 border border-destructive/20 text-destructive rounded-xl hover:bg-destructive/10 transition-ui"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
             ))}
-            <button
-              type="button"
+            <Button
+              variant="outline"
+              size="sm"
+              className="text-primary"
               onClick={() => onChange([...arrayValue, ""])}
-              className="h-11 px-6 bg-surface-2 hover:bg-surface-3 border border-white/5 rounded-xl text-2xs font-semibold text-primary transition-ui flex items-center gap-2"
             >
               <Plus className="h-4 w-4" /> Add item
-            </button>
+            </Button>
           </div>
         );
       }

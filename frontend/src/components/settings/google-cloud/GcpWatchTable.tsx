@@ -6,6 +6,7 @@
 import React from "react";
 import { Activity, Copy, XCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { cn } from "@/lib/utils";
 import {
   RecentFailureBadge,
@@ -27,8 +28,23 @@ export function GcpWatchTable({
   onTest: (channelUuid: string) => void;
   onStop: (channelUuid: string) => void;
 }): React.ReactElement {
+  const [watchToStop, setWatchToStop] = React.useState<GcpWatchSummary | null>(
+    null,
+  );
   return (
     <div className="border border-border/40 rounded-2xl overflow-hidden">
+      <ConfirmDialog
+        open={watchToStop !== null}
+        title="Stop this watch?"
+        message={`Google Cloud stops pushing incidents for “${watchToStop?.display_name ?? ""}” to Talos. A workflow bound to this watch is not started by an incident again until you create the watch again.`}
+        confirmLabel="Stop watch"
+        destructive
+        onConfirm={() => {
+          if (watchToStop) onStop(watchToStop.channel_uuid);
+          setWatchToStop(null);
+        }}
+        onCancel={() => setWatchToStop(null)}
+      />
       <table className="w-full text-sm">
         <thead className="bg-muted/30 text-xs text-muted-foreground">
           <tr>
@@ -121,13 +137,7 @@ export function GcpWatchTable({
                     <Button
                       variant="outline"
                       size="sm"
-                      onClick={() => {
-                        if (
-                          window.confirm(`Stop GCP watch "${w.display_name}"?`)
-                        ) {
-                          onStop(w.channel_uuid);
-                        }
-                      }}
+                      onClick={() => setWatchToStop(w)}
                       disabled={cur !== null}
                       className="h-8 px-2.5 text-xs text-destructive hover:text-destructive"
                     >

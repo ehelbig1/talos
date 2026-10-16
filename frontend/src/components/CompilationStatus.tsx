@@ -202,6 +202,7 @@ export function CompilationStatus() {
             {(job.status === "success" || job.status === "failed") && (
               <button
                 onClick={() => removeJob(job.jobId)}
+                aria-label="Dismiss"
                 className="text-white/50 hover:text-white hover:bg-white/5 rounded-lg p-1 transition-ui"
               >
                 <X className="w-4 h-4" />

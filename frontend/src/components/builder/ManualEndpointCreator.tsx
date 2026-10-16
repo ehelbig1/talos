@@ -133,6 +133,7 @@ export function ManualEndpointCreator({
         <button
           type="button"
           onClick={() => setShowCreator(false)}
+          aria-label="Close"
           className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
         >
           <X className="h-4 w-4" />
@@ -205,14 +206,15 @@ export function ManualEndpointCreator({
             <h5 className="text-xs font-semibold text-white/60">Parameters</h5>
             <div className="flex gap-2">
               {(["path", "query", "header"] as const).map((type) => (
-                <button
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="capitalize"
                   key={type}
-                  type="button"
                   onClick={() => addParameter(type)}
-                  className="h-7 px-3 bg-white/5 hover:bg-white/10 text-2xs font-semibold text-white rounded-lg border border-white/5 transition-ui"
                 >
                   <Plus className="h-3 w-3 mr-1.5 inline" /> {type}
-                </button>
+                </Button>
               ))}
             </div>
           </div>
@@ -277,6 +279,7 @@ export function ManualEndpointCreator({
                     <button
                       type="button"
                       onClick={() => removeParameter(index)}
+                      aria-label="Remove parameter"
                       className="p-1.5 rounded-lg hover:bg-destructive/10 text-muted-foreground/50 hover:text-destructive transition-ui"
                     >
                       <X className="h-4 w-4" />
@@ -309,7 +312,7 @@ export function ManualEndpointCreator({
             variant="ghost"
             className="h-12 px-8 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-sm font-semibold rounded-2xl border border-white/5 transition-ui"
           >
-            Abort
+            Cancel
           </Button>
         </div>
 

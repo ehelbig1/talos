@@ -276,7 +276,6 @@ export default function OAuthManager() {
                     </Button>
                   ) : (
                     <Button
-                      variant="premium"
                       className="h-12 px-8 rounded-xl"
                       onClick={() => handleLink(provider.id)}
                       disabled={isLinking}
@@ -293,7 +292,8 @@ export default function OAuthManager() {
                     <button
                       type="button"
                       className="h-12 w-12 flex items-center justify-center text-muted-foreground/50 hover:text-primary hover:bg-primary/10 rounded-xl transition-ui border border-white/5 hover:border-primary/20"
-                      title="Access provider dashboard"
+                      title="Open provider dashboard"
+                      aria-label="Open provider dashboard"
                     >
                       <ExternalLink className="w-5 h-5" />
                     </button>

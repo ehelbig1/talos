@@ -131,12 +131,7 @@ export function ExecutionHeader({
           </span>
         )}
 
-        <Button
-          onClick={onRun}
-          disabled={!canRun}
-          variant="premium"
-          className="h-9 px-4 text-sm"
-        >
+        <Button onClick={onRun} disabled={!canRun} className="h-9 px-4 text-sm">
           {loading ? (
             <Loader2 className="h-4 w-4 animate-spin" />
           ) : (

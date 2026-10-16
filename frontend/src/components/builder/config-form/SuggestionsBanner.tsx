@@ -7,6 +7,7 @@
  */
 
 import React from "react";
+import { Button } from "@/components/ui/button";
 import { Lightbulb, X, Zap } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { SmartSuggestion } from "./types";
@@ -58,6 +59,7 @@ export function SuggestionsBanner({
         ) : (
           <button
             onClick={onHide}
+            aria-label="Hide suggestions"
             className="p-1.5 rounded-lg hover:bg-white/5 text-muted-foreground/50 hover:text-white transition-ui"
           >
             <X className="h-4 w-4" />
@@ -87,18 +89,12 @@ export function SuggestionsBanner({
             ))}
           </ul>
           <div className="flex items-center gap-3 pt-4 border-t border-white/5">
-            <button
-              onClick={onApply}
-              className="px-6 h-9 bg-primary hover:bg-primary/90 text-white text-2xs font-semibold rounded-xl transition-ui"
-            >
-              Apply Optimization
-            </button>
-            <button
-              onClick={onDiscard}
-              className="px-6 h-9 bg-surface-3 hover:bg-surface-4 text-muted-foreground/70 hover:text-white text-2xs font-semibold rounded-xl transition-ui border border-white/5"
-            >
+            <Button size="sm" onClick={onApply}>
+              Apply
+            </Button>
+            <Button variant="ghost" size="sm" onClick={onDiscard}>
               Discard
-            </button>
+            </Button>
           </div>
         </div>
       )}

@@ -1,4 +1,5 @@
 import React, { Suspense, lazy, useCallback, useState, useEffect } from "react";
+import { Button } from "@/components/ui/button";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
 import { Link, useNavigate } from "react-router";
@@ -502,12 +503,13 @@ export default function Settings() {
                         {user?.email || user?.name}
                       </p>
                     </div>
-                    <button
+                    <Button
+                      variant="outline"
+                      className="ml-auto shrink-0 text-destructive border-destructive/20 hover:bg-destructive/10 hover:text-destructive"
                       onClick={logout}
-                      className="ml-auto shrink-0 px-4 h-10 text-sm font-medium border border-destructive/20 text-destructive hover:text-white hover:bg-destructive transition-ui rounded-xl"
                     >
                       Sign out
-                    </button>
+                    </Button>
                   </div>
                 </section>
                 <section id="password" className="scroll-mt-6">

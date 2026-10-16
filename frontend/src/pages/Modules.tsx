@@ -154,16 +154,17 @@ function ModuleCard({
         </div>
 
         <div className="flex items-center gap-4 shrink-0">
-          <button
+          <Button
+            variant="outline"
+            size="sm"
             onClick={(e) => {
               e.stopPropagation();
               onUseInEditor();
             }}
-            className="text-sm font-semibold text-primary bg-primary/5 border border-primary/20 rounded-xl px-6 py-3 hover:bg-primary hover:text-white transition-ui flex items-center gap-2 group/btn"
           >
             <ExternalLink className="w-4 h-4 transition-transform" />
-            Initialize
-          </button>
+            Open in editor
+          </Button>
           <div className="p-3 rounded-xl bg-white/5 border border-white/5 text-muted-foreground group-hover:text-white group-hover:bg-white/10 transition-ui">
             {expanded ? (
               <ChevronDown className="w-4 h-4" />

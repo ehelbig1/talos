@@ -204,7 +204,6 @@ function AddScheduleDialog({
           <Button
             onClick={handleSubmit}
             disabled={createMutation.isPending || !isValid}
-            variant="premium"
             className="px-10 h-14"
           >
             {createMutation.isPending ? "Creating…" : "Create schedule"}
@@ -290,7 +289,6 @@ function EditForm({ schedule, onDone }: EditFormProps) {
           size="sm"
           onClick={handleSave}
           disabled={updateMutation.isPending || !cron.trim()}
-          variant="premium"
           className="h-9 px-6 text-2xs"
         >
           {updateMutation.isPending ? "UPDATING..." : "COMMIT CHANGES"}
@@ -424,6 +422,8 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             <button
               type="button"
               onClick={() => setEditing((v) => !v)}
+              aria-label="Edit schedule"
+              aria-pressed={editing}
               className={cn(
                 "w-11 h-11 flex items-center justify-center rounded-2xl border transition-ui",
                 editing
@@ -437,6 +437,7 @@ function ScheduleCard({ schedule, workflowName }: ScheduleCardProps) {
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
+              aria-label="Delete schedule"
               className="w-11 h-11 flex items-center justify-center rounded-2xl border bg-white/5 border-white/5 text-muted-foreground/60 hover:text-destructive hover:border-destructive/30 hover:bg-destructive/10 transition-ui"
             >
               <Trash2 size={16} />
@@ -535,11 +536,7 @@ export default function SchedulesManager() {
             </p>
           </div>
         </div>
-        <Button
-          onClick={() => setShowAdd(true)}
-          variant="premium"
-          className="h-14 px-8"
-        >
+        <Button onClick={() => setShowAdd(true)} className="h-14 px-8">
           <Plus className="w-5 h-5 mr-2" />
           New schedule
         </Button>
@@ -564,11 +561,7 @@ export default function SchedulesManager() {
           <p className="text-sm text-muted-foreground/70 max-w-sm mb-10 leading-relaxed">
             Create a schedule to run a workflow automatically.
           </p>
-          <Button
-            onClick={() => setShowAdd(true)}
-            variant="premium"
-            className="px-10 h-14"
-          >
+          <Button onClick={() => setShowAdd(true)} className="px-10 h-14">
             <Plus className="w-5 h-5 mr-2" />
             Create schedule
           </Button>

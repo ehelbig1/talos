@@ -154,12 +154,11 @@ export const AddExistingNodeDialog = memo(function AddExistingNodeDialog({
               onClick={onClose}
               className="h-12 px-8 text-sm font-semibold text-muted-foreground/70 hover:text-white transition-ui bg-surface-2 hover:bg-surface-3 rounded-2xl border border-white/5"
             >
-              Abort
+              Cancel
             </Button>
             <Button
               onClick={handleAdd}
               disabled={!selectedModuleId || loading}
-              variant="premium"
               className="h-12 px-10"
             >
               Add node

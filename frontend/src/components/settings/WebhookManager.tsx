@@ -135,7 +135,6 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
           <Button
             className="w-full mt-10 h-14 rounded-2xl font-semibold text-sm"
             onClick={onClose}
-            variant="premium"
           >
             Done
           </Button>
@@ -217,7 +216,6 @@ function CreateWebhookDialog({ onClose }: CreateDialogProps) {
             <Button
               className="flex-1 h-14 rounded-2xl"
               disabled={!name.trim() || !moduleId || createMutation.isPending}
-              variant="premium"
               onClick={() =>
                 createMutation.mutate({
                   input: { name, moduleId, maxRequestsPerMinute: rateLimit },
@@ -289,7 +287,6 @@ export default function WebhookManager() {
           </div>
           <Button
             onClick={() => setShowCreate(true)}
-            variant="premium"
             className="h-14 px-8 rounded-2xl flex items-center gap-3 w-full md:w-auto"
           >
             <Plus className="w-5 h-5" />

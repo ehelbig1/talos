@@ -210,7 +210,8 @@ export function ActorCard({
                   onQuickRun();
                 }}
                 className="w-10 h-10 flex items-center justify-center rounded-xl bg-primary/10 text-primary border border-primary/20 hover:bg-primary/20 hover:border-primary/40 transition-ui"
-                title="Execute Manual Cycle"
+                title="Run now"
+                aria-label="Run now"
               >
                 <Play className="w-4.5 h-4.5" fill="currentColor" />
               </button>
@@ -226,6 +227,7 @@ export function ActorCard({
               disabled={isCloning}
               className="w-10 h-10 flex items-center justify-center rounded-xl bg-surface-4/60 text-muted-foreground/70 border border-white/5 hover:text-white hover:bg-surface-4 hover:border-white/20 transition-ui disabled:opacity-30 bg-white/[0.03] border border-white/5"
               title="Duplicate actor"
+              aria-label="Duplicate actor"
             >
               <Copy className="w-4 h-4" />
             </button>
@@ -257,6 +259,7 @@ export function ActorCard({
               }}
               className="w-10 h-10 flex items-center justify-center rounded-xl text-muted-foreground/50 hover:text-destructive hover:bg-destructive/10 hover:border-destructive/20 border border-transparent transition-ui"
               title="Delete actor"
+              aria-label="Delete actor"
             >
               <Trash2 className="w-4.5 h-4.5" />
             </button>

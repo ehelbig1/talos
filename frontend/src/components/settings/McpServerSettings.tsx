@@ -242,7 +242,6 @@ export default function McpServerSettings() {
               <Button
                 onClick={handleCreatePlugin}
                 disabled={creating || !pluginName.trim()}
-                variant="premium"
                 className="w-full h-14 rounded-2xl"
               >
                 {creating ? (
@@ -302,15 +301,17 @@ export default function McpServerSettings() {
                 <code className="text-xs font-mono text-primary/60 block truncate">
                   {localEndpoint}
                 </code>
-                <button
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
                   onClick={() => {
                     copy(localEndpoint);
                     toast.success("Local endpoint copied");
                   }}
-                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-ui"
                 >
                   Copy local URL
-                </button>
+                </Button>
               </div>
 
               <div className="p-5 bg-black/40 border border-white/5 rounded-2xl space-y-3 group">
@@ -325,15 +326,17 @@ export default function McpServerSettings() {
                 <code className="text-xs font-mono text-warning/60 block truncate">
                   {authEndpoint}
                 </code>
-                <button
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="w-full"
                   onClick={() => {
                     copy(authEndpoint);
                     toast.success("Production endpoint copied");
                   }}
-                  className="w-full py-2 text-2xs font-semibold text-muted-foreground/70 hover:text-white hover:bg-white/5 rounded-lg border border-white/5 transition-ui"
                 >
                   Copy production URL
-                </button>
+                </Button>
               </div>
             </div>
           </div>
@@ -404,17 +407,20 @@ export default function McpServerSettings() {
                           </p>
                         </div>
                       </div>
-                      <button
+                      <Button
+                        variant="outline"
+                        size="icon"
+                        className="text-destructive border-destructive/10 bg-destructive/5 hover:bg-destructive/10 hover:text-destructive"
+                        aria-label="Revoke token"
                         onClick={() => handleRevoke(agent.id)}
                         disabled={revokingId === agent.id}
-                        className="w-10 h-10 flex items-center justify-center rounded-xl bg-destructive/5 border border-destructive/10 text-destructive/40 hover:text-white hover:bg-destructive hover:border-destructive transition-ui"
                       >
                         {revokingId === agent.id ? (
                           <Loader2 size={14} className="animate-spin" />
                         ) : (
                           <Trash2 size={14} />
                         )}
-                      </button>
+                      </Button>
                     </div>
 
                     <div className="grid grid-cols-2 gap-4 relative z-10">
@@ -494,6 +500,7 @@ export default function McpServerSettings() {
                       copy(inst.config);
                       toast.success("Configuration copied");
                     }}
+                    aria-label="Copy configuration"
                     className="p-3 bg-white/5 border border-white/10 rounded-xl text-muted-foreground hover:text-white hover:bg-white/10 transition-ui"
                   >
                     <Copy size={16} />
