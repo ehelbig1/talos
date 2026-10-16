@@ -79,7 +79,7 @@ function LoadingScreen() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-background">
       <div className="flex flex-col items-center gap-5">
-        <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
+        <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
           <Zap size={28} className="text-primary" fill="currentColor" />
         </div>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">

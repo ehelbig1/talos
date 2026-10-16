@@ -187,7 +187,7 @@ export const ConfigForm = React.memo(function ConfigForm({
                   <div className="group/info relative">
                     <AlertTriangle className="h-3.5 w-3.5 text-muted-foreground/50 cursor-help hover:text-primary transition-ui" />
                     <div className="absolute bottom-full right-0 mb-3 w-64 p-3 bg-surface-4 border border-white/10 rounded-xl opacity-0 group-hover/info:opacity-100 transition-ui pointer-events-none z-50">
-                      <p className="text-xs font-bold text-white/60 leading-relaxed">
+                      <p className="text-xs font-medium text-white/60 leading-relaxed">
                         {fieldSchema.description}
                       </p>
                     </div>

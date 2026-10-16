@@ -197,7 +197,7 @@ export function GoogleCalendarSelector({
 
       {integrations.length === 0 ? (
         <div className="p-10 bg-surface-4 border-2 border-dashed border-white/5 rounded-2xl text-center flex flex-col items-center">
-          <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-6 border border-white/10">
+          <div className="w-14 h-14 rounded-full bg-white/5 flex items-center justify-center mb-6 border border-white/10">
             <Calendar className="h-8 w-8 text-muted-foreground/50" />
           </div>
           <h5 className="mb-2 text-sm font-semibold text-white tracking-tight font-outfit">
@@ -346,7 +346,7 @@ export function GoogleCalendarSelector({
                               )}
                             </div>
                             {calendar.description && (
-                              <p className="text-2xs font-bold text-muted-foreground/50 line-clamp-1">
+                              <p className="text-2xs font-medium text-muted-foreground/50 line-clamp-1">
                                 {calendar.description}
                               </p>
                             )}

@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 import {
   Play,
   Copy,
@@ -12,37 +13,9 @@ import {
 import { cn } from "@/lib/utils";
 import { ConfirmDialog } from "@/components/ui";
 import { relativeTime } from "@/lib/formatTime";
-import { getCapabilityConfig } from "@/lib/capabilityConfig";
 import { statusColors } from "@/pages/actor-detail/shared";
 export { statusColors };
 import type { ActorSummary } from "@/lib/graphqlApi";
-
-// ── CapabilityBadge ───────────────────────────────────────────────────────────
-
-export function CapabilityBadge({
-  world,
-  size = "md",
-}: {
-  world: string;
-  size?: "sm" | "md";
-}) {
-  const cfg = getCapabilityConfig(world);
-  return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded-full border font-semibold",
-        cfg.textColor,
-        cfg.bgColor,
-        cfg.borderColor,
-        size === "sm"
-          ? "text-2xs px-2 py-0.5"
-          : "text-2xs px-2.5 py-0.5 shadow-sm",
-      )}
-    >
-      {cfg.label}
-    </span>
-  );
-}
 
 export interface ActorCardProps {
   actor: ActorSummary;
@@ -131,7 +104,7 @@ export function ActorCard({
             <CapabilityBadge world={actor.maxCapabilityWorld} size="sm" />
           </div>
           {actor.description ? (
-            <p className="text-muted-foreground/60 text-xs font-bold line-clamp-1 leading-relaxed">
+            <p className="text-muted-foreground/60 text-xs font-medium line-clamp-1 leading-relaxed">
               {actor.description}
             </p>
           ) : (

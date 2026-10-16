@@ -8,7 +8,8 @@ import React from "react";
 import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
-import { CheckCircle2, Clock, Bot } from "lucide-react";
+import { CheckCircle2 } from "lucide-react";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 import type { ActorSummary } from "@/lib/graphqlApi";
 import type { WorkflowOption } from "./types";
 
@@ -36,21 +37,15 @@ export function SetupPanel({
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
       {/* Workflow selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-2xl p-10 space-y-6 bg-surface-3 border border-white/10 relative overflow-hidden">
-        <div className="absolute top-0 right-0 p-8 opacity-5">
-          <Clock size={120} />
-        </div>
-        <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
-          <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-          01. SELECT TARGET WORKFLOW
-        </h2>
+      <div className="bg-surface-3 border border-white/10 rounded-2xl p-6 space-y-6">
+        <h2 className="text-sm font-semibold text-white">Workflow</h2>
         {loadingWorkflows ? (
           <div className="flex items-center gap-3 text-muted-foreground/60 py-4">
             <Spinner className="w-4 h-4" />
-            <span className="text-xs font-bold">Accessing Registry...</span>
+            <span className="text-xs">Loading workflows…</span>
           </div>
         ) : workflows.length === 0 ? (
-          <p className="text-muted-foreground/70 text-sm font-bold py-4">
+          <p className="text-muted-foreground/70 text-sm font-medium py-4">
             No workflows yet.
           </p>
         ) : (
@@ -77,15 +72,11 @@ export function SetupPanel({
       </div>
 
       {/* Actor selector */}
-      <div className="bg-surface-1/40 border border-white/5 rounded-2xl p-10 space-y-6 bg-surface-3 border border-white/10 relative overflow-hidden">
-        <div className="absolute top-0 right-0 p-8 opacity-5">
-          <Bot size={120} />
-        </div>
-        <h2 className="text-xs font-semibold text-primary flex items-center gap-3">
-          <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-          02. Choose actors
-          <span className="text-muted-foreground/70 normal-case font-bold tracking-wider ml-auto">
-            (at least 2)
+      <div className="bg-surface-3 border border-white/10 rounded-2xl p-6 space-y-6">
+        <h2 className="text-sm font-semibold text-white flex items-center gap-3">
+          Actors
+          <span className="text-xs text-muted-foreground font-medium ml-auto">
+            at least 2
           </span>
         </h2>
         {loadingActors ? (
@@ -94,7 +85,7 @@ export function SetupPanel({
             <span className="text-xs font-bold">Loading actors…</span>
           </div>
         ) : activeActors.length === 0 ? (
-          <p className="text-muted-foreground/70 text-sm font-bold py-4">
+          <p className="text-muted-foreground/70 text-sm font-medium py-4">
             No active actors.{" "}
             <button
               onClick={onGoToActors}
@@ -140,14 +131,15 @@ export function SetupPanel({
                       {actor.name}
                     </p>
                     {actor.description && (
-                      <p className="text-2xs text-muted-foreground/70 font-bold truncate mt-1">
+                      <p className="text-2xs text-muted-foreground/70 font-medium truncate mt-1">
                         {actor.description}
                       </p>
                     )}
                   </div>
-                  <span className="text-2xs text-primary/70 font-semibold tracking-wider uppercase shrink-0">
-                    {actor.maxCapabilityWorld}
-                  </span>
+                  <CapabilityBadge
+                    world={actor.maxCapabilityWorld}
+                    className="shrink-0"
+                  />
                 </label>
               );
             })}

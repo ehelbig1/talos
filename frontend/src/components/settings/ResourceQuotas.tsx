@@ -237,7 +237,7 @@ export function ResourceQuotas() {
                     <h4 className="text-sm font-semibold text-white leading-none truncate">
                       {item.metric}
                     </h4>
-                    <p className="text-xs text-muted-foreground/60 font-bold mt-1.5 leading-none">
+                    <p className="text-xs text-muted-foreground/60 font-medium mt-1.5 leading-none">
                       {isEditing ? "New limit" : "In use"}
                     </p>
                   </div>

@@ -158,26 +158,16 @@ export default function OAuthManager() {
 
   return (
     <div className="space-y-10">
-      <div className="flex items-center gap-6">
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center group">
-          <Shield className="w-8 h-8 text-primary transition-ui" />
-        </div>
-        <div>
-          <SectionHeader
-            level="h2"
-            className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1"
-          >
-            Sign-in providers
-          </SectionHeader>
-          <div className="flex items-center gap-3">
-            <span className="text-xs font-semibold text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
-              Single sign-on
-            </span>
-            <span className="text-xs font-semibold text-muted-foreground/70">
-              OAuth 2.0
-            </span>
-          </div>
-        </div>
+      <div>
+        <SectionHeader
+          level="h2"
+          className="text-2xl font-semibold text-white tracking-tight"
+        >
+          Sign-in providers
+        </SectionHeader>
+        <p className="text-sm text-muted-foreground mt-2">
+          Sign in with an OAuth 2.0 provider instead of a password.
+        </p>
       </div>
 
       <div className="grid gap-6">
@@ -245,7 +235,7 @@ export default function OAuthManager() {
                         </div>
                       </div>
                     ) : (
-                      <p className="text-xs text-muted-foreground/60 font-bold">
+                      <p className="text-xs text-muted-foreground/60 font-medium">
                         No active credential link for {provider.name}
                       </p>
                     )}
@@ -300,8 +290,8 @@ export default function OAuthManager() {
       </div>
 
       <div className="bg-primary/5 border border-white/5 rounded-2xl p-8 flex items-start gap-8 hover:border-white/10 transition-ui group relative overflow-hidden">
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 transition-ui relative z-10">
-          <Shield className="w-8 h-8 text-primary" />
+        <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center shrink-0 transition-ui relative z-10">
+          <Shield className="w-7 h-7 text-primary" />
         </div>
         <div className="space-y-2 relative z-10">
           <h4 className="text-lg font-semibold text-white tracking-tight font-outfit">

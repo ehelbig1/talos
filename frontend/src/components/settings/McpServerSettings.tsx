@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from "react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
@@ -26,7 +27,6 @@ import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  Monitor,
   Bot,
   Info,
   Terminal,
@@ -147,42 +147,17 @@ export default function McpServerSettings() {
         onCancel={() => setRevokeConfirmId(null)}
       />
 
-      <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden group/header">
-        <div className="flex flex-col md:flex-row items-center justify-between gap-8 relative z-10">
-          <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-ui">
-              <Monitor size={32} />
-            </div>
-            <div className="space-y-1.5">
-              <h2 className="text-2xl md:text-3xl font-semibold text-white tracking-tight leading-tight">
-                Model Context Protocol
-              </h2>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full">
-                  <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-                  <span className="text-2xs text-primary font-semibold uppercase tracking-wider leading-none">
-                    MCP server running
-                  </span>
-                </div>
-                <div className="w-1 h-1 rounded-full bg-white/10" />
-                <span className="text-xs text-muted-foreground/70 font-medium leading-none">
-                  Let AI agents use Talos as a tool
-                </span>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4">
-            <div className="flex flex-col items-end gap-1">
-              <span className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
-                Schema version
-              </span>
-              <code className="text-xs font-mono text-primary font-bold">
-                V1.2.0-STABLE
-              </code>
-            </div>
-          </div>
-        </div>
+      <div>
+        <SectionHeader
+          level="h2"
+          className="text-2xl font-semibold text-white tracking-tight"
+        >
+          Model Context Protocol
+        </SectionHeader>
+        <p className="text-sm text-muted-foreground max-w-2xl mt-2">
+          Let AI agents use Talos as a tool. Create a key for each agent and
+          point it at the endpoint below.
+        </p>
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -349,11 +324,8 @@ export default function McpServerSettings() {
                 </div>
                 <div>
                   <h4 className="text-xl font-semibold text-white tracking-tight">
-                    Registry
-                  </h4>
-                  <p className="text-2xs text-muted-foreground/60 font-semibold uppercase tracking-wider">
                     Agents with access
-                  </p>
+                  </h4>
                 </div>
               </div>
               {agents.length > 0 && (

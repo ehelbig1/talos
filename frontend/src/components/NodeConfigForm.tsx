@@ -329,7 +329,7 @@ export const NodeConfigForm = React.memo(
               </div>
               {rhaiError && (
                 <div className="p-4 bg-destructive/5 border border-destructive/20 rounded-2xl">
-                  <p className="text-xs text-destructive flex items-center gap-2 font-bold">
+                  <p className="text-xs text-destructive flex items-center gap-2 font-medium">
                     <AlertCircle className="w-4 h-4 shrink-0" />
                     FAULT: {rhaiError}
                   </p>
@@ -598,7 +598,7 @@ export const NodeConfigForm = React.memo(
 
             {jsonError && (
               <div className="p-5 bg-destructive/5 border border-destructive/20 rounded-2xl">
-                <p className="text-xs text-destructive flex items-center gap-3 font-bold">
+                <p className="text-xs text-destructive flex items-center gap-3 font-medium">
                   <AlertCircle className="w-4 h-4 shrink-0" />
                   Invalid JSON: {jsonError}
                 </p>

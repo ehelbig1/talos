@@ -234,7 +234,7 @@ export function SlackAppCreator({
             </Section>
 
             <Section className="text-sm leading-relaxed">
-              <p className="mb-2 font-bold">How to get a user token:</p>
+              <p className="mb-2 font-medium">How to get a user token:</p>
               <ol className="ml-6 list-decimal">
                 <li>
                   Go to{" "}

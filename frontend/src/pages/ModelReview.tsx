@@ -96,7 +96,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
             Teacher ceiling
           </span>
         </div>
-        <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+        <p className="text-xs text-muted-foreground/60 font-medium mt-2">
           Not audited yet — run ml_teacher_audit to measure the teacher's
           accuracy against gold corrections.
         </p>
@@ -138,7 +138,7 @@ function TeacherCeilingCard({ audit }: { audit: unknown }) {
             Teacher ceiling — audit failed
           </span>
         </div>
-        <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+        <p className="text-xs text-muted-foreground/70 font-medium mt-2">
           {audit.error}
         </p>
       </div>
@@ -290,7 +290,7 @@ export default function ModelReview() {
               <p className="text-sm text-muted-foreground/50 font-semibold">
                 No models yet
               </p>
-              <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+              <p className="text-xs text-muted-foreground/60 font-medium mt-2">
                 Distilled classifiers appear here as they start learning.
               </p>
             </div>
@@ -390,7 +390,7 @@ export default function ModelReview() {
                   <p className="text-sm text-destructive/80 font-semibold">
                     Could not load the review queue
                   </p>
-                  <p className="text-xs text-muted-foreground/70 font-bold mt-2">
+                  <p className="text-xs text-muted-foreground/70 font-medium mt-2">
                     The pending count in the model list is still accurate.
                   </p>
                   <Button
@@ -408,7 +408,7 @@ export default function ModelReview() {
                   <p className="text-sm text-muted-foreground font-semibold">
                     All caught up
                   </p>
-                  <p className="text-xs text-muted-foreground/60 font-bold mt-2">
+                  <p className="text-xs text-muted-foreground/60 font-medium mt-2">
                     No disagreements waiting on your review.
                   </p>
                 </div>

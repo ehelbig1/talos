@@ -1,7 +1,8 @@
 import React, { useState } from "react";
 import { LoadingState } from "@/components/ui/spinner";
 import { toast } from "sonner";
-import { ExternalLink, HelpCircle } from "lucide-react";
+import { HelpCircle } from "lucide-react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { GoogleCalendarWatchChannels } from "./GoogleCalendarWatchChannels";
 import { GmailWatchChannels } from "./GmailWatchChannels";
 import { GoogleCloudWatchChannels } from "./GoogleCloudWatchChannels";
@@ -71,45 +72,24 @@ export function IntegrationsManager() {
   };
 
   return (
-    <div className="max-w-6xl mx-auto space-y-12">
-      <div className="relative group">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative z-10">
-          <div className="space-y-4">
-            <div className="flex items-center gap-5">
-              <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary transition-ui">
-                <ExternalLink size={28} />
-              </div>
-              <div className="flex flex-col">
-                <h2 className="text-3xl md:text-2xl font-semibold text-white tracking-tight">
-                  Integrations
-                </h2>
-                <div className="flex flex-wrap items-center gap-3 mt-2">
-                  <div className="flex items-center gap-2 bg-primary/10 border border-primary/20 px-3 py-1 rounded-full shrink-0">
-                    <div className="w-1.5 h-1.5 rounded-full bg-primary" />
-                    <span className="text-2xs text-primary font-semibold uppercase tracking-wider leading-none">
-                      Connected services
-                    </span>
-                  </div>
-                  <div className="hidden sm:block w-1 h-1 rounded-full bg-white/10 shrink-0" />
-                  <span className="text-xs text-muted-foreground/70 font-medium leading-none shrink-0">
-                    OAuth and API connections
-                  </span>
-                </div>
-              </div>
-            </div>
-            <p className="text-sm text-muted-foreground/60 leading-relaxed max-w-2xl font-medium">
-              Connect external services so workflows can read from them and
-              write to them. A connected account can start a workflow or be
-              called from one.
-            </p>
-          </div>
-        </div>
+    <div className="max-w-6xl mx-auto space-y-8">
+      <div>
+        <SectionHeader
+          level="h2"
+          className="text-2xl font-semibold text-white tracking-tight"
+        >
+          Integrations
+        </SectionHeader>
+        <p className="text-sm text-muted-foreground max-w-2xl mt-2">
+          Connect external services so workflows can read from them and write to
+          them. A connected account can start a workflow or be called from one.
+        </p>
       </div>
 
       {loadingServices ? (
         <LoadingState />
       ) : (
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
           {providers.map((provider) => (
             <ServiceCard
               key={provider.id}
@@ -166,7 +146,7 @@ export function IntegrationsManager() {
       {/* GitHub App (RFC 0008) — not a registry OAuth provider; bespoke card.
           Initiates the App install flow; the result toast is handled by the
           github_connected / github_error query-param effect above. */}
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
         <GithubAppCard
           installations={githubInstallations}
           onConnect={handleConnectGithub}
@@ -201,8 +181,8 @@ export function IntegrationsManager() {
       />
 
       <div className="p-10 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-ui">
-        <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-ui">
-          <HelpCircle size={32} />
+        <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-ui">
+          <HelpCircle size={28} />
         </div>
         <div className="space-y-2">
           <h4 className="text-xl font-semibold text-white tracking-tight">

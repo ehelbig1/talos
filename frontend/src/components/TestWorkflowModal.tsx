@@ -442,8 +442,8 @@ export function TestWorkflowModal({
         <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {phase === "idle" && !testMutation.isPending && (
             <div className="flex flex-col items-center justify-center py-16 text-center px-6 opacity-60">
-              <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6">
-                <Terminal size={32} className="text-muted-foreground" />
+              <div className="w-14 h-14 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6">
+                <Terminal size={28} className="text-muted-foreground" />
               </div>
               <p className="text-xs font-semibold text-muted-foreground">
                 Awaiting Diagnostic Initiation
@@ -525,7 +525,7 @@ export function TestWorkflowModal({
                     <p className="text-xs font-semibold text-destructive">
                       Orchestration Failure
                     </p>
-                    <p className="text-xs text-destructive/80 leading-relaxed font-mono font-bold">
+                    <p className="text-xs text-destructive/80 leading-relaxed font-mono font-medium">
                       {sanitizeErrorMessage(runError)}
                     </p>
                   </div>

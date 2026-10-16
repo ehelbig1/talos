@@ -205,9 +205,9 @@ export function ModuleBuilder({
               <Shield className="w-6 h-6 shrink-0" />
               <div className="space-y-1">
                 <p className="text-sm font-semibold tracking-tight font-outfit">
-                  Template Corruption Detected
+                  The template could not be loaded
                 </p>
-                <p className="text-xs font-bold opacity-60 leading-relaxed">
+                <p className="text-xs opacity-80 leading-relaxed">
                   {sanitizeErrorMessage((templateError as Error).message)}
                 </p>
               </div>
@@ -317,12 +317,12 @@ export function ModuleBuilder({
 
               {isWebhookTemplate && (
                 <div className="relative group/webhook">
-                  <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-2xl space-y-10 bg-surface-3 border border-white/10">
+                  <div className="relative p-6 bg-surface-3 border border-white/10 rounded-2xl space-y-6">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
                         <Webhook className="h-5 w-5 text-primary" />
                         <h3 className="text-xs font-semibold text-primary">
-                          Webhook Orchestration
+                          Webhook
                         </h3>
                       </div>
                       <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
@@ -408,7 +408,7 @@ export function ModuleBuilder({
                             {webhookSettings.allowedIps.map((ip, index) => (
                               <span
                                 key={ip}
-                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-primary"
+                                className="px-3 py-1.5 bg-surface-3/80 border border-white/10 rounded-xl text-xs font-mono flex items-center gap-2 text-foreground"
                               >
                                 {ip}
                                 <button
@@ -586,7 +586,7 @@ function WebhookSuccessView({
                 <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-ui">
                   {idx + 1}
                 </span>
-                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-ui">
+                <p className="text-sm text-muted-foreground leading-relaxed pt-1 group-hover:text-white transition-ui">
                   {step.text}{" "}
                   {step.link && (
                     <a
@@ -624,7 +624,7 @@ function WebhookSuccessView({
                 <span className="shrink-0 w-8 h-8 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center text-xs font-semibold text-muted-foreground/70 group-hover:text-white group-hover:border-primary/40 transition-ui">
                   {idx + 1}
                 </span>
-                <p className="text-sm font-bold text-muted-foreground/60 leading-relaxed pt-1 group-hover:text-white transition-ui">
+                <p className="text-sm text-muted-foreground leading-relaxed pt-1 group-hover:text-white transition-ui">
                   {step}
                 </p>
               </li>

@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Dialog } from "@/components/ui/dialog";
 import { LoadingState } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
@@ -20,7 +21,6 @@ import { formatDate } from "@/lib/format";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  Key,
   Plus,
   ShieldCheck,
   Eye,
@@ -228,19 +228,17 @@ function SecretsManager() {
       )}
 
       <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-8 relative group">
-        <div className="flex items-center gap-6 relative z-10">
-          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
-            <Key className="w-8 h-8 text-primary" />
-          </div>
-          <div className="flex flex-col">
-            <h2 className="text-2xl font-semibold text-white tracking-tight">
-              Secrets
-            </h2>
-            <p className="text-sm text-muted-foreground mt-1">
-              API keys and tokens, encrypted at rest. Modules read them without
-              seeing the value.
-            </p>
-          </div>
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            Secrets
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            API keys and tokens, encrypted at rest. Modules read them without
+            seeing the value.
+          </p>
         </div>
 
         <Button onClick={() => setShowCreate(true)}>
@@ -424,26 +422,17 @@ function SecretsManager() {
       <div className="bg-warning/5 border border-warning/20 rounded-2xl p-12 group relative overflow-hidden transition-ui hover:border-warning/40">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-8 relative z-10">
           <div className="flex-1 space-y-6">
-            <div className="flex items-center gap-6">
-              <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center transition-ui">
-                <ShieldCheck className="w-8 h-8 text-warning" />
+            <div className="flex items-center gap-4">
+              <div className="w-12 h-12 shrink-0 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center">
+                <ShieldCheck className="w-6 h-6 text-warning" />
               </div>
               <div className="flex flex-col">
-                <h4 className="text-2xl font-semibold text-white tracking-tight">
+                <h4 className="text-xl font-semibold text-white tracking-tight">
                   Master encryption key
                 </h4>
-                <div className="flex items-center gap-3 mt-1.5">
-                  <div className="flex items-center gap-2 bg-warning/10 border border-warning/20 px-3 py-1 rounded-full">
-                    <div className="w-1.5 h-1.5 rounded-full bg-warning" />
-                    <span className="text-2xs text-warning font-semibold uppercase tracking-wider leading-none">
-                      High impact
-                    </span>
-                  </div>
-                  <div className="w-1 h-1 rounded-full bg-warning/30" />
-                  <span className="text-xs text-muted-foreground/70 font-medium leading-none">
-                    Rotation re-encrypts every secret
-                  </span>
-                </div>
+                <p className="text-sm text-muted-foreground mt-1">
+                  High impact: rotation re-encrypts every secret.
+                </p>
               </div>
             </div>
             <p className="text-sm text-muted-foreground/60 leading-relaxed max-w-3xl font-medium">

@@ -22,7 +22,7 @@ export const NodeErrorOverlay: React.FC<NodeErrorOverlayProps> = ({
         </p>
       </div>
       {fixSuggestion && (
-        <p className="text-xs text-warning font-bold tracking-tight pl-5">
+        <p className="text-xs text-warning font-medium tracking-tight pl-5">
           PROPOSAL: {fixSuggestion}
         </p>
       )}

@@ -390,8 +390,8 @@ export default function Settings() {
                   className="bg-surface-3/40 border border-white/5 rounded-2xl p-10"
                 >
                   <div className="flex items-center gap-6">
-                    <div className="w-16 h-16 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shrink-0">
-                      <UserIcon className="w-8 h-8 text-primary" />
+                    <div className="w-14 h-14 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shrink-0">
+                      <UserIcon className="w-7 h-7 text-primary" />
                     </div>
                     <div className="min-w-0">
                       <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 block">

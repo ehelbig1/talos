@@ -21,7 +21,7 @@ import {
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
-import { Building2, Plus } from "lucide-react";
+import { Plus } from "lucide-react";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { useAuth } from "@/contexts/AuthContext";
@@ -178,27 +178,22 @@ export default function OrganizationsManager() {
   return (
     <div className="max-w-6xl mx-auto py-4 space-y-10">
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
-        <div className="flex items-center gap-6">
-          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary relative group">
-            <Building2 size={32} className="relative z-10 transition-ui" />
-          </div>
-          <div>
-            <SectionHeader
-              level="h2"
-              className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1 leading-tight"
-            >
-              Organizations
-            </SectionHeader>
-            <p className="text-xs text-muted-foreground/70 font-semibold">
-              Shared workspaces and team roles
-            </p>
-          </div>
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            Organizations
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            Shared workspaces and team roles.
+          </p>
         </div>
         <Button
           onClick={() => setShowCreate(true)}
-          className="h-14 px-8 rounded-2xl flex items-center gap-3 w-full md:w-auto"
+          className="w-full md:w-auto"
         >
-          <Plus className="w-5 h-5" />
+          <Plus className="w-4 h-4" />
           New organization
         </Button>
       </div>

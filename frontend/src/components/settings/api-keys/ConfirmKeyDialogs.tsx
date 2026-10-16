@@ -26,8 +26,8 @@ export function RevokeKeyDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
-            <Shield size={32} />
+          <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
+            <Shield size={28} />
           </div>
           <div>
             <h3 className="text-xl font-bold text-white tracking-tight">
@@ -78,8 +78,8 @@ export function RotateKeyDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary mx-auto">
-            <RefreshCw size={32} />
+          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary mx-auto">
+            <RefreshCw size={28} />
           </div>
           <div>
             <h3 className="text-xl font-bold text-white tracking-tight">
@@ -146,8 +146,8 @@ export function DeleteKeyDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="p-8 text-center space-y-4">
-          <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive mx-auto">
-            <Trash2 size={32} />
+          <div className="w-14 h-14 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive mx-auto">
+            <Trash2 size={28} />
           </div>
           <div>
             <h3 className="text-xl font-bold text-white tracking-tight">

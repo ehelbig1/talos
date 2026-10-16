@@ -3,45 +3,9 @@ import { Textarea } from "@/components/ui/textarea";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Brain, ShieldCheck, ChevronDown, Activity } from "lucide-react";
+import { Brain, ChevronDown, Activity } from "lucide-react";
 import { CopyField } from "@/components/ui";
-import { cn } from "@/lib/utils";
 import type { WorkflowNodeData } from "@/store/workflowStore";
-
-export function CapabilityBadge({
-  capability,
-  importedInterfaces,
-}: {
-  capability: string;
-  importedInterfaces?: string[];
-}) {
-  const visuals = {
-    bgColor: "bg-primary/10",
-    borderColor: "border-primary/20",
-    color: "text-primary",
-    icon: ShieldCheck,
-    label: capability,
-  };
-
-  return (
-    <div
-      className={cn(
-        "inline-flex items-center gap-2.5 px-3 py-1.5 rounded-full border text-2xs font-semibold tracking-wider uppercase transition-ui group overflow-hidden relative",
-        visuals.bgColor,
-        visuals.borderColor,
-        visuals.color,
-      )}
-    >
-      <visuals.icon className="w-3.5 h-3.5 relative z-10" />
-      <span className="relative z-10">{visuals.label}</span>
-      {importedInterfaces && importedInterfaces.length > 0 && (
-        <span className="opacity-40 ml-1 font-bold relative z-10">
-          [{importedInterfaces.length}]
-        </span>
-      )}
-    </div>
-  );
-}
 
 export function LlmConfigSection({
   nodeId,

@@ -31,7 +31,7 @@ export function NewKeyDialog({
               <h3 className="text-lg font-bold text-warning tracking-tight">
                 Key Generated
               </h3>
-              <p className="text-xs text-warning font-bold leading-none mt-1">
+              <p className="text-xs text-warning font-medium leading-none mt-1">
                 One-time security display
               </p>
             </div>

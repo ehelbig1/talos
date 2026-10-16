@@ -328,7 +328,7 @@ export default function WorkflowVersionsPanel({
                         v{entry.versionNumber}
                       </div>
                       <div className="flex-1 pt-1.5 min-w-0">
-                        <p className="text-sm font-bold text-white group-hover:text-primary transition-ui">
+                        <p className="text-sm font-medium text-white group-hover:text-primary transition-ui">
                           {entry.summary}
                         </p>
                         {entry.description && (
@@ -450,7 +450,7 @@ export default function WorkflowVersionsPanel({
                     <h4 className="text-sm font-semibold text-white tracking-tight">
                       Capability Ceiling
                     </h4>
-                    <p className="text-xs font-bold text-muted-foreground/70 mt-1">
+                    <p className="text-xs font-medium text-muted-foreground/70 mt-1">
                       Max simultaneous executions. Null for unbounded capacity.
                     </p>
                   </div>
@@ -518,7 +518,7 @@ export default function WorkflowVersionsPanel({
           className="max-w-sm"
         >
           <div className="p-2 text-center space-y-6">
-            <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
+            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
               <RotateCcw size={28} />
             </div>
             <div>

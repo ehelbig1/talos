@@ -388,7 +388,7 @@ const Terminal = () => {
             </div>
             <div className="text-center">
               <p className="text-xs font-semibold mb-2">Idle</p>
-              <p className="text-xs font-bold">
+              <p className="text-xs font-medium">
                 Run a workflow to see its output here
               </p>
             </div>

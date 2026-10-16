@@ -74,7 +74,7 @@ export function SuggestionsBanner({
               <li key={s.field} className="flex gap-4 items-start group/s">
                 <div className="mt-1 w-1.5 h-1.5 rounded-full bg-primary/40 group-hover/s:bg-primary transition-ui" />
                 <div className="space-y-1">
-                  <p className="text-xs font-bold text-white/60">
+                  <p className="text-xs font-medium text-white/60">
                     Override <span className="text-primary">{s.field}</span>{" "}
                     with{" "}
                     <code className="px-1.5 py-0.5 bg-white/5 rounded font-mono text-primary/80">
