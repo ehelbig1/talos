@@ -448,7 +448,7 @@ function WorkflowHealth() {
             ))}
           </div>
         ) : sorted.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-24 text-center">
+          <div className="flex flex-col items-center justify-center py-16 text-center">
             <Activity className="w-16 h-16 text-muted-foreground/30 mb-6" />
             <p className="text-sm text-muted-foreground">
               No runs in the last 7 days
@@ -605,7 +605,7 @@ export default function Health() {
         />
 
         {/* Stat cards */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-12">
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6 mb-8">
           <StatCard
             label="Workflows"
             value={workflows?.length ?? "—"}
@@ -652,7 +652,7 @@ export default function Health() {
         </div>
 
         {/* Main grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-12">
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 mb-8">
           {/* Workflow health — spans 2 columns */}
           <div className="lg:col-span-2">
             <WorkflowHealth />

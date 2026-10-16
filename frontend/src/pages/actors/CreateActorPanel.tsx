@@ -314,7 +314,7 @@ export function CreateActorPanel({
         <div className="flex-1 overflow-y-auto px-10 py-10 custom-scrollbar">
           {/* Step 0: Template + Identity */}
           {step === 0 && (
-            <div className="flex flex-col gap-10">
+            <div className="flex flex-col gap-6">
               {/* Template selection */}
               <div className="space-y-6">
                 <div className="flex items-center gap-3">
@@ -403,7 +403,7 @@ export function CreateActorPanel({
 
           {/* Step 1: Review & Create */}
           {step === 1 && (
-            <div className="flex flex-col gap-10">
+            <div className="flex flex-col gap-6">
               {/* Summary card */}
               <div className="rounded-2xl border border-white/5 bg-white/5 p-10 bg-white/[0.03] border border-white/5 relative overflow-hidden">
                 <p className="text-xs font-semibold text-muted-foreground/50 mb-8 relative z-10">
@@ -460,7 +460,7 @@ export function CreateActorPanel({
               </button>
 
               {showAdvanced && (
-                <div className="flex flex-col gap-10">
+                <div className="flex flex-col gap-6">
                   {/* Capability ceiling */}
                   <div className="space-y-6">
                     <div>

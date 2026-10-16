@@ -33,7 +33,7 @@ export function RoleChangeDialog({
           </p>
         </div>
 
-        <div className="flex items-center justify-center gap-12 py-4 relative">
+        <div className="flex items-center justify-center gap-8 py-4 relative">
           <div className="flex flex-col items-center gap-3">
             <div className="text-xs font-semibold text-muted-foreground/60 mb-1">
               Current

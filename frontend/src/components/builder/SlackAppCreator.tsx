@@ -134,7 +134,7 @@ export function SlackAppCreator({
       <div className="bg-surface-3/60 rounded-xl max-w-2xl w-11/12 max-h-[90vh] overflow-auto p-8">
         {/* Header */}
         <div className="mb-8 text-center">
-          <div className="text-4xl mb-4">🚀</div>
+          <div className="text-2xl mb-4">🚀</div>
           <SectionHeader level="h2" className="m-0 text-xl text-foreground">
             Create Slack App
           </SectionHeader>
@@ -306,7 +306,7 @@ export function SlackAppCreator({
         {/* Creating Step */}
         {step === "creating" && (
           <div className="text-center py-8">
-            <div className="text-5xl mb-4">⏳</div>
+            <div className="text-3xl mb-4">⏳</div>
             <SectionHeader level="h3" className="mb-2">
               Creating Your Slack App...
             </SectionHeader>

@@ -182,7 +182,7 @@ export function TemplateLibrary({
               </div>
             )}
             {!isLoading && filteredTemplates.length === 0 && (
-              <div className="col-span-full py-32 flex flex-col items-center gap-6 opacity-10 grayscale">
+              <div className="col-span-full py-16 flex flex-col items-center gap-6 opacity-60">
                 <div className="p-8 rounded-2xl bg-surface-3/40 border border-white/5">
                   <Star size={48} className="stroke-[1px]" />
                 </div>

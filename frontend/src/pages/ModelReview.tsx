@@ -285,7 +285,7 @@ export default function ModelReview() {
               ))}
             </div>
           ) : models.length === 0 ? (
-            <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
+            <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
               <BrainCircuit className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
               <p className="text-sm text-muted-foreground/50 font-semibold">
                 No models yet
@@ -386,7 +386,7 @@ export default function ModelReview() {
                 // that silently hides work (found live 2026-07-14: a
                 // schema/query version skew errored the feed while the
                 // badge showed 10 pending).
-                <div className="text-center py-24 bg-white/[0.01] border border-dashed border-destructive/20 rounded-2xl">
+                <div className="text-center py-16 bg-white/[0.01] border border-dashed border-destructive/20 rounded-2xl">
                   <p className="text-sm text-destructive/80 font-semibold">
                     Could not load the review queue
                   </p>
@@ -403,7 +403,7 @@ export default function ModelReview() {
                   </Button>
                 </div>
               ) : pending.length === 0 ? (
-                <div className="text-center py-24 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl group">
+                <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl group">
                   <CheckCircle2 className="w-16 h-16 text-success/25 mb-6 mx-auto group-hover:text-success/50 transition-ui" />
                   <p className="text-sm text-muted-foreground font-semibold">
                     All caught up

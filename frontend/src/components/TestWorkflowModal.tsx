@@ -441,7 +441,7 @@ export function TestWorkflowModal({
         {/* Results */}
         <div className="max-h-[460px] overflow-y-auto custom-scrollbar border border-white/5 rounded-2xl bg-surface-4/20">
           {phase === "idle" && !testMutation.isPending && (
-            <div className="flex flex-col items-center justify-center py-24 text-center px-6 opacity-20">
+            <div className="flex flex-col items-center justify-center py-16 text-center px-6 opacity-60">
               <div className="w-16 h-16 rounded-2xl bg-surface-3 border border-white/5 flex items-center justify-center mb-6">
                 <Terminal size={32} className="text-muted-foreground" />
               </div>

@@ -203,7 +203,7 @@ export default function OrganizationsManager() {
         </Button>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-10">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
         <OrgListSidebar
           organizations={organizations}
           isLoading={isLoadingOrgs}

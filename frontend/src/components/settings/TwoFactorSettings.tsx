@@ -126,7 +126,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
   return (
     <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
       <div className="relative z-10">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-12">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-8">
           <div className="flex items-center gap-6">
             <div
               className={cn(
@@ -239,7 +239,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           </div>
         ) : step === "setup" && setupData ? (
           <div className="space-y-10">
-            <div className="flex flex-col lg:flex-row items-stretch gap-10">
+            <div className="flex flex-col lg:flex-row items-stretch gap-6">
               <div className="bg-white p-6 rounded-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
                 <img
                   src={qrCodeImageSrc(setupData.qrCodePng)}
@@ -309,7 +309,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                 Cancel
               </Button>
               <Button
-                className="px-12 h-14 rounded-xl"
+                className="px-6 h-14 rounded-xl"
                 onClick={() => setStep("verify")}
               >
                 Next <ArrowRight className="w-4 h-4 ml-3" />
@@ -319,7 +319,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
         ) : step === "verify" ? (
           <div className="space-y-10 max-w-md mx-auto py-4">
             <div className="text-center space-y-6">
-              <div className="w-24 h-24 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-8 border border-primary/20 relative group">
+              <div className="w-14 h-14 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-8 border border-primary/20 relative group">
                 <QrCode className="w-12 h-12 text-primary relative z-10" />
               </div>
               <h4 className="text-2xl font-semibold text-white tracking-tight font-outfit">
@@ -336,7 +336,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
                   type="text"
                   placeholder="000000"
                   maxLength={6}
-                  className="text-center text-4xl tracking-[0.8em] font-semibold h-24 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-2xl transition-ui text-white placeholder:text-white/5"
+                  className="text-center text-2xl tracking-[0.5em] font-semibold h-14 bg-black/40 border-white/5 focus:border-primary/40 focus:ring-primary/10 rounded-2xl transition-ui text-white placeholder:text-white/5"
                   value={verificationCode}
                   onChange={(e) =>
                     setVerificationCode(e.target.value.replace(/\D/g, ""))

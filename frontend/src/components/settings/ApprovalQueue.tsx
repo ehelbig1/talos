@@ -74,7 +74,7 @@ export function ApprovalQueue() {
   if (isLoading) {
     return (
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
-        <div className="h-4 w-48 bg-white/5 rounded-full mb-10" />
+        <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-4">
           {[1, 2].map((i) => (
             <div
@@ -93,7 +93,7 @@ export function ApprovalQueue() {
   return (
     <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
       {/* Header */}
-      <div className="flex items-center justify-between mb-10 relative z-10">
+      <div className="flex items-center justify-between mb-6 relative z-10">
         <div className="flex items-center gap-5">
           <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center">
             <UserCheck className="w-7 h-7 text-warning" />
@@ -155,7 +155,7 @@ export function ApprovalQueue() {
       {activeTab === "pending" ? (
         <div className="space-y-4 relative z-10">
           {pending.length === 0 ? (
-            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
+            <div className="text-center py-12 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
               <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-ui" />
               <p className="text-sm text-muted-foreground font-semibold">
                 All Systems Authorized
@@ -219,7 +219,7 @@ export function ApprovalQueue() {
       ) : (
         <div className="space-y-4 relative z-10">
           {decided.length === 0 ? (
-            <div className="text-center py-20 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
+            <div className="text-center py-12 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
               <History className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
               <p className="text-sm text-muted-foreground/70 font-semibold">
                 Archive Empty

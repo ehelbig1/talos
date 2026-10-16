@@ -218,7 +218,7 @@ export default function Actors() {
           />
           {/* Operational Telemetry Header */}
           {actors.length > 0 && (
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 border border-white/5 rounded-2xl mb-10">
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 border border-white/5 rounded-2xl mb-6">
               {[
                 {
                   label: "Actors",
@@ -316,7 +316,7 @@ export default function Actors() {
 
         <div className="pt-8">
           {isLoading ? (
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
               {[0, 1, 2, 3, 4, 5].map((i) => (
                 <div
                   key={i}
@@ -325,8 +325,8 @@ export default function Actors() {
               ))}
             </div>
           ) : error ? (
-            <div className="flex flex-col items-center justify-center py-40 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10 max-w-4xl mx-auto">
-              <div className="w-24 h-24 rounded-2xl bg-destructive/10 border border-destructive/20 flex items-center justify-center mb-10 relative">
+            <div className="flex flex-col items-center justify-center py-16 bg-surface-3/20 border border-white/5 rounded-2xl bg-surface-3 border border-white/10 max-w-4xl mx-auto">
+              <div className="w-14 h-14 rounded-2xl bg-destructive/10 border border-destructive/20 flex items-center justify-center mb-6 relative">
                 <X className="w-12 h-12 text-destructive relative z-10" />
               </div>
               <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
@@ -357,9 +357,9 @@ export default function Actors() {
               </Button>
             </div>
           ) : (
-            <div className="space-y-20">
+            <div className="space-y-10">
               {liveActors.length > 0 && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
                   {liveActors.map((actor) => (
                     <ActorCard
                       key={actor.id}
@@ -415,7 +415,7 @@ export default function Actors() {
                       </span>
                     </div>
                   </summary>
-                  <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10 opacity-40 hover:opacity-100 transition-ui grayscale group-hover:grayscale-0">
+                  <div className="mt-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6 opacity-40 hover:opacity-100 transition-ui grayscale group-hover:grayscale-0">
                     {terminatedActors.map((actor) => (
                       <ActorCard
                         key={actor.id}

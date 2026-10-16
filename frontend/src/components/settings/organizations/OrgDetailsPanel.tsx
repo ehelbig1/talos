@@ -44,7 +44,7 @@ export function OrgDetailsPanel({
   return (
     <div className="space-y-8">
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
-        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-10 relative z-10">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-6 relative z-10">
           <div className="flex items-center gap-6">
             <div className="w-16 h-16 bg-white/5 border border-white/10 rounded-2xl flex items-center justify-center text-3xl font-semibold font-outfit text-white">
               {selectedOrg?.name.charAt(0).toUpperCase()}

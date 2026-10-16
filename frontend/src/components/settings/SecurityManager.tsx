@@ -421,7 +421,7 @@ function RotateMasterKeyCard() {
           <Button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="h-16 px-12 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
+            className="h-12 px-6 rounded-2xl bg-destructive/10 hover:bg-destructive text-destructive hover:text-black border border-destructive/20 transition-ui"
           >
             {mutation.isPending ? (
               <div className="flex items-center gap-3">
