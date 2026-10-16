@@ -17,7 +17,10 @@ fails=0
 check() { # check <label> <expected> <actual>
     if [ "$2" = "$3" ]; then printf '  ok   %s\n' "$1"; else printf '  FAIL %s\n       expected: %s\n       actual:   %s\n' "$1" "$2" "$3"; fails=$((fails+1)); fi
 }
-has() { if printf '%s' "$1" | grep -qF -- "$2"; then echo yes; else echo no; fi; }
+# A substring test in the shell itself. Not `printf | grep -q`: under pipefail,
+# grep -q exiting at its first match can leave printf a broken pipe, and the
+# pipeline then reports a match as "no" (seen on CI, 2026-10-16).
+has() { if [[ "$1" == *"$2"* ]]; then echo yes; else echo no; fi; }
 line_of() { printf '%s\n' "$1" | grep -nF -- "$2" | head -1 | cut -d: -f1; }
 
 T="$(mktemp -d)"

@@ -101,10 +101,10 @@ else
         printf '%s' "$plist" | sed "s#<key>PATH</key><string>[^<]*</string>#<key>PATH</key><string>/nonexistent:/also-nonexistent</string>#" \
             > "$T/home/Library/LaunchAgents/$label.plist"
         st="$(HOME="$T/home" PATH="$TOOL_PATH:/usr/sbin:/sbin" bash "$REPO/scripts/$script" status 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g')"
-        check "status reports an unresolving PATH as broken" yes "$(printf '%s' "$st" | grep -q "cannot find: $t1 $t2" && echo yes || echo no)"
+        check "status reports an unresolving PATH as broken" yes "$([[ "$st" == *"cannot find: $t1 $t2"* ]] && echo yes || echo no)"
         printf '%s' "$plist" > "$T/home/Library/LaunchAgents/$label.plist"
         st="$(HOME="$T/home" PATH="$TOOL_PATH:/usr/sbin:/sbin" bash "$REPO/scripts/$script" status 2>&1 | sed -E 's/\x1b\[[0-9;]*m//g')"
-        check "status reports a rendered PATH as resolving" yes "$(printf '%s' "$st" | grep -q "PATH resolves $t1" && echo yes || echo no)"
+        check "status reports a rendered PATH as resolving" yes "$([[ "$st" == *"PATH resolves $t1"* ]] && echo yes || echo no)"
         rm -f "$T/home/Library/LaunchAgents/$label.plist"
     done
 
@@ -187,7 +187,7 @@ else
         AWS_ACCESS_KEY_ID=keyid-is-configuration \
         bash "$DRILL" render 2>/dev/null)"
     check "the bucket SECRET never reaches the plist" no \
-        "$(printf '%s' "$credplist" | grep -qE 'sekrit-must-not-be-propagated|AWS_SECRET_ACCESS_KEY' && echo yes || echo no)"
+        "$([[ "$credplist" == *sekrit-must-not-be-propagated* || "$credplist" == *AWS_SECRET_ACCESS_KEY* ]] && echo yes || echo no)"
     check "the key id (not a secret) is carried" keyid-is-configuration \
         "$(printf '%s' "$credplist" | plutil -extract EnvironmentVariables.AWS_ACCESS_KEY_ID raw -o - - 2>/dev/null)"
 
@@ -214,7 +214,7 @@ else
     for v in "${OFFHOST_PLIST_ENV_VARS[@]}"; do
         [[ "$v" == TALOS_OFFHOST_AGE_PASSPHRASE_FILE ]] && continue
         check "both schedulers carry $v" "yes yes" \
-            "$(printf '%s' "$dplist" | grep -q "<key>$v</key>" && printf yes || printf no) $(printf '%s' "$oplist" | grep -q "<key>$v</key>" && printf yes || printf no)"
+            "$([[ "$dplist" == *"<key>$v</key>"* ]] && printf yes || printf no) $([[ "$oplist" == *"<key>$v</key>"* ]] && printf yes || printf no)"
     done
 fi
 
