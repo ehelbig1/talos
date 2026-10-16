@@ -7,7 +7,7 @@
   "capability_world": "secrets-node",
   "block": {"role": "decider"},
   "allowed_hosts": [],
-  "allowed_secrets": [],
+  "requires_secrets": [],
   "recommended_fuel": {
     "expected_items": 50,
     "bytes_per_item": 2000,

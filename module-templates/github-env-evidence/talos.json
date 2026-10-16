@@ -1,0 +1,55 @@
+{
+  "name": "github-env-evidence",
+  "version": "v1.0.0",
+  "display_name": "GitHub: Environment Protection Evidence",
+  "description": "Reads how an organisation's GitHub repositories protect their deployment environments, for github-env-check. GET only on api.github.com, bounded.",
+  "category": "Security",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "api.github.com"
+  ],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer ' and a vault reference to a GitHub App installation token: 'Bearer vault://github_app:<owner>'. The controller mints it at dispatch. Grant the installed copy that exact path (it has no default grant)."
+      },
+      "OWNER": {
+        "type": "string",
+        "description": "The GitHub organisation (or user) the App is installed on."
+      }
+    },
+    "required": [
+      "AUTH_HEADER",
+      "OWNER"
+    ]
+  },
+  "block": {
+    "role": "reader"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Install the GitHub App",
+      "detail": "On the organisation, with the repository permissions \"Actions: read\" and nothing else."
+    },
+    {
+      "step": 2,
+      "title": "Configure and grant",
+      "detail": "Set AUTH_HEADER and OWNER on the node, and grant the installed copy exactly github_app:<owner>."
+    }
+  ],
+  "recommended_fuel": {
+    "expected_items": 70,
+    "bytes_per_item": 3000,
+    "fuel_per_byte": 11,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0
+  }
+}

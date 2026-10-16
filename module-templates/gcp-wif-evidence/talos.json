@@ -1,0 +1,68 @@
+{
+  "name": "gcp-wif-evidence",
+  "version": "v1.0.0",
+  "display_name": "GCP: Workload Identity Federation Evidence",
+  "description": "Reads one Google Cloud project's Workload Identity Federation facts for wif-check: pools and providers, impersonation grants, project roles, audit-log config and alert filters. GET only, bounded.",
+  "category": "Security",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "cloudasset.googleapis.com",
+    "iam.googleapis.com",
+    "logging.googleapis.com",
+    "monitoring.googleapis.com"
+  ],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [
+    "gcp/impersonated/*"
+  ],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer ' and a vault reference to an impersonated read-only service account's token: 'Bearer vault://gcp/impersonated/<reader-sa>@<project>.iam.gserviceaccount.com/access_token'. The controller mints it at dispatch. Grant the installed copy that one path."
+      },
+      "PROJECT": {
+        "type": "string",
+        "description": "The Google Cloud project to read, by id."
+      }
+    },
+    "required": [
+      "AUTH_HEADER",
+      "PROJECT"
+    ]
+  },
+  "dependencies": {
+    "sha2": "0.10"
+  },
+  "block": {
+    "role": "reader"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a read-only reader account",
+      "detail": "In the project, a service account the controller may impersonate, holding only: listing the project's workload identity pools and their providers (iam.googleapis.com), searching the IAM policies of the project and its service accounts (cloudasset.googleapis.com), and listing its alerting policies (monitoring.googleapis.com) and log-based metrics (logging.googleapis.com); for example roles/iam.workloadIdentityPoolViewer, roles/cloudasset.viewer, roles/monitoring.viewer and roles/logging.viewer."
+    },
+    {
+      "step": 2,
+      "title": "Connect Google Cloud",
+      "detail": "Complete the Google Cloud (full) connection, so the controller can mint the impersonated token at dispatch."
+    },
+    {
+      "step": 3,
+      "title": "Configure and grant",
+      "detail": "Set AUTH_HEADER and PROJECT on the node, and grant the installed copy the one gcp/impersonated/<reader-sa>/access_token path."
+    }
+  ],
+  "recommended_fuel": {
+    "expected_items": 30,
+    "bytes_per_item": 30000,
+    "fuel_per_byte": 11,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0
+  }
+}

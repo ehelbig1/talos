@@ -1,0 +1,74 @@
+{
+  "name": "gcp-alerting-evidence",
+  "version": "v1.0.0",
+  "display_name": "GCP: Security Alerting Evidence",
+  "description": "Reads one Google Cloud project's notification channels and selected alert policies for security-alerting-check, handing on email addresses only as fingerprints. GET only, bounded.",
+  "category": "Security",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "monitoring.googleapis.com"
+  ],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [
+    "gcp/impersonated/*"
+  ],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer ' and a vault reference to an impersonated read-only service account's token: 'Bearer vault://gcp/impersonated/<reader-sa>@<project>.iam.gserviceaccount.com/access_token'. The controller mints it at dispatch. Grant the installed copy that one path."
+      },
+      "PROJECT": {
+        "type": "string",
+        "description": "The Google Cloud project to read, by id."
+      },
+      "SECURITY_GROUP_EMAIL": {
+        "type": "string",
+        "description": "The security group's email address. It is handed on only as a SHA-256 fingerprint of the trimmed, lower-cased address, never in plain."
+      },
+      "ALERT_POLICY_SELECTOR": {
+        "type": "object",
+        "description": "Which alerting policies are the security alerts: {\"label\": \"<key>=<value>\"} or {\"display_name_prefix\": \"<prefix>\"}, one form only. Absent or malformed, the policies are left unread (and the check's alert rules not assessed); the channels are still read."
+      }
+    },
+    "required": [
+      "AUTH_HEADER",
+      "PROJECT",
+      "SECURITY_GROUP_EMAIL"
+    ]
+  },
+  "dependencies": {
+    "sha2": "0.10"
+  },
+  "block": {
+    "role": "reader"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a read-only reader account",
+      "detail": "In the project, a service account the controller may impersonate, holding only: monitoring.notificationChannels.list and monitoring.alertPolicies.list (both in roles/monitoring.viewer)."
+    },
+    {
+      "step": 2,
+      "title": "Connect Google Cloud",
+      "detail": "Complete the Google Cloud (full) connection, so the controller can mint the impersonated token at dispatch."
+    },
+    {
+      "step": 3,
+      "title": "Configure and grant",
+      "detail": "Set AUTH_HEADER and PROJECT on the node, and grant the installed copy the one gcp/impersonated/<reader-sa>/access_token path."
+    }
+  ],
+  "recommended_fuel": {
+    "expected_items": 8,
+    "bytes_per_item": 60000,
+    "fuel_per_byte": 11,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0
+  }
+}

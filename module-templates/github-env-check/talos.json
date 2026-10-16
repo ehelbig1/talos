@@ -1,0 +1,53 @@
+{
+  "name": "github-env-check",
+  "version": "v1.0.0",
+  "display_name": "Security: GitHub Environment Protection Check",
+  "description": "Judges how an organisation's GitHub repositories protect their deployment environments (required reviewers, self-review, branch rules, admin bypass), from a reader's evidence. Fixed rules; calls nothing.",
+  "category": "Security",
+  "capability_world": "minimal-node",
+  "allowed_hosts": [],
+  "allowed_methods": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "ACCEPTED": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [],
+        "description": "Findings the owner decided are acceptable, each written \"rule:severity:subject\" exactly as the check reported it. An accepted finding is reported as accepted, never dropped."
+      },
+      "CATALOGUE_ONLY": {
+        "type": "boolean",
+        "default": false,
+        "description": "Return the check's catalogue (every rule, its severity, task, remedy, limits and the published source it rests on) and judge nothing."
+      },
+      "PRODUCTION": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "default": [
+          "prod",
+          "production",
+          "prd",
+          "live"
+        ],
+        "description": "The words that mark an environment's name as production."
+      }
+    }
+  },
+  "block": {
+    "role": "decider"
+  },
+  "recommended_fuel": {
+    "expected_items": 1,
+    "bytes_per_item": 300000,
+    "fuel_per_byte": 100,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 1.5
+  }
+}

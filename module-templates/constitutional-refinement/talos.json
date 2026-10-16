@@ -9,7 +9,7 @@
   "allowed_methods": [
     "POST"
   ],
-  "allowed_secrets": [],
+  "requires_secrets": [],
   "config_schema": {
     "type": "object",
     "required": ["CONSTITUTION", "API_KEY_SECRET"],

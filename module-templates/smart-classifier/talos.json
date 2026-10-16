@@ -6,7 +6,7 @@
   "category": "AI",
   "capability_world": "agent-node",
   "allowed_hosts": [],
-  "allowed_secrets": [],
+  "requires_secrets": [],
   "recommended_fuel": {
     "expected_items": 1,
     "bytes_per_item": 4000,

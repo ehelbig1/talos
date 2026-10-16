@@ -144,6 +144,19 @@ impl HttpReplay {
         })
     }
 
+    /// A replay with no recorded answer, so every request the module makes is
+    /// a miss and fails its run. For a module that makes no request at all (a
+    /// decider, measured on its input): the run proves it sent nothing.
+    /// [`Self::new`] refuses an empty set, because there an empty set is a
+    /// mistake, not a statement.
+    #[must_use]
+    pub fn refusing_every_request() -> Self {
+        Self {
+            fixtures: Vec::new(),
+            progress: Mutex::new(Progress::default()),
+        }
+    }
+
     /// As [`Self::new`], held to the cap a real response is held to
     /// (`WASM_HTTP_MAX_RESPONSE_BYTES`): a recording larger than that could
     /// never have arrived.
@@ -398,6 +411,22 @@ mod tests {
             }
         );
         assert_eq!(calls[2].outcome, ReplayOutcome::Exhausted);
+    }
+
+    #[test]
+    fn a_replay_that_refuses_every_request_answers_none_and_says_so() {
+        // `new` refuses an empty set; this one is empty on purpose.
+        assert!(HttpReplay::new(vec![], CAP).is_err());
+        let r = HttpReplay::refusing_every_request();
+        assert_eq!(r.unused(), (0, 0));
+        let miss = r.answer("GET", &url("https://a.test/x"), 0).unwrap_err();
+        assert!(
+            miss.0.contains("request 1") && miss.0.contains("no recorded response left"),
+            "{}",
+            miss.0
+        );
+        assert_eq!(r.calls().len(), 1);
+        assert_eq!(r.calls()[0].outcome, ReplayOutcome::Exhausted);
     }
 
     #[test]

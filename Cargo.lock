@@ -8060,6 +8060,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "talos-compilation",
  "talos-module-testkit",
  "talos-worker-runtime",

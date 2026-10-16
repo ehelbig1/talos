@@ -1,0 +1,68 @@
+{
+  "config": {},
+  "input": {
+    "kind": "binauthz_evidence",
+    "project": "example-project",
+    "api": {
+      "state": "ENABLED"
+    },
+    "policy": {
+      "rules": [
+        {
+          "scope": "default",
+          "applies_to": "",
+          "evaluation": "REQUIRE_ATTESTATION",
+          "enforcement": "ENFORCED_BLOCK_AND_AUDIT_LOG"
+        },
+        {
+          "scope": "cluster",
+          "applies_to": "us-central1.batch",
+          "evaluation": "ALWAYS_DENY",
+          "enforcement": "ENFORCED_BLOCK_AND_AUDIT_LOG"
+        },
+        {
+          "scope": "namespace",
+          "applies_to": "jobs",
+          "evaluation": "REQUIRE_ATTESTATION",
+          "enforcement": "ENFORCED_BLOCK_AND_AUDIT_LOG"
+        }
+      ],
+      "exempt_patterns": [
+        "registry.example/base-images/*"
+      ]
+    },
+    "clusters": [
+      {
+        "location": "us-central1",
+        "name": "apps",
+        "evaluation": "DISABLED",
+        "legacy_enabled": false
+      },
+      {
+        "location": "us-central1",
+        "name": "batch",
+        "evaluation": "POLICY_BINDINGS_AND_PROJECT_SINGLETON_POLICY_ENFORCE",
+        "legacy_enabled": false
+      },
+      {
+        "location": "europe-west1-b",
+        "name": "older",
+        "evaluation": "",
+        "legacy_enabled": true
+      }
+    ],
+    "services": [
+      {
+        "location": "us-central1",
+        "name": "api",
+        "binauthz": "default"
+      },
+      {
+        "location": "europe-west1",
+        "name": "worker",
+        "binauthz": "projects/example-project/platforms/cloudRun/strict"
+      }
+    ],
+    "unread": []
+  }
+}

@@ -1,0 +1,79 @@
+{
+  "config": {
+    "ACCEPTED": []
+  },
+  "input": {
+    "kind": "security_alerting_evidence",
+    "project": "example-np",
+    "security_group": "sha256:48ddc227211d8cacd2496f5ab2bb796ed1173a434d5ddb4d818ec1918113bb90",
+    "channels": [
+      {
+        "id": "1111",
+        "type": "email",
+        "enabled": true,
+        "verification": "VERIFICATION_STATUS_UNSPECIFIED",
+        "address": "sha256:48ddc227211d8cacd2496f5ab2bb796ed1173a434d5ddb4d818ec1918113bb90"
+      },
+      {
+        "id": "2222",
+        "type": "email",
+        "enabled": false,
+        "verification": "",
+        "address": "sha256:d876c66bad34ef8c60ff07a371204c781a9b9d76fcdee661579a9e69d33b0c85"
+      },
+      {
+        "id": "3333",
+        "type": "slack",
+        "enabled": true,
+        "verification": "VERIFIED"
+      },
+      {
+        "id": "5555",
+        "type": "email",
+        "enabled": true,
+        "verification": "",
+        "address": "sha256:ef0d4fb7a4bce5a3bf3518d0d84389e6b4885978ae2926463ede98e82ad9cec7"
+      }
+    ],
+    "unread": [],
+    "errors": {},
+    "alert_selector": {
+      "label": "security-control=true"
+    },
+    "policies": [
+      {
+        "id": "7001",
+        "selected": true,
+        "name": "Security: IAM policy changed",
+        "enabled": true,
+        "channels": [
+          "3333",
+          "1111",
+          "8888"
+        ]
+      },
+      {
+        "id": "7002",
+        "selected": true,
+        "name": "Security: firewall rule changed",
+        "enabled": true,
+        "channels": [
+          "1111"
+        ]
+      },
+      {
+        "id": "7003",
+        "selected": true,
+        "name": "Security: audit config changed (paused)",
+        "enabled": false,
+        "channels": [
+          "2222"
+        ]
+      },
+      {
+        "id": "7100",
+        "selected": false
+      }
+    ]
+  }
+}

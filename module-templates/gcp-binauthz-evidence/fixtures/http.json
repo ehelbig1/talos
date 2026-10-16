@@ -1,0 +1,38 @@
+[
+ {
+  "method": "GET",
+  "url_contains": "serviceusage.googleapis.com/v1/projects/example-np/services/binaryauthorization.googleapis.com",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"name\":\"projects/123456789012/services/binaryauthorization.googleapis.com\",\"state\":\"ENABLED\"}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "binaryauthorization.googleapis.com/v1/projects/example-np/policy",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"admissionWhitelistPatterns\":[{\"namePattern\":\"registry.example/base/*\"},{\"namePattern\":\"**\"}],\"clusterAdmissionRules\":{\"us-central1.apps\":{\"enforcementMode\":\"DRYRUN_AUDIT_LOG_ONLY\",\"evaluationMode\":\"REQUIRE_ATTESTATION\",\"requireAttestationsBy\":[\"projects/example-np/attestors/built\"]},\"us-east1.batch\":{\"enforcementMode\":\"ENFORCED_BLOCK_AND_AUDIT_LOG\",\"evaluationMode\":\"ALWAYS_ALLOW\"}},\"defaultAdmissionRule\":{\"enforcementMode\":\"ENFORCED_BLOCK_AND_AUDIT_LOG\",\"evaluationMode\":\"REQUIRE_ATTESTATION\",\"requireAttestationsBy\":[\"projects/example-np/attestors/built\"]},\"globalPolicyEvaluationMode\":\"ENABLE\",\"kubernetesNamespaceAdmissionRules\":{\"jobs\":{\"enforcementMode\":\"ENFORCED_BLOCK_AND_AUDIT_LOG\",\"evaluationMode\":\"ALWAYS_DENY\"}},\"name\":\"projects/example-np/policy\",\"updateTime\":\"2026-01-02T03:04:05Z\"}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "container.googleapis.com/v1/projects/example-np/locations/-/clusters",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"clusters\":[{\"binaryAuthorization\":{\"evaluationMode\":\"PROJECT_SINGLETON_POLICY_ENFORCE\"},\"location\":\"us-central1\",\"name\":\"apps\",\"status\":\"RUNNING\"},{\"binaryAuthorization\":{\"enabled\":true},\"location\":\"us-east1\",\"name\":\"batch\",\"status\":\"RUNNING\"},{\"location\":\"us-west1-a\",\"name\":\"scratch\",\"status\":\"RUNNING\"}]}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "run.googleapis.com/apis/serving.knative.dev/v1/namespaces/example-np/services",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"apiVersion\":\"serving.knative.dev/v1\",\"items\":[{\"apiVersion\":\"serving.knative.dev/v1\",\"kind\":\"Service\",\"metadata\":{\"annotations\":{\"run.googleapis.com/binary-authorization\":\"default\",\"run.googleapis.com/ingress\":\"all\"},\"labels\":{\"cloud.googleapis.com/location\":\"us-central1\"},\"name\":\"api\",\"namespace\":\"123456789012\"},\"spec\":{\"template\":{\"spec\":{\"containers\":[{\"image\":\"registry.example/api:1\"}]}}}},{\"metadata\":{\"annotations\":{\"run.googleapis.com/binary-authorization\":\"projects/example-np/platforms/cloudRun/strict\"},\"labels\":{\"cloud.googleapis.com/location\":\"europe-west1\"},\"name\":\"worker\"}},{\"metadata\":{\"annotations\":{\"run.googleapis.com/ingress\":\"internal\"},\"labels\":{\"cloud.googleapis.com/location\":\"us-central1\"},\"name\":\"preview\"}}],\"kind\":\"ServiceList\",\"metadata\":{}}"
+ }
+]

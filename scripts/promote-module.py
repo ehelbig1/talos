@@ -74,6 +74,22 @@ RESERVED_SUFFIXES = (".example", ".test", ".invalid", ".localhost")
 RESERVED_DOMAINS = ("example.com", "example.org", "example.net")
 # Addresses that are part of a provider's API, not a person.
 SERVICE_DOMAINS = ("resource.calendar.google.com", "group.calendar.google.com")
+# One provider address a module may have to name: Cloud Monitoring sends its
+# alert e-mail from it, and its documentation asks a group to accept it.
+SERVICE_ADDRESSES = ("alerting-noreply@google.com",)
+# A Google service account in a made-up project: `<name>@example.iam…` or
+# `<name>@example-<suffix>.iam.gserviceaccount.com`. Fixtures need one in the
+# provider's own shape, and no other domain can stand in for it.
+EXAMPLE_SERVICE_ACCOUNT_RE = re.compile(r"example(-[a-z0-9-]+)?\.iam\.gserviceaccount\.com")
+# The accounts Google runs for a project (its service agents) are named by the
+# project's NUMBER, which identifies the project. One is let through only with
+# the placeholder number 123456: a module that tells agents from people needs
+# their exact shape, and a real capture carries a real number.
+GOOGLE_AGENT_RE = re.compile(
+    r"(service-|service-org-|service-folder-)?123456(-compute)?@"
+    r"(cloudservices\.gserviceaccount\.com|developer\.gserviceaccount\.com"
+    r"|gcp-sa-[a-z0-9-]+\.iam\.gserviceaccount\.com|[a-z0-9-]+-robot\.iam\.gserviceaccount\.com)"
+)
 
 
 class Refused(Exception):
@@ -83,7 +99,10 @@ class Refused(Exception):
 def reserved(domain):
     domain = domain.lower()
     return (
-        domain in RESERVED_DOMAINS
+        # A top-level label of digits is no domain: `action@0.28.0` is a version.
+        domain.rsplit(".", 1)[-1].isdigit()
+        or EXAMPLE_SERVICE_ACCOUNT_RE.fullmatch(domain) is not None
+        or domain in RESERVED_DOMAINS
         or domain in SERVICE_DOMAINS
         or any(domain.endswith(suffix) for suffix in RESERVED_SUFFIXES)
         or any(domain.endswith("." + d) for d in RESERVED_DOMAINS)
@@ -97,7 +116,8 @@ def identifiers(text):
         if match.group(0).lower() != NIL_UUID:
             found.append(match.group(0))
     for match in EMAIL_RE.finditer(text):
-        if not reserved(match.group(1)):
+        address = match.group(0).lower()
+        if address not in SERVICE_ADDRESSES and not GOOGLE_AGENT_RE.fullmatch(address) and not reserved(match.group(1)):
             found.append(match.group(0))
     return list(dict.fromkeys(found))
 
@@ -153,7 +173,10 @@ def template_source(module_rs, tests_rs, world):
             "the module has both a tests.rs and a #[cfg(test)] module in module.rs; "
             "keep the tests in one place"
         )
-    body = "\n".join(("    " + line) if line.strip() else "" for line in tests_rs.rstrip("\n").split("\n"))
+    # The tests go in as written, not indented: indenting every line would
+    # also move the inside of a multi-line string literal, and change the
+    # text a test feeds the module.
+    body = tests_rs.rstrip("\n")
     return f"{source}\n#[cfg(test)]\nmod tests {{\n{body}\n}}\n"
 
 
@@ -228,7 +251,9 @@ def plan(module_dir, args):
         "capability_world": world,
         "allowed_hosts": string_list(record, "allowed_hosts", record_path),
         "allowed_methods": string_list(record, "allowed_methods", record_path),
-        "allowed_secrets": secrets,
+        # The catalog's manifest parser reads a template's grant as `requires_secrets`
+        # (talos_registry::reconcile::CatalogManifest); any other key is dropped.
+        "requires_secrets": secrets,
         "requires_approval_for": string_list(record, "requires_approval_for", record_path),
         "config_schema": record.get("config_schema") or {"type": "object", "properties": {}},
     }
@@ -345,6 +370,9 @@ pub fn run(input: String) -> Result<String, String> {
 PROBE_TESTS = """\
 use super::*;
 
+const TEXT: &str = "first
+top: level";
+
 #[test]
 fn reads_the_url() {
     assert_eq!(label(r#"{"URL":"https://api.example.test/x"}"#).unwrap(), "https://api.example.test/x");
@@ -423,14 +451,17 @@ def self_test():
             check("max_fuel not carried", "max_fuel" not in manifest, str(manifest))
             check("grants carried", manifest["allowed_hosts"] == ["api.example.test"]
                   and manifest["allowed_methods"] == ["GET"]
-                  and manifest["allowed_secrets"] == ["api/example/key"], str(manifest))
+                  and manifest["requires_secrets"] == ["api/example/key"]
+                  and "allowed_secrets" not in manifest, str(manifest))
             check("dependencies carried", manifest.get("dependencies") == {"chrono": "0.4"}, str(manifest))
             check("module macro added above run",
                   '#[talos_sdk_macros::talos_module(world = "http-node")]\npub fn run(' in files["template.rs"],
                   files["template.rs"])
             check("macro added once", files["template.rs"].count("talos_module(") == 1)
-            check("tests inlined", "#[cfg(test)]\nmod tests {\n    use super::*;" in files["template.rs"],
+            check("tests inlined", "#[cfg(test)]\nmod tests {\nuse super::*;" in files["template.rs"],
                   files["template.rs"][-200:])
+            check("a multi-line string in the tests kept as written",
+                  'const TEXT: &str = "first\ntop: level";' in files["template.rs"], files["template.rs"][-300:])
             check("fixtures copied", {"fixtures/http.json", "fixtures/config.json"} <= set(files), str(sorted(files)))
             check("no-fuel note", any("recommended_fuel" in n for n in notes), str(notes))
             check("written", (templates / "promotion-probe" / "talos.json").exists())
@@ -450,7 +481,7 @@ def self_test():
                                     "--secret", "oauth/example/*")
         check("pattern accepted", refusal is None, refusal or "")
         if files:
-            check("pattern stored", json.loads(files["talos.json"])["allowed_secrets"] == ["oauth/example/*"])
+            check("pattern stored", json.loads(files["talos.json"])["requires_secrets"] == ["oauth/example/*"])
         refusal, _, _ = attempt(personal, scratch / "t3b", "--description", "A probe.",
                                 "--secret", f"oauth/example/{PROBE_USER}/*")
         check("identifier in --secret refused", refusal is not None and "identifier" in refusal, str(refusal))
@@ -491,6 +522,31 @@ def self_test():
         # 7. Reserved example addresses are not identifiers; a real-looking one is.
         check("example addresses pass", identifiers("a@corp.example b@example.com c@x.test") == [])
         check("nil uuid passes", identifiers(NIL_UUID) == [])
+        # 8. Three placeholder shapes pass, and the real shapes beside them do not.
+        check("a version is no address", identifiers("uses: org/scan-action@0.28.0") == [])
+        agents = ("123456@cloudservices.gserviceaccount.com 123456-compute@developer.gserviceaccount.com "
+                  "service-123456@gcp-sa-cloudasset.iam.gserviceaccount.com "
+                  "service-123456@container-engine-robot.iam.gserviceaccount.com")
+        check("google agents with the placeholder number pass", identifiers(agents) == [], str(identifiers(agents)))
+        real_agent = "service-" + "8675309" + "@" + "gcp-sa-cloudasset.iam.gserviceaccount.com"
+        check("a google agent with a real number refused", identifiers(real_agent) == [real_agent], str(identifiers(real_agent)))
+        real_compute = "8675309-compute" + "@" + "developer.gserviceaccount.com"
+        check("a compute agent with a real number refused", identifiers(real_compute) == [real_compute], str(identifiers(real_compute)))
+        prefixed = "x123456" + "@" + "cloudservices.gserviceaccount.com"
+        check("a placeholder inside a longer number refused", identifiers(prefixed) == [prefixed], str(identifiers(prefixed)))
+        numbered = "ops" + "@" + "10.corp-domain.io"
+        check("a domain with a numbered label refused", identifiers(numbered) == [numbered], str(identifiers(numbered)))
+        check("the alerting sender passes", identifiers("accept alerting-noreply@google.com") == [])
+        other = "someone" + "@" + "google.com"
+        check("another google address refused", identifiers(other) == [other], str(identifiers(other)))
+        check("an example project's service account passes",
+              identifiers("reader@example-np.iam.gserviceaccount.com sa@example.iam.gserviceaccount.com") == [])
+        real_sa = "reader" + "@" + "acme-prod.iam.gserviceaccount.com"
+        check("a real project's service account refused", identifiers(real_sa) == [real_sa], str(identifiers(real_sa)))
+        lookalike = "reader" + "@" + "example-np.iam.gserviceaccount.com.evil.io"
+        check("a lookalike domain refused", identifiers(lookalike) == [lookalike], str(identifiers(lookalike)))
+        notexample = "reader" + "@" + "myexample-np.iam.gserviceaccount.com"
+        check("a project that only contains 'example' refused", identifiers(notexample) == [notexample], str(identifiers(notexample)))
 
     if failures:
         print("promote-module self-test FAILED:", file=sys.stderr)

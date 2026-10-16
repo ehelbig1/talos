@@ -1,0 +1,67 @@
+{
+  "name": "gcp-artifact-registry-evidence",
+  "version": "v1.0.0",
+  "display_name": "GCP: Artifact Registry Evidence",
+  "description": "Reads one Google Cloud project's Artifact Registry facts for artifact-registry-check: scanning state, repositories' settings and cleanup policies, and the age of CRITICAL findings. GET only, bounded.",
+  "category": "Security",
+  "capability_world": "http-node",
+  "allowed_hosts": [
+    "artifactregistry.googleapis.com",
+    "containeranalysis.googleapis.com",
+    "serviceusage.googleapis.com"
+  ],
+  "allowed_methods": [
+    "GET"
+  ],
+  "requires_secrets": [
+    "gcp/impersonated/*"
+  ],
+  "requires_approval_for": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "AUTH_HEADER": {
+        "type": "string",
+        "description": "'Bearer ' and a vault reference to an impersonated read-only service account's token: 'Bearer vault://gcp/impersonated/<reader-sa>@<project>.iam.gserviceaccount.com/access_token'. The controller mints it at dispatch. Grant the installed copy that one path."
+      },
+      "PROJECT": {
+        "type": "string",
+        "description": "The Google Cloud project to read, by id."
+      }
+    },
+    "required": [
+      "AUTH_HEADER",
+      "PROJECT"
+    ]
+  },
+  "dependencies": {
+    "chrono": "0.4"
+  },
+  "block": {
+    "role": "reader"
+  },
+  "setup_instructions": [
+    {
+      "step": 1,
+      "title": "Create a read-only reader account",
+      "detail": "In the project, a service account the controller may impersonate, holding only: serviceusage.services.get, artifactregistry.locations.list, artifactregistry.repositories.list and containeranalysis.occurrences.list."
+    },
+    {
+      "step": 2,
+      "title": "Connect Google Cloud",
+      "detail": "Complete the Google Cloud (full) connection, so the controller can mint the impersonated token at dispatch."
+    },
+    {
+      "step": 3,
+      "title": "Configure and grant",
+      "detail": "Set AUTH_HEADER and PROJECT on the node, and grant the installed copy the one gcp/impersonated/<reader-sa>/access_token path."
+    }
+  ],
+  "recommended_fuel": {
+    "expected_items": 40,
+    "bytes_per_item": 30000,
+    "fuel_per_byte": 11,
+    "llm_output_bytes": 0,
+    "safety_multiplier": 2.0
+  }
+}
