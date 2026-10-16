@@ -347,9 +347,7 @@ export function CreateActorPanel({
                             {t.name}
                           </span>
                           {t.id !== "custom" && (
-                            <span className="text-2xs text-muted-foreground/50 font-semibold uppercase tracking-wider bg-white/5 px-2 py-1 rounded-lg border border-white/5">
-                              {t.defaultCapability}
-                            </span>
+                            <CapabilityBadge world={t.defaultCapability} />
                           )}
                         </div>
                         <p className="text-muted-foreground/70 text-xs leading-relaxed relative z-10">
@@ -578,7 +576,7 @@ export function CreateActorPanel({
                                 </span>
                               </div>
                               {preset.recommended && (
-                                <span className="text-2xs font-semibold px-2 py-1 rounded bg-primary/20 text-primary uppercase tracking-wider ml-auto border border-primary/20">
+                                <span className="text-2xs font-semibold px-2 py-1 rounded bg-primary/20 text-primary ml-auto border border-primary/20">
                                   Recommended
                                 </span>
                               )}

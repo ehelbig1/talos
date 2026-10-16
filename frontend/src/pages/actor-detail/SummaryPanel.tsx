@@ -239,7 +239,7 @@ export function SummaryPanel({
                           size="md"
                         />
                         {isAiActor && (
-                          <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-2xs font-semibold uppercase tracking-wider px-3 py-1 shadow-sm">
+                          <span className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/5 text-primary text-2xs font-semibold px-3 py-1 shadow-sm">
                             <Sparkles className="w-3 h-3" />
                             Generated
                           </span>

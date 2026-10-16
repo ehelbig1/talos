@@ -325,7 +325,7 @@ export function ModuleBuilder({
                           Webhook
                         </h3>
                       </div>
-                      <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
+                      <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-2 py-1">
                         Receives webhooks
                       </Badge>
                     </div>

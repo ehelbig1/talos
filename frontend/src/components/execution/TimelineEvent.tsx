@@ -77,18 +77,18 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
 
             <div className="flex items-center gap-2">
               {ev.retryAttempt != null && ev.retryAttempt > 0 && (
-                <Badge className="bg-warning/5 text-warning/80 text-2xs font-semibold h-4 px-2 border-warning/20 rounded-md tracking-wider uppercase">
+                <Badge className="bg-warning/5 text-warning/80 text-2xs font-semibold h-4 px-2 border-warning/20 rounded-md">
                   Retry {ev.retryAttempt}
                 </Badge>
               )}
               {ev.iterationIndex != null && (
-                <Badge className="bg-primary/5 text-primary/80 text-2xs font-semibold h-4 px-2 border-primary/20 rounded-md tracking-wider uppercase">
+                <Badge className="bg-primary/5 text-primary/80 text-2xs font-semibold h-4 px-2 border-primary/20 rounded-md">
                   Loop {ev.iterationIndex + 1}
                   {ev.iterationTotal ? `/${ev.iterationTotal}` : ""}
                 </Badge>
               )}
               {ev.checkpointSaved && (
-                <Badge className="bg-success/5 text-success/80 text-2xs font-semibold h-4 px-2 border-success/20 rounded-md tracking-wider uppercase">
+                <Badge className="bg-success/5 text-success/80 text-2xs font-semibold h-4 px-2 border-success/20 rounded-md">
                   Checkpoint saved
                 </Badge>
               )}
@@ -125,7 +125,7 @@ export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
               {ev.approvalRequired.map((op) => (
                 <span
                   key={op}
-                  className="text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning/60 border border-warning/10 font-semibold uppercase tracking-wider shadow-sm"
+                  className="text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning/60 border border-warning/10 font-semibold shadow-sm"
                 >
                   {op}
                 </span>

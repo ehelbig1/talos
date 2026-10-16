@@ -549,7 +549,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                           </span>
                         </div>
                         {ev.retryAttempt != null && ev.retryAttempt > 0 && (
-                          <span className="inline-block text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 uppercase font-semibold tracking-wider">
+                          <span className="inline-block text-2xs px-3 py-1 rounded-full bg-warning/5 text-warning border border-warning/10 font-semibold">
                             Retry {ev.retryAttempt}
                           </span>
                         )}

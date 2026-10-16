@@ -308,7 +308,7 @@ const MetadataRow: React.FC<{
   children: React.ReactNode;
 }> = ({ label, children }) => (
   <div className="flex items-center justify-between p-2.5 rounded-lg bg-secondary/5 border border-border/10">
-    <span className="text-2xs font-bold text-muted-foreground uppercase tracking-wider">
+    <span className="text-2xs font-semibold text-muted-foreground uppercase tracking-wider">
       {label}
     </span>
     {children}

@@ -226,13 +226,13 @@ export default function AlertTriage() {
                         </span>
                       )}
                       {asIsoString(a.reopenedAt) && (
-                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
+                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-semibold uppercase tracking-wider inline-flex items-center border text-destructive bg-destructive/10 border-destructive/30">
                           <RotateCcw className="w-3 h-3 mr-1" />
                           reopened
                         </span>
                       )}
                       {a.correctedSeverity && (
-                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-bold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
+                        <span className="px-2.5 py-0.5 rounded-lg text-2xs font-semibold uppercase tracking-wider inline-flex items-center border text-primary bg-primary/5 border-primary/20">
                           <ShieldCheck className="w-3 h-3 mr-1" />
                           corrected
                         </span>

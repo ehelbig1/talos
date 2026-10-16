@@ -187,7 +187,7 @@ export function ApprovalQueue() {
                   {approval.requiredFor.map((op: string) => (
                     <div
                       key={op}
-                      className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/40 border border-white/5 text-2xs font-semibold text-white uppercase tracking-wider group-hover:border-warning/30 transition-ui shadow-sm"
+                      className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-black/40 border border-white/5 text-2xs font-semibold text-white group-hover:border-warning/30 transition-ui shadow-sm"
                     >
                       <ShieldAlert className="w-3 h-3 text-warning" />
                       {op}

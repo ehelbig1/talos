@@ -331,7 +331,7 @@ export default function CapabilityCeilingManager() {
                             {w.name}
                           </span>
                           {isCurrent && (
-                            <span className="px-2 py-0.5 bg-primary/10 text-primary text-2xs font-semibold uppercase tracking-wider rounded-full border border-primary/20 shadow-sm">
+                            <span className="px-2 py-0.5 bg-primary/10 text-primary text-2xs font-semibold rounded-full border border-primary/20 shadow-sm">
                               Current
                             </span>
                           )}

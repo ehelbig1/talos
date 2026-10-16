@@ -34,7 +34,7 @@ export function MemberRow({
               Member {member.userId.split("-")[0].toUpperCase()}
             </span>
             {isCurrentUser && (
-              <span className="text-2xs font-semibold uppercase tracking-wider text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-full">
+              <span className="text-2xs font-semibold text-primary bg-primary/10 border border-primary/20 px-2 py-0.5 rounded-full">
                 You
               </span>
             )}
@@ -49,7 +49,7 @@ export function MemberRow({
         {member.role === "owner" ? (
           <Badge
             variant="outline"
-            className="text-2xs uppercase font-semibold tracking-wider px-3 py-1 border-warning/30 text-warning bg-warning/5 rounded-full"
+            className="text-2xs font-semibold px-3 py-1 border-warning/30 text-warning bg-warning/5 rounded-full"
           >
             {member.role}
           </Badge>
