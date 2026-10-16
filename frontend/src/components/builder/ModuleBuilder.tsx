@@ -241,7 +241,7 @@ export function ModuleBuilder({
                 <ArrowLeft className="h-4 w-4 text-muted-foreground/70" />
               </Button>
               <div className="flex items-center gap-4 relative z-10">
-                <div className="flex items-center justify-center w-16 h-16 bg-surface-3/60 border border-white/10 rounded-2xl relative">
+                <div className="flex items-center justify-center w-14 h-14 bg-surface-3/60 border border-white/10 rounded-2xl relative">
                   {selectedTemplate.icon ? (
                     <span className="text-2xl relative z-10">
                       {selectedTemplate.icon}

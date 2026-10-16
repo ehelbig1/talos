@@ -271,7 +271,7 @@ export default function WebhookManager() {
 
         {triggers.length === 0 ? (
           <div className="text-center py-16 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
-            <Webhook className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-ui" />
+            <Webhook className="w-10 h-10 text-muted-foreground/30 mb-6 mx-auto group-hover:text-primary/20 transition-ui" />
             <p className="text-sm text-muted-foreground font-semibold">
               No webhooks yet
             </p>

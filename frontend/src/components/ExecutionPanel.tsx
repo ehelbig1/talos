@@ -337,7 +337,7 @@ export default function ExecutionPanel() {
               <div className="py-12 flex flex-col items-center justify-center text-center">
                 <div className="relative mb-8 group">
                   <div className="relative p-8 rounded-[3.5rem] bg-surface-2/40 border border-white/5 transition-ui group-hover:border-primary/20">
-                    <Activity className="h-16 w-16 text-muted-foreground/50 group-hover:text-primary transition-ui stroke-[1px]" />
+                    <Activity className="w-10 h-10 text-muted-foreground/50 group-hover:text-primary transition-ui stroke-[1px]" />
                   </div>
                 </div>
                 <div className="space-y-3 max-w-[280px]">

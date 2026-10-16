@@ -130,7 +130,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
           <div className="flex items-center gap-6">
             <div
               className={cn(
-                "w-16 h-16 rounded-2xl flex items-center justify-center border transition-ui",
+                "w-14 h-14 rounded-2xl flex items-center justify-center border transition-ui",
                 enabled
                   ? "bg-primary/10 border-primary/20 text-primary"
                   : "bg-white/5 border-white/10 text-muted-foreground/50",

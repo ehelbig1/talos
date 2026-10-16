@@ -350,7 +350,7 @@ export default function McpServerSettings() {
                 </div>
               ) : agents.length === 0 ? (
                 <div className="col-span-full py-16 flex flex-col items-center justify-center border border-dashed border-white/5 rounded-2xl bg-white/[0.01] group">
-                  <Bot className="w-16 h-16 text-muted-foreground/30 mb-6 transition-ui group-hover:text-primary/10" />
+                  <Bot className="w-10 h-10 text-muted-foreground/30 mb-6 transition-ui group-hover:text-primary/10" />
                   <p className="text-xs text-muted-foreground/60 font-semibold">
                     No agents yet
                   </p>

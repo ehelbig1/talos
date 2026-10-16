@@ -192,7 +192,7 @@ export default function CapabilityCeilingManager() {
             <div className="flex items-center gap-6">
               <div
                 className={cn(
-                  "w-16 h-16 rounded-2xl border-2 flex items-center justify-center transition-ui",
+                  "w-14 h-14 rounded-2xl border-2 flex items-center justify-center transition-ui",
                   tierBorder(currentRank),
                   tierBg(currentRank),
                 )}

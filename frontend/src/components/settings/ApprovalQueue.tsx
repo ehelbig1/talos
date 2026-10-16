@@ -156,7 +156,7 @@ export function ApprovalQueue() {
         <div className="space-y-4 relative z-10">
           {pending.length === 0 ? (
             <div className="text-center py-12 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl relative group overflow-hidden">
-              <CheckCircle2 className="w-16 h-16 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-ui" />
+              <CheckCircle2 className="w-10 h-10 text-success/20 mb-6 mx-auto group-hover:text-success/40 transition-ui" />
               <p className="text-sm text-muted-foreground font-semibold">
                 All Systems Authorized
               </p>
@@ -220,7 +220,7 @@ export function ApprovalQueue() {
         <div className="space-y-4 relative z-10">
           {decided.length === 0 ? (
             <div className="text-center py-12 bg-white/[0.01] border border-dashed border-white/5 rounded-2xl">
-              <History className="w-16 h-16 text-muted-foreground/30 mb-6 mx-auto" />
+              <History className="w-10 h-10 text-muted-foreground/30 mb-6 mx-auto" />
               <p className="text-sm text-muted-foreground/70 font-semibold">
                 Archive Empty
               </p>
