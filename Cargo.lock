@@ -8062,6 +8062,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "talos-compilation",
+ "talos-module-source",
  "talos-module-testkit",
  "talos-worker-runtime",
  "talos-workflow-engine-core",
@@ -8113,6 +8114,7 @@ dependencies = [
  "talos-config",
  "talos-engine-events",
  "talos-metrics",
+ "talos-module-source",
  "talos-text-util",
  "talos-wit-inspector",
  "tempfile",
@@ -9351,6 +9353,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-module-source"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "talos-module-templates"
 version = "0.1.0"
 dependencies = [
@@ -9369,6 +9378,7 @@ dependencies = [
  "hmac 0.13.0",
  "serde_json",
  "sha2 0.11.0",
+ "talos-module-source",
 ]
 
 [[package]]

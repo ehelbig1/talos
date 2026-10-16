@@ -163,6 +163,7 @@ members = [
     "talos-google-health",
     "talos-plaid-connect",
     "talos-module-testkit",
+    "talos-module-source",
     "talos-catalog-tests",
     "talos-github",
     "talos-github-repository",

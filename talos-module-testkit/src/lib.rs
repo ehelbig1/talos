@@ -10,6 +10,13 @@
 //!   secrets, the clock, a model's reply). Nothing here touches a network.
 //! * [`build`] — for a `build.rs`: copies each module source with the two
 //!   SDK-macro lines removed and writes one `pub mod` per module to include.
+//! * [`source`] — the gates over a module's source text (`talos-module-source`):
+//!   the hosts it addresses against its grant, the config keys it reads
+//!   against its schema, and the static lint that refuses a compile. The
+//!   catalog's tests and an authoring lane's run the same functions.
+//! * [`recorded_run`] — a module's `fixtures/` kept from one of its tests,
+//!   for the catalog's layout (`module-templates/<slug>/talos.json`) and an
+//!   authoring lane's (`modules/<name>/module.json`).
 //!
 //! # Using it
 //!
@@ -37,6 +44,7 @@
 pub mod build;
 pub mod host;
 pub mod recorded_run;
+pub use talos_module_source as source;
 pub mod talos;
 
 #[cfg(test)]

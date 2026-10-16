@@ -141,4 +141,7 @@ promotion instead (`docs/module-promotion.md`); the checks are the same.
 | it compiles for the sandbox | `scripts/check-catalog.sh` (`make check-catalog`) |
 
 Each gate also runs over the skeletons, so a new template never starts from
-one that fails.
+one that fails. The hosts and config rules and the compile lint are functions
+of `talos-module-source`; the files above hold the catalog's population and
+its `PREDATING` lists, and an authoring lane runs the same functions over its
+own modules.
