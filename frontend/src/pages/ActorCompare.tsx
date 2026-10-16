@@ -10,7 +10,7 @@ import { CompareLane } from "./actor-compare/CompareLane";
 import { useCompareRun } from "./actor-compare/useCompareRun";
 import { SetupPanel } from "./actor-compare/SetupPanel";
 import { RunTicker } from "./actor-compare/RunTicker";
-import { Button, PageHeader } from "@/components/ui";
+import { Button, PageContainer, PageHeader } from "@/components/ui";
 
 // ── ActorCompare page ─────────────────────────────────────────────────────────
 
@@ -62,10 +62,8 @@ export default function ActorCompare() {
   const canRun = !running && selectedWorkflowId && selectedActorIds.size >= 2;
 
   return (
-    <div className="min-h-screen bg-background text-white relative overflow-hidden font-inter">
-      {/* Ambient background glows */}
-
-      <div className="max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10 space-y-12 relative z-10">
+    <div className="h-full overflow-auto bg-background text-white custom-scrollbar">
+      <PageContainer className="space-y-12">
         <PageHeader
           backTo={{ to: "/actors", label: "Actors" }}
           title="Compare actors"
@@ -143,7 +141,7 @@ export default function ActorCompare() {
             </div>
           </div>
         )}
-      </div>
+      </PageContainer>
     </div>
   );
 }

@@ -12,7 +12,7 @@ import {
   type MySchedulesQuery,
 } from "@/generated/graphql";
 import { cn } from "@/lib/utils";
-import { PageHeader } from "@/components/ui";
+import { PageContainer, PageHeader } from "@/components/ui";
 import { futureTime, formatDurationSecs } from "@/lib/formatTime";
 import {
   Activity,
@@ -597,12 +597,8 @@ export default function Health() {
         : "text-destructive";
 
   return (
-    <div className="h-full overflow-y-auto bg-background custom-scrollbar relative">
-      {/* Dynamic Glow Background */}
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
-
-      <div className="max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10 relative z-10">
-        {/* Page header */}
+    <div className="h-full overflow-y-auto bg-background custom-scrollbar">
+      <PageContainer>
         <PageHeader
           title="System health"
           description="Workflows, actors and runs over the last 7 days."
@@ -675,7 +671,7 @@ export default function Health() {
             Counts cover the last 7 days and refresh every minute.
           </p>
         </footer>
-      </div>
+      </PageContainer>
     </div>
   );
 }

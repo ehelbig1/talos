@@ -244,10 +244,10 @@ export function TabBar({
 }) {
   const tabs: { id: Tab; label: string; count?: number }[] = [
     { id: "summary", label: "Overview" },
-    { id: "workflows", label: "Logic", count: counts.workflows },
-    { id: "memory", label: "State" },
-    { id: "budget", label: "Resources" },
-    { id: "policies", label: "Rules" },
+    { id: "workflows", label: "Workflows", count: counts.workflows },
+    { id: "memory", label: "Memory" },
+    { id: "budget", label: "Budget" },
+    { id: "policies", label: "Policies" },
     { id: "log", label: "Activity", count: counts.log },
     ...(showHandoffs
       ? [{ id: "handoffs" as Tab, label: "Handoffs", count: counts.handoffs }]
@@ -255,13 +255,19 @@ export function TabBar({
   ];
 
   return (
-    <div className="flex items-center gap-2 p-1.5 bg-surface-3/40 border-b border-white/5 shrink-0 flex-wrap sticky top-0 z-20 px-8">
+    <div
+      role="tablist"
+      className="flex items-center gap-1 p-1 bg-background border-b border-white/5 flex-wrap sticky top-0 z-20"
+    >
       {tabs.map((t) => (
         <button
           key={t.id}
+          type="button"
+          role="tab"
+          aria-selected={active === t.id}
           onClick={() => onChange(t.id)}
           className={cn(
-            "px-5 py-2 rounded-xl text-xs font-semibold transition-ui flex items-center gap-2",
+            "px-4 h-9 rounded-xl text-sm font-medium transition-ui flex items-center gap-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
             active === t.id
               ? "bg-primary text-primary-foreground"
               : "text-muted-foreground hover:text-foreground hover:bg-white/5",

@@ -3,7 +3,7 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 import { useAuth } from "@/contexts/AuthContext";
 import { Link, useNavigate } from "react-router";
 import { cn } from "@/lib/utils";
-import { PageHeader } from "@/components/ui";
+import { PageContainer, PageHeader } from "@/components/ui";
 import {
   Lock as LockIcon,
   User as UserIcon,
@@ -345,12 +345,9 @@ export default function Settings() {
   }, []);
 
   return (
-    <div className="h-full flex flex-col overflow-hidden bg-background relative">
-      {/* Dynamic Background Glow */}
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
-
+    <div className="h-full flex flex-col overflow-hidden bg-background">
       {/* Page header */}
-      <header className="shrink-0 px-8 py-6 border-b border-white/5 bg-surface-1/60 relative z-20">
+      <header className="shrink-0 px-6 md:px-8 py-6 border-b border-white/5 bg-surface-1/60">
         <PageHeader
           title="Settings"
           description="Your account, integrations and security."
@@ -359,7 +356,7 @@ export default function Settings() {
       </header>
 
       {/* Below sm the sidebar is a select: every section, grouped, on one tap. */}
-      <div className="sm:hidden shrink-0 px-6 py-3 border-b border-white/5 bg-surface-2/40 relative z-20">
+      <div className="sm:hidden shrink-0 px-6 py-3 border-b border-white/5 bg-surface-2/40">
         <label htmlFor="settings-section" className="sr-only">
           Settings section
         </label>
@@ -386,7 +383,7 @@ export default function Settings() {
       </div>
 
       {/* Two-column layout */}
-      <div className="flex flex-1 min-h-0 overflow-hidden relative z-10">
+      <div className="flex flex-1 min-h-0 overflow-hidden">
         <SettingsSidebar
           active={active}
           onSelect={setActive}
@@ -395,7 +392,7 @@ export default function Settings() {
 
         {/* Content area */}
         <main className="flex-1 overflow-y-auto custom-scrollbar">
-          <div className="max-w-6xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
+          <PageContainer>
             {active === "integrations" && (
               <ErrorBoundary>
                 <Suspense fallback={<PanelLoading />}>
@@ -538,7 +535,7 @@ export default function Settings() {
                 </section>
               </div>
             )}
-          </div>
+          </PageContainer>
         </main>
       </div>
     </div>
