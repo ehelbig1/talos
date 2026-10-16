@@ -1,0 +1,14 @@
+[
+  {
+    "body": "{\"items\":[{\"id\":\"a\",\"name\":\"First\"},{\"id\":\"b\",\"name\":\"Second\"}],\"next\":\"p2\"}",
+    "method": "GET",
+    "status": 200,
+    "url_contains": "api.example.com/v1/items"
+  },
+  {
+    "body": "{\"items\":[{\"id\":\"c\",\"name\":\"Third\"},{\"id\":\"d\",\"name\":\"Fourth\"}]}",
+    "method": "GET",
+    "status": 200,
+    "url_contains": "api.example.com/v1/items"
+  }
+]

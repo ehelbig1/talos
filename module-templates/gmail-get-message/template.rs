@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn trusted_google_ar_passes() {
         let h = hdrs(&[
-            "mx.google.com; spf=pass smtp.mailfrom=a@b.com; dkim=pass header.i=@b.com; dmarc=pass (p=REJECT)",
+            "mx.google.com; spf=pass smtp.mailfrom=a@example.com; dkim=pass header.i=@example.com; dmarc=pass (p=REJECT)",
         ]);
         let a = parse_auth_results(&h, "google.com");
         assert!(a.spf_pass && a.dkim_pass && a.dmarc_pass);

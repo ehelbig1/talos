@@ -387,8 +387,12 @@ const GROUP: &str = "security-team@example.com";
 fn config() -> Value {
     json!({"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P, "SECURITY_GROUP_EMAIL": GROUP, "ALERT_POLICY_SELECTOR": {"label": "security-control=true"}})
 }
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": config()}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": config()}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 /// Four channels: the group's email channel, another person's (disabled), a Slack channel, and an
 /// email channel whose address is written in another letter case with spaces round it.
@@ -650,6 +654,8 @@ fn the_policies_are_read_with_a_get_and_only_what_the_rules_need_is_handed_on() 
     for never in ["oncall", "SetIamPolicy", "IAM change", "documentation", "conditions", "platform", "firewall"] {
         assert!(!text.contains(never), "{never} was handed on");
     }
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=gcp-alerting-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("gcp-alerting-evidence", &envelope());
 }
 
 #[test]

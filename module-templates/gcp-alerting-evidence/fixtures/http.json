@@ -1,20 +1,14 @@
 [
- {
-  "method": "GET",
-  "url_contains": "monitoring.googleapis.com/v3/projects/example-np/notificationChannels?pageSize=100",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
+  {
+    "body": "{\"notificationChannels\":[{\"displayName\":\"Security\",\"enabled\":true,\"labels\":{\"email_address\":\"security-team@example.com\"},\"name\":\"projects/example-np/notificationChannels/1111\",\"type\":\"email\",\"verificationStatus\":\"VERIFICATION_STATUS_UNSPECIFIED\"},{\"displayName\":\"On call\",\"enabled\":false,\"labels\":{\"email_address\":\"oncall@example.com\"},\"name\":\"projects/example-np/notificationChannels/2222\",\"type\":\"email\"},{\"labels\":{\"channel_name\":\"#alerts\"},\"name\":\"projects/example-np/notificationChannels/3333\",\"type\":\"slack\",\"verificationStatus\":\"VERIFIED\"},{\"labels\":{\"email_address\":\" Security-Team@Example.COM \"},\"name\":\"projects/example-np/notificationChannels/4444\",\"type\":\"email\"}],\"totalSize\":4}",
+    "method": "GET",
+    "status": 200,
+    "url_contains": "monitoring.googleapis.com/v3/projects/example-np/notificationChannels"
   },
-  "body": "{\"notificationChannels\":[{\"displayName\":\"Security\",\"enabled\":true,\"labels\":{\"email_address\":\"security-team@example.com\"},\"name\":\"projects/example-np/notificationChannels/1111\",\"type\":\"email\",\"verificationStatus\":\"VERIFICATION_STATUS_UNSPECIFIED\"},{\"displayName\":\"On call\",\"enabled\":false,\"labels\":{\"email_address\":\"oncall@example.com\"},\"name\":\"projects/example-np/notificationChannels/2222\",\"type\":\"email\"},{\"labels\":{\"channel_name\":\"#alerts\"},\"name\":\"projects/example-np/notificationChannels/3333\",\"type\":\"slack\",\"verificationStatus\":\"VERIFIED\"},{\"labels\":{\"email_address\":\" Security-Team@Example.COM \"},\"name\":\"projects/example-np/notificationChannels/4444\",\"type\":\"email\"}],\"totalSize\":4}"
- },
- {
-  "method": "GET",
-  "url_contains": "monitoring.googleapis.com/v3/projects/example-np/alertPolicies?pageSize=100",
-  "status": 200,
-  "headers": {
-   "content-type": "application/json"
-  },
-  "body": "{\"alertPolicies\":[{\"conditions\":[{\"conditionMatchedLog\":{\"filter\":\"protoPayload.methodName=\\\"SetIamPolicy\\\"\"},\"displayName\":\"IAM change\"}],\"displayName\":\"Security: IAM policy changed <b>\",\"documentation\":{\"content\":\"Page the on-call person at oncall@example.com\"},\"enabled\":true,\"name\":\"projects/example-np/alertPolicies/7001\",\"notificationChannels\":[\"projects/example-np/notificationChannels/1111\",\"projects/123456789012/notificationChannels/3333\",\"not a channel\"],\"userLabels\":{\"security-control\":\"true\",\"team\":\"platform\"}},{\"displayName\":\"Security: firewall changed\",\"enabled\":false,\"name\":\"projects/example-np/alertPolicies/7002\",\"notificationChannels\":[\"projects/example-np/notificationChannels/2222\"],\"userLabels\":{\"security-control\":\"false\"}},{\"displayName\":\"CPU high\",\"name\":\"projects/example-np/alertPolicies/7003\",\"notificationChannels\":[],\"userLabels\":{\"security-control\":\"true\"}}],\"totalSize\":3}"
- }
+  {
+    "body": "{\"alertPolicies\":[{\"conditions\":[{\"conditionMatchedLog\":{\"filter\":\"protoPayload.methodName=\\\"SetIamPolicy\\\"\"},\"displayName\":\"IAM change\"}],\"displayName\":\"Security: IAM policy changed <b>\",\"documentation\":{\"content\":\"Page the on-call person at oncall@example.com\"},\"enabled\":true,\"name\":\"projects/example-np/alertPolicies/7001\",\"notificationChannels\":[\"projects/example-np/notificationChannels/1111\",\"projects/123456789012/notificationChannels/3333\",\"not a channel\"],\"userLabels\":{\"security-control\":\"true\",\"team\":\"platform\"}},{\"displayName\":\"Security: firewall changed\",\"enabled\":false,\"name\":\"projects/example-np/alertPolicies/7002\",\"notificationChannels\":[\"projects/example-np/notificationChannels/2222\"],\"userLabels\":{\"security-control\":\"false\"}},{\"displayName\":\"CPU high\",\"name\":\"projects/example-np/alertPolicies/7003\",\"notificationChannels\":[],\"userLabels\":{\"security-control\":\"true\"}}],\"totalSize\":3}",
+    "method": "GET",
+    "status": 200,
+    "url_contains": "monitoring.googleapis.com/v3/projects/example-np/alertPolicies"
+  }
 ]

@@ -36,6 +36,7 @@
 
 pub mod build;
 pub mod host;
+pub mod recorded_run;
 pub mod talos;
 
 #[cfg(test)]

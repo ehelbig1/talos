@@ -27,7 +27,7 @@
       "QUERY": {
         "type": "string",
         "default": "is:unread newer_than:24h",
-        "description": "Gmail search query — same syntax as the web UI. Common: 'is:unread newer_than:24h' (morning brief), 'label:important newer_than:1d', 'from:boss@company.com'. Empty → all mail."
+        "description": "Gmail search query — same syntax as the web UI. Common: 'is:unread newer_than:24h' (morning brief), 'label:important newer_than:1d', 'from:boss@example.com'. Empty → all mail."
       },
       "MAX_RESULTS": {
         "type": "integer",

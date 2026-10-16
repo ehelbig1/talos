@@ -1,4 +1,4 @@
 {
- "AUTH_HEADER": "Bearer made-up-token",
- "PROJECT": "example-np"
+  "AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token",
+  "PROJECT": "example-np"
 }

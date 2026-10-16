@@ -30,7 +30,7 @@
       },
       "QUERY": {
         "type": "string",
-        "description": "Mode B: Gmail search query (same syntax as the web UI, e.g. 'label:Ask is:unread', 'from:me@x.com newer_than:1h'). Lists matching ids then fetches each in full. Ignored when MESSAGE_ID is set."
+        "description": "Mode B: Gmail search query (same syntax as the web UI, e.g. 'label:Ask is:unread', 'from:me@example.com newer_than:1h'). Lists matching ids then fetches each in full. Ignored when MESSAGE_ID is set."
       },
       "MAX_RESULTS": {
         "type": "integer",

@@ -1,0 +1,25 @@
+{
+  "name": "skeleton-reader",
+  "version": "v1.0.0",
+  "display_name": "Skeleton Reader",
+  "description": "TODO(author): what it reads from which service, what it hands on, and its bounds. GET only.",
+  "category": "Utilities",
+  "capability_world": "http-node",
+  "allowed_hosts": ["api.example.com"],
+  "allowed_methods": ["GET"],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "block": {"role": "reader"},
+  "config_schema": {
+    "type": "object",
+    "required": ["AUTH_HEADER"],
+    "properties": {
+      "AUTH_HEADER": {"type": "string", "description": "'Bearer ' and a vault reference to the service's token, e.g. 'Bearer vault://<path>'. The platform puts the secret in the header; the module never sees it. Grant the installed copy exactly that path."},
+      "MAX_ITEMS": {"type": "integer", "default": 100, "description": "The most items to hand on, 1 to 100."}
+    }
+  },
+  "setup_instructions": [
+    {"step": 1, "title": "Store the token", "detail": "Store a read-only token for the service in the vault, and grant the installed copy exactly that path."},
+    {"step": 2, "title": "Configure", "detail": "Set AUTH_HEADER to 'Bearer vault://<that path>'."}
+  ]
+}

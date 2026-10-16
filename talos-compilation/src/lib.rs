@@ -496,6 +496,23 @@ impl std::error::Error for CompilationDisabled {}
 
 /// Whether a compile-service error is the deployment's "compilation is
 /// off" refusal, at any depth of the error's context chain.
+/// The static-lint findings that refuse a compile: the error-severity half
+/// of the source analysis every compile path runs before it builds. Exposed
+/// so a template's author meets them in a test that takes milliseconds, not at
+/// the end of a build; the compile paths below ask this same function.
+#[must_use]
+pub fn source_lint_errors(source_code: &str) -> Vec<CompilationError> {
+    analyze::lint_source_code(source_code)
+        .into_iter()
+        .filter(lint_refuses_compile)
+        .collect()
+}
+
+/// Whether one static-lint finding refuses the compile.
+fn lint_refuses_compile(e: &CompilationError) -> bool {
+    e.severity == "error"
+}
+
 pub fn is_compilation_disabled(error: &anyhow::Error) -> bool {
     error.downcast_ref::<CompilationDisabled>().is_some()
         || error
@@ -988,7 +1005,7 @@ impl CompilationService {
         let lint_warnings = analyze::lint_source_code(source_code);
         let lint_errors: Vec<CompilationError> = lint_warnings
             .iter()
-            .filter(|e| e.severity == "error")
+            .filter(|e| lint_refuses_compile(e))
             .cloned()
             .collect();
         if !lint_errors.is_empty() {
@@ -3141,12 +3158,7 @@ impl CompilationService {
         // Mirrors compile_to_wasm_with_config so domain-specific hints
         // (e.g. `secrets::get` → `secrets::get_secret`) surface from BOTH
         // the lint pre-flight and the full compile path.
-        let static_lints = analyze::lint_source_code(source_code);
-        let static_errors: Vec<CompilationError> = static_lints
-            .iter()
-            .filter(|e| e.severity == "error")
-            .cloned()
-            .collect();
+        let static_errors = source_lint_errors(source_code);
         if !static_errors.is_empty() {
             return Ok(static_errors);
         }

@@ -531,8 +531,12 @@ use talos::core::http::Method;
 use talos_module_testkit::host;
 
 const P: &str = "example-np";
+/// The envelope every test of this reader runs it with.
+fn envelope() -> String {
+    json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()
+}
 fn read() -> Result<Value, String> {
-    run(json!({"config": {"AUTH_HEADER": "Bearer vault://gcp/impersonated/reader@example-np.iam.gserviceaccount.com/access_token", "PROJECT": P}}).to_string()).map(|o| serde_json::from_str(&o).unwrap())
+    run(envelope()).map(|o| serde_json::from_str(&o).unwrap())
 }
 fn pools() -> Value {
     json!({"workloadIdentityPools": [
@@ -608,6 +612,8 @@ fn the_projects_facts_are_collected_with_gets_only_in_the_shape_the_check_reads(
     let found: Vec<&str> = judged["findings"].as_array().unwrap().iter().map(|f| f["rule"].as_str().unwrap()).collect();
     assert!(found.contains(&"binding-unscoped") && found.contains(&"attribute-by-name") && found.contains(&"provider-custom-audience"), "{found:?}");
     assert_eq!(judged["not_assessed"], json!([]));
+    // This run is the template's recorded run (fixtures/): `make record-template TEMPLATE=gcp-wif-evidence` rewrites it.
+    talos_module_testkit::recorded_run::keep("gcp-wif-evidence", &envelope());
 }
 
 #[test]

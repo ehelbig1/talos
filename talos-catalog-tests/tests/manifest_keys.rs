@@ -5,15 +5,12 @@
 //! can read none of the secrets it was written for. `promote-module.py` wrote
 //! that key until 2026-10-16.
 
-use std::path::PathBuf;
-
 #[test]
 fn no_template_writes_its_secret_grant_under_a_key_the_catalog_does_not_read() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
     let mut read = 0;
     let mut wrong = Vec::new();
-    for entry in std::fs::read_dir(&root).expect("module-templates") {
-        let manifest = entry.expect("entry").path().join("talos.json");
+    for dir in talos_catalog_tests::template_dirs() {
+        let manifest = dir.join("talos.json");
         let Ok(text) = std::fs::read_to_string(&manifest) else {
             continue;
         };

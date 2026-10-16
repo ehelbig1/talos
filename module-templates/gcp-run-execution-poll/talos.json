@@ -15,7 +15,7 @@
     "properties": {
       "AUTH_HEADER": {
         "type": "string",
-        "description": "vault:// path to the Phase D impersonated SA access token wrapped in 'Bearer ' (e.g. 'Bearer vault://gcp/impersonated/talos-runner@my-project.iam.gserviceaccount.com/access_token'). Set <sa_email> to your talos-runner service account. The controller mints the impersonated token at dispatch. Least privilege: set the module's allowed_secrets to the EXACT path, not the 'gcp/impersonated/*' wildcard."
+        "description": "vault:// path to the Phase D impersonated SA access token wrapped in 'Bearer ' (e.g. 'Bearer vault://gcp/impersonated/talos-runner@example-project.iam.gserviceaccount.com/access_token'). Set <sa_email> to your talos-runner service account. The controller mints the impersonated token at dispatch. Least privilege: set the module's allowed_secrets to the EXACT path, not the 'gcp/impersonated/*' wildcard."
       },
       "PROJECT_ID": {
         "type": "string",

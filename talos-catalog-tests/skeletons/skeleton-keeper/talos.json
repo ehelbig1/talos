@@ -1,0 +1,14 @@
+{
+  "name": "skeleton-keeper",
+  "version": "v1.0.0",
+  "display_name": "Skeleton Keeper",
+  "description": "TODO(author): what it keeps, under which memory key, from which node, and its bounds. The only writer of that key.",
+  "category": "Utilities",
+  "capability_world": "agent-node",
+  "allowed_hosts": [],
+  "allowed_methods": [],
+  "requires_secrets": [],
+  "requires_approval_for": [],
+  "block": {"role": "keeper"},
+  "config_schema": {"type": "object", "properties": {}}
+}

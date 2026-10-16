@@ -374,7 +374,7 @@ pub fn run(input: String) -> Result<String, String> {
     let url = r
         .html_url
         .as_deref()
-        .filter(|u| u.starts_with("https://github.com/"))
+        .filter(|u| u.starts_with("https://github.com/")) // host-not-requested: a run's link for the reader, never fetched
         .map(|u| clean(u, 300));
     let event = clean(r.event.as_deref().unwrap_or("unknown"), 30);
     let run = Run {

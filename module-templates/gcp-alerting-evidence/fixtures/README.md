@@ -1,12 +1,12 @@
 # Recorded run
 
-Made-up data, taken from this template's own test of the same name's shape:
-one project's notification channels and alerting policies, the security ones picked by a display-name prefix, in 2 GET requests. No real project, account or
-address is in it.
+The run of this template's test `the_policies_are_read_with_a_get_and_only_what_the_rules_need_is_handed_on`: one project's notification channels and alerting policies, in 2 requests.
+Made-up data, the test's own; no real project, account or address is in it.
 
-`config.json` is the node config for the run (the token is a placeholder: the
-run is answered from `http.json` and nothing is sent).
+`http.json` and `config.json` are kept by `talos_module_testkit::recorded_run::keep`
+at the end of that test. A normal `cargo test` fails when they no longer match
+what the test serves; `make record-template TEMPLATE=gcp-alerting-evidence` rewrites them.
 
 `make check-catalog-fuel TEMPLATE=gcp-alerting-evidence` builds the template the way the
-platform does, runs it against this recording, and fails if the fuel used is
-above 80% of the limit `talos.json` declares.
+platform does, runs it against this recording (nothing is sent), and fails if
+the fuel used is above 80% of the limit `talos.json` declares.

@@ -30,7 +30,6 @@
 //! come off it, and a template not on it must declare one.
 
 use serde_json::Value;
-use std::path::{Path, PathBuf};
 
 const ROLES: &[&str] = &["reader", "decider", "keeper", "composer", "sender"];
 const BLOCK_KEYS: &[&str] = &["role", "contract", "reads_by_post"];
@@ -122,14 +121,16 @@ const UNDECLARED: &[&str] = &[
 ];
 
 fn templates() -> Vec<(String, Value)> {
-    let root: PathBuf = Path::new(env!("CARGO_MANIFEST_DIR")).join("../module-templates");
-    let mut out: Vec<(String, Value)> = std::fs::read_dir(&root)
-        .expect("module-templates")
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().join("talos.json").is_file())
-        .map(|e| {
-            let slug = e.file_name().to_string_lossy().into_owned();
-            let text = std::fs::read_to_string(e.path().join("talos.json")).unwrap();
+    let mut out: Vec<(String, Value)> = talos_catalog_tests::template_dirs()
+        .into_iter()
+        .filter(|dir| dir.join("talos.json").is_file())
+        .map(|dir| {
+            let slug = dir
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let text = std::fs::read_to_string(dir.join("talos.json")).unwrap();
             let manifest: Value =
                 serde_json::from_str(&text).unwrap_or_else(|err| panic!("{slug}: {err}"));
             (slug, manifest)

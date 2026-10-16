@@ -63,6 +63,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 
+# The repository is public, and a template written straight into
+# module-templates/ never meets the scan a promotion runs: scan every
+# template's text for identifiers first (no toolchain needed).
+echo "🔎 Identifier scan — module-templates/ is public"
+python3 "$ROOT/scripts/promote-module.py" --scan ${TEMPLATE:+--slug "$TEMPLATE"}
+python3 "$ROOT/scripts/promote-module.py" --scan --templates-dir "$ROOT/talos-catalog-tests/skeletons" ${TEMPLATE:+--slug "$TEMPLATE"}
+echo
+
 # One shared target dir across all templates — they share the identical dep
 # graph, so per-dir targets rebuilt serde/wit-bindgen 60x for nothing.
 export CARGO_TARGET_DIR="$ROOT/target/catalog-check"
@@ -171,7 +179,11 @@ template_source() {
     fi
 }
 
-for dir in "$ROOT"/module-templates/*/; do
+# The skeletons `make new-template` copies are compiled with the catalog, so a
+# new template never starts from one that does not build.
+TEMPLATE_DIRS=("$ROOT"/module-templates/*/ "$ROOT"/talos-catalog-tests/skeletons/*/)
+
+for dir in "${TEMPLATE_DIRS[@]}"; do
     [ -f "$dir/talos.json" ] || continue
     [ -n "$(template_source "$dir")" ] || continue
     total=$((total + 1))
@@ -266,12 +278,15 @@ TOML
     return $rc
 }
 
+[ -n "${TEMPLATE:-}" ] && total=1
 echo "📦 Catalog template check — $total templates, production-parity manifests"
 echo
 
-for dir in "$ROOT"/module-templates/*/; do
+for dir in "${TEMPLATE_DIRS[@]}"; do
     name="$(basename "$dir")"
     [ -f "$dir/talos.json" ] || continue
+    # TEMPLATE=<slug> compiles that one (make template).
+    if [ -n "${TEMPLATE:-}" ] && [ "$name" != "$TEMPLATE" ]; then continue; fi
     src="$(template_source "$dir")"
     [ -n "$src" ] || continue
 
