@@ -161,7 +161,7 @@ export function ControlFlowMenu({ onClose }: ControlFlowMenuProps) {
 
       {isOpen && (
         <div
-          className="absolute top-full left-0 mt-2 z-50 bg-surface-3 border border-white/10 rounded-2xl py-2 min-w-[240px] overflow-hidden origin-top-left"
+          className="absolute top-full left-0 mt-2 z-50 bg-surface-3 border border-white/10 rounded-2xl py-2 min-w-[240px] max-h-[min(70vh,32rem)] overflow-y-auto custom-scrollbar origin-top-left"
           role="menu"
           aria-label="Control flow nodes"
         >

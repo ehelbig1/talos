@@ -218,7 +218,7 @@ export default function ExecutionPanel() {
   );
 
   return (
-    <div className="flex flex-col bg-surface-1/60 border-l border-white/5 text-foreground relative overflow-hidden transition-ui">
+    <div className="flex flex-col bg-surface-1/60 border-l border-white/5 text-foreground relative transition-ui">
       <ConfirmDialog
         open={confirmPending !== null}
         title={confirmPending?.title ?? "Confirm"}
