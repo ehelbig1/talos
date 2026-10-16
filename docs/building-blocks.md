@@ -72,6 +72,17 @@ decide, act — are reader, decider, sender; keeper and composer sit between.
   idempotent (a `tag` that replaces, an idempotency key).
 * One adapter per service, interchangeable through a contract
   (`notify-*`, `control-*`).
+* **A sender of a message to a person (`notify-*`, `send-*`) returns the
+  delivery verdict** (2026-10-16): `provider` (the service's word), `sent`,
+  `skipped`, `dry_run`, `parts_total`, `parts_sent`, `actions_sent` (the
+  actions the message carried: a notification's buttons, an email's action
+  links). The notification contract extends it; a sender outside that
+  contract returns the same fields beside its own. The engine records a real
+  send from it (`message_deliveries`, `docs/notification-contract.md`, "What
+  the platform records of a send"), so a message sent by a sender that
+  returns something else is sent and never counted.
+  `talos-catalog-tests/tests/delivery_verdict.rs` drives every message sender
+  and reads its verdict through the engine's reader.
 
 ## Contracts
 
@@ -178,6 +189,7 @@ Correctness
 |---|---|
 | Every new template declares a role, and the role fits its grants | `talos-catalog-tests/tests/block_roles.rs` |
 | Adapters of a contract agree | `talos-catalog-tests/tests/{notification,capture}_contract.rs` |
+| Every message sender's verdict is one the engine records | `talos-catalog-tests/tests/delivery_verdict.rs` |
 | A recorded run fits its declared fuel | `make check-catalog-fuel` (`tests/fuel_fixtures.rs`) |
 | A template's own tests run in CI | `make test-templates` |
 | Promotion refuses identifiers and per-user secret paths | `scripts/promote-module.py` |

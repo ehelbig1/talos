@@ -59,6 +59,9 @@ completed send node on a quiet day sends nothing.
   provider or parts). Recognising a second shape would be a second contract
   for one template; if email engagement is wanted, the email senders should
   return the notification verdict, and the reader needs no change.
+  **Superseded the same day** by `2026-10-16-every-message-sender-returns-its-verdict.md`:
+  the email sender returns the verdict, and the reader DID change (a tap rate
+  over every send would have read a plain report as ignored).
 - **No new reserved `__key__`.** The verdict is the contract's documented
   return, read where it is; an output protocol key would have asked every
   adapter to say the same thing twice.

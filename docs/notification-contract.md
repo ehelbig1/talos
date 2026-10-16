@@ -183,7 +183,9 @@ buttons, without a word. Move such a workflow to one send node and
 2. `talos.json` with `allowed_hosts: []`, `requires_secrets: []`,
    `allowed_methods: ["POST"]`; `fixtures/` with a recorded run.
 3. Add it to `ADAPTERS` in
-   `talos-catalog-tests/tests/notification_contract.rs`.
+   `talos-catalog-tests/tests/notification_contract.rs`, and to `SENDERS` in
+   `talos-catalog-tests/tests/delivery_verdict.rs` (every `notify-*` sender
+   is driven there, and its verdict read as the engine reads it).
 
 That test fails if two adapters' contract blocks differ by a byte, if a
 `notify-*` template is missing from the list, if adapters disagree on a
@@ -227,13 +229,27 @@ block that the reader does not follow fails CI.
 
 The MCP tool `get_message_engagement` reads that table and sets action-link
 taps against the executions that sent them: per workflow, sends, parts,
-actions, executions, executions with at least one tap, and taps. Rehearsals
+actions, executions, executions whose messages carried an action, executions
+with at least one tap, and taps, with the sends also given per provider.
+`tap_rate` is `executions_tapped / executions_with_actions`: a message with no
+action cannot be tapped, so a plain report is not read as ignored. Rehearsals
 (`started_by_kind = test`) are left out. A new adapter needs nothing beyond
 returning the verdict unchanged.
+
+The four fields the engine recognises a send by (`provider`, `sent`,
+`parts_total`, `parts_sent`), with `skipped`, `dry_run` and `actions_sent`,
+are the **delivery verdict every sender of a message returns**
+(`docs/building-blocks.md`, "Sender"), not only a `notify-*` adapter. The
+HTML email sender returns them beside its Gmail ids, with `provider: "gmail"`,
+one part, and the action links in its body as `actions_sent`.
+`talos-catalog-tests/tests/delivery_verdict.rs` drives every message sender
+and reads its verdict through the engine's reader.
 
 ## What is not in the contract
 
 Email. The morning message is HTML mail through the delivery pattern
 (`docs/delivery-node-pattern.md`), which carries far more than a
 notification can. A notification is a short prompt to act; when both are
-wanted, a workflow composes both.
+wanted, a workflow composes both. The email sender does return the delivery
+verdict above, so its sends are counted with the notifications; what it
+reads (`{subject, html}`) and the rules it applies are its own.

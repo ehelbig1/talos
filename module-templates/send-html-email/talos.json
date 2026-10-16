@@ -1,8 +1,8 @@
 {
   "name": "send-html-email",
-  "version": "v1.0.0",
+  "version": "v1.1.0",
   "display_name": "Send HTML Email (Gmail)",
-  "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. `skip: true` from the upstream node sends nothing; an input with no `html` is an error, never a blank email. Costs about 55 fuel per byte of `html`; the default limit is sized for a message of up to 60 KB, so set the node's `max_fuel` higher for a longer one. Pair with a compose node (memory, no network) per the two-node delivery pattern.",
+  "description": "Delivery-pattern HTML email sender. Reads {html, subject} from the upstream node's output, RFC 2047-encodes non-ASCII subjects, and POSTs an HTML message to the Gmail API using a Bearer token (a vault:// reference in AUTH_HEADER is resolved host-side). DRY_RUN gates the send. `skip: true` from the upstream node sends nothing; an input with no `html` is an error, never a blank email. Costs about 55 fuel per byte of `html`; the default limit is sized for a message of up to 60 KB, so set the node's `max_fuel` higher for a longer one. Pair with a compose node (memory, no network) per the two-node delivery pattern. Returns the delivery verdict every sender of a message returns (provider, sent, parts_total, parts_sent, actions_sent: the action links in the body), which the engine records so the email is counted beside phone notifications.",
   "category": "Communication",
   "capability_world": "http-node",
   "block": {"role": "sender"},
@@ -50,9 +50,13 @@
     }
   },
   "output": {
+    "provider": "\"gmail\": the delivery verdict's word for the service (docs/building-blocks.md, Sender)",
     "sent": "boolean",
-    "skipped": "true when the upstream node returned skip: true (absent otherwise)",
+    "skipped": "true when the upstream node returned skip: true",
     "dry_run": "boolean",
+    "parts_total": "1 for a message, 0 for a skip (one email is one part)",
+    "parts_sent": "1 when sent, 0 on a dry run or a skip",
+    "actions_sent": "the action links (/action-links/ URLs) in the body; an unminted fallback is not one",
     "message_id": "Gmail message id (when sent)",
     "thread_id": "Gmail thread id (when sent)",
     "to": "recipient",

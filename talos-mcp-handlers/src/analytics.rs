@@ -633,7 +633,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_message_engagement",
-            "description": "Messages the platform sent and the taps they drew, per workflow, over a window. A send is a notify-* node that delivered on a real run (recorded by the engine from the adapter's verdict; dry runs and rehearsals are left out); a tap is an action link minted in the same execution and used. `executions_tapped / executions` is the share of messages that drew at least one tap. Use it before adding a message or a button: a message nobody taps is noise.",
+            "description": "Messages the platform sent and the taps they drew, per workflow, over a window. A send is a send node (a notify-* adapter, the HTML email sender) that delivered on a real run, recorded by the engine from the sender's verdict; dry runs and rehearsals are left out. A tap is an action link minted in the same execution and used. `tap_rate` is `executions_tapped / executions_with_actions`: only a message that carried an action can be tapped, so a workflow that mails a plain report is not read as ignored. Sends are also broken down by provider (`ntfy`, `home-assistant`, `gmail`); taps are not, since a run that sent by two services minted its links once. Use it before adding a message or a button: a message nobody taps is noise.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -7543,6 +7543,18 @@ fn child_runs_note(ledger_has_started: bool, days: i64) -> String {
 /// Sends and taps per workflow: `message_deliveries` joined to the action
 /// links tapped in the same executions. Thin: parse `days`, one repository
 /// read, totals summed here.
+/// The share of messages that carried an action and drew a tap, rounded to
+/// three places; `null` when none carried one, since a rate over nothing is
+/// not zero.
+fn tap_rate(tapped: i64, with_actions: i64) -> serde_json::Value {
+    if with_actions <= 0 {
+        return serde_json::Value::Null;
+    }
+    // Both counts are row counts far below 2^53, so the conversions are exact.
+    let rate = (tapped as f64 / with_actions as f64 * 1000.0).round() / 1000.0;
+    serde_json::json!(rate)
+}
+
 async fn handle_get_message_engagement(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -7566,6 +7578,19 @@ async fn handle_get_message_engagement(
     let workflows: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
+            let providers: Vec<serde_json::Value> = r
+                .providers
+                .iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "provider": p.provider,
+                        "sends": p.sends,
+                        "parts_sent": p.parts_sent,
+                        "actions_sent": p.actions_sent,
+                        "one_tap_actions": p.one_tap_actions,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "workflow_id": r.workflow_id,
                 "workflow_name": r.workflow_name,
@@ -7574,8 +7599,11 @@ async fn handle_get_message_engagement(
                 "actions_sent": r.actions_sent,
                 "one_tap_actions": r.one_tap_actions,
                 "executions": r.executions,
+                "executions_with_actions": r.executions_with_actions,
                 "executions_tapped": r.executions_tapped,
                 "taps": r.taps,
+                "tap_rate": tap_rate(r.executions_tapped, r.executions_with_actions),
+                "providers": providers,
             })
         })
         .collect();
@@ -7586,11 +7614,16 @@ async fn handle_get_message_engagement(
             "parts_sent": total(|r| r.parts_sent),
             "actions_sent": total(|r| r.actions_sent),
             "executions": total(|r| r.executions),
+            "executions_with_actions": total(|r| r.executions_with_actions),
             "executions_tapped": total(|r| r.executions_tapped),
             "taps": total(|r| r.taps),
+            "tap_rate": tap_rate(
+                total(|r| r.executions_tapped),
+                total(|r| r.executions_with_actions),
+            ),
         },
         "workflows": workflows,
-        "population": "notify-* sends on real runs (dry runs and rehearsals excluded); taps are action links minted in the same executions and used. Email sends are not in this table.",
+        "population": "Sends on real runs by every sender that returns the delivery verdict (notify-* adapters, send-html-email); dry runs and rehearsals excluded. Taps are action links minted in the same executions and used. tap_rate is over executions whose messages carried an action: null when none did. A send node whose installed copy predates the verdict is not counted.",
     });
     mcp_text(
         req_id,
