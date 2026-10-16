@@ -1,6 +1,7 @@
 import React from "react";
 import { cn } from "@/lib/utils";
 import { getCapabilityVisuals } from "@/lib/capabilityBadge";
+import { systemNodeLabel } from "@/lib/systemNodes";
 import type { LucideIcon } from "lucide-react";
 import {
   RotateCw,
@@ -102,30 +103,40 @@ interface NodeBadgesProps {
   systemNodeKind?: string;
   capabilityWorld?: string;
   joinMode?: string;
+  /** The node's own title. When it already says the kind (a node the author
+   *  has not renamed), the badge does not say it a second time. */
+  nodeLabel?: string;
 }
 
 export const NodeBadges: React.FC<NodeBadgesProps> = ({
   systemNodeKind,
   capabilityWorld,
   joinMode,
+  nodeLabel,
 }) => {
   const systemStyle = systemNodeKind
     ? getSystemNodeStyle(systemNodeKind)
     : null;
+  const kindLabel = systemNodeKind ? systemNodeLabel(systemNodeKind) : null;
+  const badgeText = [
+    kindLabel && kindLabel !== nodeLabel ? kindLabel : null,
+    joinMode ?? null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
 
   return (
     <>
-      {systemNodeKind && systemStyle && (
+      {systemNodeKind && systemStyle && badgeText && (
         <div
           className={cn(
-            "text-2xs font-bold mt-2 px-1.5 py-0.5 rounded-md inline-flex items-center gap-1 border",
+            "text-2xs font-semibold mt-2 px-1.5 py-0.5 rounded-md inline-flex items-center gap-1 border",
             systemStyle.color,
             "bg-black/40 border-current/20",
           )}
         >
           <systemStyle.icon className="w-2.5 h-2.5" />
-          {systemNodeKind.toUpperCase()}
-          {systemNodeKind === "FanIn" && joinMode ? ` (${joinMode})` : ""}
+          {badgeText}
         </div>
       )}
 
