@@ -550,7 +550,7 @@ function RotateEncryptionKeyCard() {
 
 export default function SecurityManager() {
   return (
-    <div className="max-w-6xl mx-auto py-4 space-y-10">
+    <div className="max-w-6xl mx-auto py-4 space-y-8">
       {/* Page header */}
       <div>
         <SectionHeader

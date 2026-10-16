@@ -180,7 +180,7 @@ export function IntegrationsManager() {
         onConfirm={handleDisconnectService}
       />
 
-      <div className="p-10 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-ui">
+      <div className="p-6 bg-surface-3/40 border border-white/5 rounded-2xl flex flex-col md:flex-row items-start md:items-center gap-8 relative overflow-hidden group hover:border-white/10 transition-ui">
         <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning shrink-0 transition-ui">
           <HelpCircle size={28} />
         </div>

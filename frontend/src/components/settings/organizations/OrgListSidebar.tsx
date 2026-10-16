@@ -21,11 +21,11 @@ export function OrgListSidebar({
         Organizations
       </div>
       {isLoading ? (
-        <div className="py-12 flex justify-center bg-white/[0.02] border border-white/5 rounded-2xl">
+        <div className="py-8 flex justify-center bg-white/[0.02] border border-white/5 rounded-2xl">
           <LoadingState />
         </div>
       ) : organizations?.length === 0 ? (
-        <div className="p-10 border border-dashed border-white/5 rounded-2xl text-center bg-white/[0.01]">
+        <div className="p-6 border border-dashed border-white/5 rounded-2xl text-center bg-white/[0.01]">
           <p className="text-xs text-muted-foreground/70 font-semibold">
             No active organizations
           </p>

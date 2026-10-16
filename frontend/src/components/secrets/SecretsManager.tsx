@@ -131,7 +131,7 @@ function SecretsManager() {
   };
 
   return (
-    <div className="space-y-12 max-w-6xl mx-auto">
+    <div className="space-y-8 max-w-6xl mx-auto">
       <ConfirmDialog
         open={secretToDelete !== null}
         title="Delete secret"
@@ -251,7 +251,7 @@ function SecretsManager() {
         {isLoading ? (
           <LoadingState label="Loading secrets…" />
         ) : error ? (
-          <div className="p-12 text-center text-destructive bg-destructive/5 flex flex-col items-center gap-4">
+          <div className="p-6 text-center text-destructive bg-destructive/5 flex flex-col items-center gap-4">
             <AlertTriangle className="w-8 h-8" />
             <p className="font-semibold text-xs">Could not load secrets</p>
           </div>
@@ -419,7 +419,7 @@ function SecretsManager() {
       </div>
 
       {/* Advanced Security Section */}
-      <div className="bg-warning/5 border border-warning/20 rounded-2xl p-12 group relative overflow-hidden transition-ui hover:border-warning/40">
+      <div className="bg-warning/5 border border-warning/20 rounded-2xl p-6 group relative overflow-hidden transition-ui hover:border-warning/40">
         <div className="flex flex-col lg:flex-row items-start lg:items-center justify-between gap-8 relative z-10">
           <div className="flex-1 space-y-6">
             <div className="flex items-center gap-4">

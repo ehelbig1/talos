@@ -157,7 +157,7 @@ export default function OAuthManager() {
   }
 
   return (
-    <div className="space-y-10">
+    <div className="space-y-8">
       <div>
         <SectionHeader
           level="h2"

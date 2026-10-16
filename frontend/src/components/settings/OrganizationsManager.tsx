@@ -176,7 +176,7 @@ export default function OrganizationsManager() {
   };
 
   return (
-    <div className="max-w-6xl mx-auto py-4 space-y-10">
+    <div className="max-w-6xl mx-auto py-4 space-y-8">
       <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
         <div>
           <SectionHeader

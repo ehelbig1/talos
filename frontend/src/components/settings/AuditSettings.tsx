@@ -74,7 +74,7 @@ export default function AuditSettings() {
 
   if (isLoading)
     return (
-      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="space-y-6">
           <div className="h-32 bg-white/[0.02] border border-white/5 rounded-2xl" />
@@ -101,7 +101,7 @@ export default function AuditSettings() {
         </p>
       </div>
 
-      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 relative overflow-hidden group">
         <div className="relative z-10">
           <p className="text-sm text-muted-foreground/70 leading-relaxed mb-6 max-w-2xl">
             Stream signed run logs to your existing SIEM over OpenTelemetry.
@@ -214,7 +214,7 @@ export default function AuditSettings() {
             )}
           </div>
 
-          <div className="flex justify-end mt-10">
+          <div className="flex justify-end mt-8">
             <Button
               onClick={handleSave}
               disabled={saving}
