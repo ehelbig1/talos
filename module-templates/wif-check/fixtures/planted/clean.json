@@ -1,0 +1,83 @@
+{
+  "config": {},
+  "input": {
+    "kind": "wif_evidence",
+    "project": "example-project",
+    "providers": [
+      {
+        "pool": "ci-pool",
+        "provider": "ci",
+        "issuer": "https://tokens.ci.example",
+        "condition": "assertion.repository_id == '1001' && assertion.repository_owner_id == '2002' && assertion.ref == 'refs/heads/main'",
+        "audiences": [],
+        "disabled": false
+      },
+      {
+        "pool": "release-pool",
+        "provider": "release",
+        "issuer": "https://tokens.release.example",
+        "condition": "assertion.repository_id == '1001' && assertion.repository_owner_id == '2002' && assertion.ref == 'refs/heads/main'",
+        "audiences": [],
+        "disabled": false
+      },
+      {
+        "pool": "batch-pool",
+        "provider": "batch",
+        "issuer": "",
+        "aws_account": "123456789012",
+        "condition": "assertion.arn.startsWith('arn:aws:sts::123456789012:assumed-role/batch/')",
+        "audiences": [],
+        "disabled": false
+      },
+      {
+        "pool": "retired-pool",
+        "provider": "ci-old",
+        "issuer": "https://tokens.ci.example",
+        "condition": "assertion.repository_id == '1001' && assertion.repository_owner_id == '2002' && assertion.ref == 'refs/heads/main'",
+        "audiences": [],
+        "disabled": true
+      }
+    ],
+    "bindings": [
+      {
+        "service_account": "deploy@example-project.iam.gserviceaccount.com",
+        "role": "roles/iam.workloadIdentityUser",
+        "member": "principalSet://iam.googleapis.com/projects/100000000001/locations/global/workloadIdentityPools/ci-pool/attribute.repository_id/1001"
+      },
+      {
+        "service_account": "release@example-project.iam.gserviceaccount.com",
+        "role": "roles/iam.workloadIdentityUser",
+        "member": "principalSet://iam.googleapis.com/projects/100000000001/locations/global/workloadIdentityPools/release-pool/attribute.repository_id/1001"
+      }
+    ],
+    "roles": [
+      {
+        "member": "serviceAccount:deploy@example-project.iam.gserviceaccount.com",
+        "role": "roles/run.developer"
+      },
+      {
+        "member": "serviceAccount:release@example-project.iam.gserviceaccount.com",
+        "role": "roles/artifactregistry.writer"
+      }
+    ],
+    "audit_logs": [
+      {
+        "service": "allServices",
+        "log_types": [
+          "ADMIN_READ",
+          "DATA_READ"
+        ]
+      }
+    ],
+    "alerts": [
+      {
+        "name": "pool and provider changes",
+        "enabled": true,
+        "filters": [
+          "protoPayload.methodName:\"WorkloadIdentityPools\""
+        ]
+      }
+    ],
+    "unread": []
+  }
+}

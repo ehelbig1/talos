@@ -1,0 +1,45 @@
+{
+  "config": {},
+  "input": {
+    "kind": "binauthz_evidence",
+    "project": "example-project",
+    "api": {
+      "state": "DISABLED"
+    },
+    "clusters": [
+      {
+        "location": "us-central1",
+        "name": "apps",
+        "evaluation": "PROJECT_SINGLETON_POLICY_ENFORCE",
+        "legacy_enabled": false
+      },
+      {
+        "location": "us-central1",
+        "name": "batch",
+        "evaluation": "POLICY_BINDINGS_AND_PROJECT_SINGLETON_POLICY_ENFORCE",
+        "legacy_enabled": false
+      },
+      {
+        "location": "europe-west1-b",
+        "name": "older",
+        "evaluation": "",
+        "legacy_enabled": true
+      }
+    ],
+    "services": [
+      {
+        "location": "us-central1",
+        "name": "api",
+        "binauthz": "default"
+      },
+      {
+        "location": "europe-west1",
+        "name": "worker",
+        "binauthz": "projects/example-project/platforms/cloudRun/strict"
+      }
+    ],
+    "unread": [
+      "policy"
+    ]
+  }
+}

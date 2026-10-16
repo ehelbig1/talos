@@ -1,0 +1,38 @@
+[
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/installation/repositories?per_page=100&page=1",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"repositories\":[{\"archived\":false,\"full_name\":\"Example-Org/infra\",\"name\":\"infra\",\"owner\":{\"login\":\"Example-Org\"}},{\"archived\":false,\"full_name\":\"Example-Org/docs\",\"name\":\"docs\",\"owner\":{\"login\":\"Example-Org\"}},{\"archived\":true,\"name\":\"old\",\"owner\":{\"login\":\"example-org\"}},{\"name\":\"elsewhere\",\"owner\":{\"login\":\"someone-else\"}}],\"total_count\":4}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/infra/environments?per_page=100",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"environments\":[{\"can_admins_bypass\":false,\"deployment_branch_policy\":{\"custom_branch_policies\":true,\"protected_branches\":false},\"name\":\"production\",\"protection_rules\":[{\"prevent_self_review\":true,\"reviewers\":[{\"reviewer\":{\"id\":1},\"type\":\"Team\"},{\"reviewer\":{\"id\":2},\"type\":\"User\"}],\"type\":\"required_reviewers\"},{\"type\":\"wait_timer\",\"wait_timer\":5},{\"type\":\"branch_policy\"}]},{\"can_admins_bypass\":null,\"deployment_branch_policy\":null,\"name\":\"preview/pr 1\",\"protection_rules\":[]}],\"total_count\":2}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/infra/environments/production/deployment-branch-policies?per_page=100",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"branch_policies\":[{\"name\":\"main\",\"type\":\"branch\"},{\"name\":\"v*\",\"type\":\"tag\"}],\"total_count\":2}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/docs/environments?per_page=100",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"environments\":[],\"total_count\":0}"
+ }
+]

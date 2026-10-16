@@ -1,0 +1,73 @@
+{
+  "config": {},
+  "input": {
+    "kind": "artifact_registry_evidence",
+    "project": "example-project",
+    "as_of": "2026-10-14T12:00:00Z",
+    "scanning_api": {
+      "state": "ENABLED"
+    },
+    "repositories": [
+      {
+        "location": "us-central1",
+        "name": "apps",
+        "format": "DOCKER",
+        "mode": "STANDARD_REPOSITORY",
+        "scanning_config": "INHERITED",
+        "cleanup_policies": 0,
+        "cleanup_dry_run": false,
+        "immutable_tags": true,
+        "cleanup_deleting": 0,
+        "cleanup_unknown": 0
+      },
+      {
+        "location": "us-central1",
+        "name": "mirror",
+        "format": "DOCKER",
+        "mode": "REMOTE_REPOSITORY",
+        "scanning_config": "INHERITED",
+        "cleanup_policies": 0,
+        "cleanup_dry_run": false,
+        "immutable_tags": false,
+        "cleanup_deleting": 0,
+        "cleanup_unknown": 0
+      },
+      {
+        "location": "us-central1",
+        "name": "all-images",
+        "format": "DOCKER",
+        "mode": "VIRTUAL_REPOSITORY",
+        "scanning_config": "ENABLEMENT_CONFIG_UNSPECIFIED",
+        "cleanup_policies": 0,
+        "cleanup_dry_run": false,
+        "immutable_tags": false,
+        "cleanup_deleting": 0,
+        "cleanup_unknown": 0
+      },
+      {
+        "location": "us-central1",
+        "name": "libs",
+        "format": "MAVEN",
+        "mode": "STANDARD_REPOSITORY",
+        "scanning_config": "DISABLED",
+        "cleanup_policies": 2,
+        "cleanup_dry_run": false,
+        "cleanup_deleting": 1,
+        "cleanup_unknown": 0
+      }
+    ],
+    "critical_by_image": [
+      {
+        "resource": "https://us-central1-docker.pkg.dev/example-project/apps/web@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "open": 1,
+        "ages": [
+          13
+        ],
+        "severity_unsaid": 0,
+        "undated": 0,
+        "vex_unknown": 0
+      }
+    ],
+    "unread": []
+  }
+}

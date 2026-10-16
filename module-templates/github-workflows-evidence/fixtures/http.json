@@ -1,0 +1,47 @@
+[
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/installation/repositories?per_page=100&page=1",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"repositories\":[{\"archived\":false,\"name\":\"api\",\"owner\":{\"login\":\"Example-Org\"}},{\"archived\":false,\"name\":\"docs\",\"owner\":{\"login\":\"Example-Org\"}},{\"archived\":true,\"name\":\"old\",\"owner\":{\"login\":\"example-org\"}},{\"name\":\"elsewhere\",\"owner\":{\"login\":\"someone-else\"}}],\"total_count\":4}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/api/actions/workflows?per_page=100",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"total_count\":4,\"workflows\":[{\"id\":1,\"name\":\"ci\",\"path\":\".github/workflows/ci.yml\",\"state\":\"active\"},{\"id\":2,\"name\":\"release\",\"path\":\".github/workflows/release.yaml\",\"state\":\"active\"},{\"id\":3,\"name\":\"old\",\"path\":\".github/workflows/old.yml\",\"state\":\"disabled_manually\"},{\"id\":4,\"name\":\"Dependabot Updates\",\"path\":\"dynamic/dependabot/dependabot-updates\",\"state\":\"active\"}]}"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/api/contents/.github/workflows/ci.yml",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "name: ci\non: [push, pull_request]\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4 # pinned below\n      - name: Install\n        run: npm ci && npm run build\n      - name: Audit\n        run: |\n          # a comment, not a command\n          npm audit --audit-level=high --omit=dev --json --foo --bar\n          echo done; cargo deny check advisories\n\n        env:\n          X: 1\n      - uses: 'actions/dependency-review-action@v4'\n  shared:\n    uses: example-org/shared/.github/workflows/build.yml@main\n"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/api/contents/.github/workflows/release.yaml",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "on: workflow_dispatch\njobs:\n  r:\n    steps:\n    - run: >-\n        cargo audit\n    - uses: \"./.github/actions/setup\"\n"
+ },
+ {
+  "method": "GET",
+  "url_contains": "api.github.com/repos/example-org/docs/actions/workflows?per_page=100",
+  "status": 200,
+  "headers": {
+   "content-type": "application/json"
+  },
+  "body": "{\"total_count\":0,\"workflows\":[]}"
+ }
+]

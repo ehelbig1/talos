@@ -1,0 +1,104 @@
+{
+  "config": {},
+  "input": {
+    "kind": "github_workflows_evidence",
+    "owner": "example-org",
+    "repositories": [
+      {
+        "repo": "api",
+        "workflows": [
+          {
+            "path": ".github/workflows/ci.yml",
+            "state": "active",
+            "triggers": [
+              "pull_request",
+              "merge_group"
+            ],
+            "uses": [
+              "actions/checkout@v4",
+              "./.github/workflows/review.yml"
+            ],
+            "commands": [
+              "cargo build --release",
+              "cargo test"
+            ]
+          },
+          {
+            "path": ".github/workflows/review.yml",
+            "state": "active",
+            "triggers": [
+              "workflow_call"
+            ],
+            "uses": [
+              "actions/dependency-review-action@v4"
+            ],
+            "commands": []
+          },
+          {
+            "path": ".github/workflows/old.yml",
+            "state": "disabled_manually"
+          },
+          {
+            "path": "dynamic/dependabot/dependabot-updates",
+            "state": "active"
+          }
+        ]
+      },
+      {
+        "repo": "web",
+        "workflows": [
+          {
+            "path": ".github/workflows/build.yml",
+            "state": "active",
+            "triggers": [
+              "push"
+            ],
+            "uses": [
+              "actions/checkout@v4",
+              "actions/setup-node@v4"
+            ],
+            "commands": [
+              "npm ci",
+              "npm test",
+              "npm run build"
+            ]
+          }
+        ]
+      },
+      {
+        "repo": "tools",
+        "workflows": [
+          {
+            "path": ".github/workflows/ci.yaml",
+            "state": "active",
+            "triggers": [
+              "pull_request",
+              "push"
+            ],
+            "uses": [
+              "actions/checkout@v4",
+              "example-org/shared/.github/workflows/build.yml@main"
+            ],
+            "commands": [
+              "pip-audit -r requirements.txt"
+            ]
+          },
+          {
+            "path": ".github/workflows/release.yaml",
+            "state": "active",
+            "triggers": [
+              "workflow_dispatch"
+            ],
+            "uses": [
+              "actions/checkout@v4"
+            ],
+            "commands": [
+              "python -m build"
+            ]
+          }
+        ]
+      }
+    ],
+    "unread": []
+  }
+}

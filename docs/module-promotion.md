@@ -18,8 +18,9 @@ that someone else could use it.
 |---|---|
 | `module.rs` | `template.rs`, with the module macro on `fn run` (the platform adds that macro when it compiles your source; a template is compiled as written) |
 | `tests.rs` | a `#[cfg(test)]` module inside `template.rs`, run in CI by `talos-catalog-tests` |
-| `module.json` grants and dependencies | `talos.json` |
+| `module.json` grants and dependencies | `talos.json` (the secret grant is written `requires_secrets`, the key the catalog reads) |
 | `fixtures/` (the recorded run it was rehearsed against) | `fixtures/`, checked in CI |
+| `fixtures/planted/` (a security check's planted faults) | `fixtures/planted/`, run by `talos-catalog-tests/tests/planted_faults.rs` |
 
 What does **not** come along: the module's id and its fuel limit on your
 platform, and any secret grant that names your own connection.
@@ -41,12 +42,25 @@ platform, and any secret grant that names your own connection.
    * anything it would copy — source, tests, any fixture — contains a UUID or
      an e-mail address outside the reserved example domains. This repository
      is public. Replace real values with made-up ones where the module is
-     kept, then promote again;
+     kept, then promote again. Three provider shapes pass, because a fixture
+     needs them exactly: a Google service account in a project named
+     `example` or `example-…` (`reader@example-np.iam.gserviceaccount.com`),
+     a Google service agent with the placeholder number 123456
+     (`service-123456@gcp-sa-cloudasset.iam.gserviceaccount.com`), and Cloud
+     Monitoring's sender `alerting-noreply@google.com`. An `@` followed by a
+     version (`scan-action@0.28.0`) is not an address;
    * the module states no capability world, or has no `fn run(`;
    * the template directory already exists (`--force` replaces the files the
      script writes).
 
    It is a filter over shapes, not a guarantee. Read what it wrote.
+
+   The tests go into `template.rs` as written, inside `mod tests { … }` and
+   not re-indented: indenting them would also move the inside of a
+   multi-line string literal, and change what a test feeds the module. A
+   test that runs another module must run a template (a reader's test may
+   run its check); one that runs a module only the authoring lane has stays
+   there.
 
 2. **Fill in the manifest.** Open `module-templates/<slug>/talos.json` and
    write the `config_schema` (every config key the module reads, with a
@@ -109,11 +123,12 @@ platform, and any secret grant that names your own connection.
 
 | File | What it is |
 |---|---|
-| `http.json` | The recorded responses, in request order: `[{method?, url_contains?, status?, headers?, body?}]`. The same shape `test_module`'s `http_fixtures` takes. |
+| `http.json` | The recorded responses, in request order: `[{method?, url_contains?, status?, headers?, body?}]`. The same shape `test_module`'s `http_fixtures` takes. `[]` says the module makes no request (a decider): it is then measured on `input.json`, and a request it made would fail the run. |
 | `config.json` | The node config for the run (optional). |
 | `input.json` | The upstream output for the run (optional). |
 | `grants.json` | `{"allowed_hosts": [...]}` — hosts the rehearsal may address, for a template whose manifest grants none because the installer supplies them (optional). Used by the check only. |
 | `README.md` | What the recording represents: how many items, how large. |
+| `planted/` | A security check's planted faults: `<rule>.json` (evidence with that rule's fault) and `clean.json` (evidence with none), each `{"config": …, "input": …}`. Every rule must find its fault and pass the clean case (`talos-catalog-tests/tests/planted_faults.rs`, which also lists each check that carries them). |
 
 ## What the fuel check proves, and what it does not
 
@@ -124,4 +139,6 @@ not stable across compiler versions, so nothing asserts an exact number.
 
 A template without `fixtures/http.json` is not checked at all. That is right
 for a module that makes no requests and costs the same every time; for a
-module that reads a response, record one.
+module that reads a response, record one. A decider's cost grows with its
+input, not with a response: give it `http.json` = `[]` and the input it is
+sized for in `input.json`.

@@ -1,0 +1,8 @@
+{
+ "AUTH_HEADER": "Bearer made-up-token",
+ "PROJECT": "example-np",
+ "SECURITY_GROUP_EMAIL": "security-team@example.com",
+ "ALERT_POLICY_SELECTOR": {
+  "display_name_prefix": "Security: "
+ }
+}

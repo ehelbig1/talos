@@ -203,13 +203,23 @@ async fn measure(
         .unwrap_or_else(|reason| panic!("{slug}: {reason}"));
     let limit = declared.unwrap_or(talos_compilation::scaffold::FUEL_MAX);
 
-    let fixtures = talos_worker_runtime::rehearsal::parse_http_fixtures(&http)
-        .unwrap_or_else(|e| panic!("{slug}: fixtures/http.json: {e}"));
-    let response_bytes: usize = fixtures.iter().map(|f| f.body.len()).sum();
-    let replay = Arc::new(
-        HttpReplay::for_rehearsal(fixtures)
-            .unwrap_or_else(|e| panic!("{slug}: fixtures/http.json: {e}")),
-    );
+    // `[]` is a module that makes no request (a decider, measured on its
+    // `input.json`): the replay answers nothing, so a request fails the run.
+    let no_requests = http.as_array().is_some_and(Vec::is_empty);
+    let (response_bytes, replay) = if no_requests {
+        assert!(
+            input.as_object().is_some_and(|o| !o.is_empty()),
+            "{slug}: fixtures/http.json is empty, so the run is measured on fixtures/input.json, which is missing"
+        );
+        (0, Arc::new(HttpReplay::refusing_every_request()))
+    } else {
+        let fixtures = talos_worker_runtime::rehearsal::parse_http_fixtures(&http)
+            .unwrap_or_else(|e| panic!("{slug}: fixtures/http.json: {e}"));
+        let bytes: usize = fixtures.iter().map(|f| f.body.len()).sum();
+        let replay = HttpReplay::for_rehearsal(fixtures)
+            .unwrap_or_else(|e| panic!("{slug}: fixtures/http.json: {e}"));
+        (bytes, Arc::new(replay))
+    };
 
     let compiled = compile(compiler, &slug, &template).await;
     assert!(
@@ -282,7 +292,8 @@ async fn measure(
     assert!(
         declared.is_some(),
         "{slug}: has a recorded run but declares no recommended_fuel in talos.json. This run \
-         used {consumed} fuel over {response_bytes} bytes of recorded response; declare a \
+         used {consumed} fuel over {response_bytes} bytes of recorded response (a module that \
+         makes no request is measured on its input.json); declare a \
          recommended_fuel whose limit keeps that under {:.0}% (docs/module-promotion.md).",
         HIGH_FUEL_UTILISATION * 100.0
     );
