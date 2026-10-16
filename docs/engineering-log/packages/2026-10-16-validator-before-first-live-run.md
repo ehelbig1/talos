@@ -94,7 +94,42 @@ Latent vs live: every rule names a shape that ran wrong on this fleet once
 (the fuel report's two nodes, AXP-2315, AXP-1051); `validate_all_workflows` on
 the deployed build is the confirmation of these counts.
 
+## Measured on the deployed build (2026-10-16, after wiring)
+
+`validate_workflow` over the same 92 workflows on build `bee53fe` (the lane's
+`preflight.py`, one call per workflow, diffed against the run on the previous
+build), and `validate_all_workflows` (84 workflows in the fleet report, 327
+warnings, 1 error, history consulted for 64):
+
+| reading | flagged live | against the pre-wiring figure |
+|---|---|---|
+| fuel-headroom | **13** nodes in 9 workflows; 4 of them above 100% of the configured `max_fuel` (`pa-chief-of-staff/compose` 153%, `/synthesize` 124%, `pa-inbox-organizer/classify` 112%, `/organize` 101%) | 2 — the fuel report's `high_utilisation_nodes` reads the peak against the ENFORCED ceiling, which the adaptive floor had raised (synthesize ran under 29,407,098, configured 12,000,000). The validator reads the configured limit, which is the one the author set; the gap between the two readings is the adaptive floor doing the work the author's number does not, and the report's own `node_ceiling_divergence` names the same nodes |
+| child-trigger | **2** (`pa-ask-email/ask`, `stress-05-parent/call_child`) | 1 — the scratch runner skipped the stress fixture (it has a cycle) |
+| message-chain, both | **0** | 0 — but see the stated limit below: no live sender is recognised yet |
+| config, unread | **0** | 0 |
+| config, required | **3**, the same three nodes | 3 |
+
+The 60 `send → part` edges still all carry `!is_error`, so a recognised sender
+would also have flagged nothing on the edge rule today.
+
 ## Stated limits
+
+- `fuel-headroom` reads the node's CONFIGURED limit. Where the adaptive floor
+  is in force a completed run can show above 100% of it; that is the finding
+  (the author's number is below what the node needs), not a false reading,
+  but a reader comparing it to the fuel report's `high_utilisation_nodes`
+  (peak against the enforced ceiling) sees a different count.
+- A sender is recognised by the contract literals `parts_sent` and
+  `parts_total` in its SOURCE. The installed `Notify: ntfy` copy on the
+  reference fleet was compiled on 2026-10-12 and the templates gained the
+  literals on 2026-10-15 (#1329), so on 2026-10-16 the message-chain rule
+  recognises no live sender; it starts to the moment the copies are
+  reinstalled from the catalog. An installed copy does not refresh itself.
+  The `Notify: ntfy` copy was reinstalled at 18:07 UTC the same day
+  (`bytes_changed: true`, grants and fuel kept): over the 43 workflows that
+  use it the rule then recognised the sender and flagged nothing, since every
+  `send → part` edge carries `!is_error` and no sender retries a list.
+  `notify-home-assistant` has no installed copy on this fleet.
 
 - The fuel reading sees completed runs only; a fuel-exhausted attempt is
   invisible here by construction and is `failure-history`'s.
