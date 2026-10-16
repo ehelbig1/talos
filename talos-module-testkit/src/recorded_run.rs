@@ -23,6 +23,13 @@
 //!
 //! A module that makes no request (a decider) is recorded as `http.json` =
 //! `[]` with the input it was given; the fuel check measures it on that.
+//!
+//! Two layouts are known. A catalog template is `module-templates/<slug>/`
+//! (or `talos-catalog-tests/skeletons/<slug>/`) with a `talos.json`; an
+//! authoring lane's module is `modules/<name>/` under the crate running the
+//! tests, with a `module.json`. The lane's `scripts/rehearse.py` runs a module
+//! on the platform against the same `fixtures/` files, so one recording
+//! serves both. `TALOS_TEMPLATES_DIR` names another root outright.
 
 use crate::host;
 use crate::talos::core::http::Method;
@@ -33,6 +40,9 @@ use std::path::PathBuf;
 pub const RECORD_ENV: &str = "TALOS_RECORD_RUNS";
 /// Where templates live, when not the workspace's own `module-templates/`.
 pub const TEMPLATES_ENV: &str = "TALOS_TEMPLATES_DIR";
+/// The manifests that make a directory a module's: the catalog's and an
+/// authoring lane's.
+const MANIFESTS: &[&str] = &["talos.json", "module.json"];
 /// The longest `url_contains` the replay accepts.
 const MAX_MATCH_CHARS: usize = 512;
 /// The most responses one recording may hold (the replay's own limit).
@@ -108,28 +118,51 @@ fn slug_ok(slug: &str) -> bool {
         && !slug.contains("--")
 }
 
-fn fixtures_dir(slug: &str) -> PathBuf {
-    assert!(slug_ok(slug), "{slug:?} is not a template's name");
-    // The catalog's templates, or the skeletons `make new-template` copies
-    // (their names start `skeleton-`), unless the caller names a directory.
+/// The roots a slug is looked for under, in order: the one named by
+/// `TALOS_TEMPLATES_DIR`, else the running crate's own `modules/` (an
+/// authoring lane), the skeletons `make new-template` copies (a `skeleton-`
+/// slug) and the catalog's `module-templates/`.
+fn roots(slug: &str) -> Vec<PathBuf> {
+    if let Some(named) = std::env::var_os(TEMPLATES_ENV) {
+        return vec![PathBuf::from(named)];
+    }
     let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-    let root = std::env::var_os(TEMPLATES_ENV).map_or_else(
-        || {
-            if slug.starts_with("skeleton-") {
-                workspace.join("talos-catalog-tests/skeletons")
-            } else {
-                workspace.join("module-templates")
-            }
-        },
-        PathBuf::from,
-    );
-    let dir = root.join(slug);
-    assert!(
-        dir.join("talos.json").is_file(),
-        "{} is not a template (no talos.json)",
-        dir.display()
-    );
-    dir.join("fixtures")
+    let mut out = Vec::new();
+    // Set by cargo for the test binary it runs: the crate whose tests these
+    // are, which in an authoring lane is where `modules/` lives.
+    if let Some(running) = std::env::var_os("CARGO_MANIFEST_DIR") {
+        out.push(PathBuf::from(running).join("modules"));
+    }
+    if slug.starts_with("skeleton-") {
+        out.push(workspace.join("talos-catalog-tests/skeletons"));
+    }
+    out.push(workspace.join("module-templates"));
+    out
+}
+
+/// The module's directory: the first root under which `<slug>/` holds a
+/// manifest.
+fn module_dir(slug: &str) -> PathBuf {
+    assert!(slug_ok(slug), "{slug:?} is not a module's name");
+    let roots = roots(slug);
+    roots
+        .iter()
+        .map(|root| root.join(slug))
+        .find(|dir| MANIFESTS.iter().any(|m| dir.join(m).is_file()))
+        .unwrap_or_else(|| {
+            panic!(
+                "{slug} is not a module under {} (no talos.json or module.json)",
+                roots
+                    .iter()
+                    .map(|r| r.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })
+}
+
+fn fixtures_dir(slug: &str) -> PathBuf {
+    module_dir(slug).join("fixtures")
 }
 
 /// The files a recorded run consists of, for this test: name → contents.
@@ -156,8 +189,8 @@ fn text(value: &Value) -> String {
     s
 }
 
-/// Hold `module-templates/<slug>/fixtures/` to the run this test just made
-/// with `envelope` (the JSON it passed to `run`). See the module docs.
+/// Hold the module's `fixtures/` to the run this test just made with
+/// `envelope` (the JSON it passed to `run`). See the module docs.
 pub fn keep(slug: &str, envelope: &str) {
     let dir = fixtures_dir(slug);
     let wanted = files(envelope);
@@ -171,7 +204,11 @@ pub fn keep(slug: &str, envelope: &str) {
         }
         return;
     }
-    let again = format!("make record-template TEMPLATE={slug}");
+    // The catalog has a target for it; a lane sets the variable on its test.
+    let again = format!(
+        "make record-template TEMPLATE={slug}` in the Talos workspace, or `{RECORD_ENV}=1 cargo test {}",
+        slug.replace('-', "_")
+    );
     for (name, value) in &wanted {
         let path = dir.join(name);
         let Ok(kept) = std::fs::read_to_string(&path) else {
@@ -250,6 +287,21 @@ mod tests {
         );
         assert_eq!(names(r#"{"input": null}"#), ["http.json"]);
         assert!(std::panic::catch_unwind(|| files(r#"{"input": [1]}"#)).is_err());
+    }
+
+    #[test]
+    fn a_module_is_found_by_either_manifest_and_a_lane_root_comes_first() {
+        // Both layouts resolve from the roots; the running crate's own
+        // `modules/` is tried before the catalog's.
+        let r = roots("x");
+        assert!(r.len() >= 2 && r[0].ends_with("modules"), "{r:?}");
+        assert!(r.last().is_some_and(|p| p.ends_with("module-templates")));
+        assert!(roots("skeleton-x").iter().any(|p| p.ends_with("skeletons")));
+        // A catalog template is found by its talos.json.
+        assert!(module_dir("http-request").join("talos.json").is_file());
+        assert!(fixtures_dir("http-request").ends_with("http-request/fixtures"));
+        // Neither manifest: not a module.
+        assert!(std::panic::catch_unwind(|| module_dir("no-such-module-here")).is_err());
     }
 
     #[test]

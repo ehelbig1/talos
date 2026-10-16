@@ -13,6 +13,9 @@ chrono-tz.workspace = true
 hmac.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# The gates over a module's source (hosts, config keys, the compile lint),
+# re-exported as `source` so a lane that depends on the test kit alone has them.
+talos-module-source = { path = "../talos-module-source" }
 
 [lints]
 workspace = true

@@ -22,6 +22,9 @@ talos-engine-events = { path = "../talos-engine-events" }
 # The advisory-database age sampler publishes through the controller's registry
 # (a leaf: prometheus + talos-workflow-liveness, no cycle back to here).
 talos-metrics = { path = "../talos-metrics" }
+# The static source lint both compile paths run; one home, shared with the
+# catalog gate and the authoring lane.
+talos-module-source = { path = "../talos-module-source" }
 talos-text-util = { path = "../talos-text-util" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
 tokio = { workspace = true, features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }

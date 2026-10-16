@@ -29,6 +29,8 @@ sha2 = { workspace = true }  # used-indirectly: named by included template sourc
 # path and the worker runtime that executes the result.
 [dev-dependencies]
 talos-compilation = { path = "../talos-compilation" }
+# The rules the hosts and config-schema gates apply; the one home.
+talos-module-source = { path = "../talos-module-source" }
 talos-worker-runtime = { path = "../talos-worker-runtime" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
