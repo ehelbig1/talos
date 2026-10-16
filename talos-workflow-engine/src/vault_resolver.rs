@@ -157,8 +157,8 @@ impl std::error::Error for VaultResolverError {}
 /// [`VaultResolverError::SecretNotResolved`] when a referenced path is absent
 /// from `resolved`, or [`VaultResolverError::MintedAtDispatch`] when that
 /// path is one that is minted at dispatch.
-pub fn check_vault_refs_resolvable(
-    resolved: &HashMap<String, String>,
+pub fn check_vault_refs_resolvable<V>(
+    resolved: &HashMap<String, V>,
     refs: &[VaultRef],
 ) -> Result<(), VaultResolverError> {
     for (config_key, vault_path) in refs {
@@ -303,7 +303,8 @@ mod tests {
     #[test]
     fn an_unresolvable_reference_names_the_key_and_the_path() {
         let refs = refs_of(&serde_json::json!({ "AUTH": "vault://nope/missing" }));
-        let err = check_vault_refs_resolvable(&HashMap::new(), &refs).expect_err("must refuse");
+        let err = check_vault_refs_resolvable(&HashMap::<String, String>::new(), &refs)
+            .expect_err("must refuse");
         assert_eq!(
             err,
             VaultResolverError::SecretNotResolved {

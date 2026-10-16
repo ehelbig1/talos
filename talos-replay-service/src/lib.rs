@@ -606,7 +606,7 @@ impl ReplayService {
         module: &WasmModule,
         user_id: Uuid,
         node_configs: impl IntoIterator<Item = &'a JsonValue>,
-    ) -> HashMap<String, String> {
+    ) -> talos_workflow_job_protocol::SecretMap {
         if module.allowed_secrets.is_empty() {
             return HashMap::new();
         }
@@ -624,7 +624,7 @@ impl ReplayService {
         )
         .await
         {
-            Ok(map) => talos_oauth::resolver::into_runtime_secrets(map),
+            Ok(map) => map,
             Err(e) => {
                 tracing::warn!(
                     "replay: secret prefetch failed (continuing with empty map): {}",
@@ -876,7 +876,7 @@ async fn run_replays(
     runtime: &talos_worker_runtime::runtime::TalosRuntime,
     module: &WasmModule,
     samples: Vec<ReplaySample>,
-    secrets: HashMap<String, String>,
+    secrets: talos_workflow_job_protocol::SecretMap,
     timeout_secs: u64,
     caller_ignores: &[String],
     llm_tier: LlmTier,

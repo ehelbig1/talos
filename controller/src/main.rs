@@ -280,7 +280,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Before anything else (subcommands compile templates too): make this
     // process non-dumpable so a same-UID child cannot read our environment.
-    let non_dumpable = make_process_non_dumpable();
+    let non_dumpable = talos_config::process_posture::make_process_non_dumpable();
 
     // Subcommand dispatch — ALWAYS the very first thing in main() so build /
     // CI flows that need the controller binary as a tool (not a server) don't
@@ -913,47 +913,15 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `prctl(PR_SET_DUMPABLE, 0)` on Linux.
-///
-/// The controller's environment holds `TALOS_MASTER_KEY`, `WORKER_SHARED_KEY`,
-/// `JWT_SECRET` and more. On the host-fallback compile path a user module's
-/// `build.rs` / proc-macro runs as the controller's UID, and `env_clear()`
-/// only scrubs the CHILD's environment — the child could still read the
-/// parent's `/proc/<ppid>/environ`. A non-dumpable process has its `/proc`
-/// entries owned by root, closing that read for a non-root controller.
-///
-/// Side effects, accepted: no core dumps, and a same-UID debugger cannot
-/// ptrace-attach (use root / CAP_SYS_PTRACE). The process still reads its
-/// own `/proc/self`. `execve` resets the flag, so compiler children are
-/// unaffected. Returns `Ok(())` off Linux (no `/proc/<pid>/environ` there).
-fn make_process_non_dumpable() -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    {
-        extern "C" {
-            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
-        }
-        const PR_SET_DUMPABLE: std::ffi::c_int = 4;
-        // SAFETY: prctl(PR_SET_DUMPABLE, 0) takes one integer argument and
-        // touches no caller memory.
-        #[allow(unsafe_code)] // see SAFETY above.
-        let rc = unsafe { prctl(PR_SET_DUMPABLE, 0 as std::ffi::c_ulong) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
-    }
-    Ok(())
-}
-
-/// Log the outcome of [`make_process_non_dumpable`]. Until 2026-10-15 a
+/// Log the outcome of `make_process_non_dumpable`. Until 2026-10-15 a
 /// failure refused boot in the one configuration that exposed the environment
 /// to user code — production with the unsandboxed host compile fallback — and
 /// that configuration no longer exists (operator decision G-9: the fallback is
-/// retired and refused at boot where the sandbox is required).
+/// retired and refused at boot where the sandbox is required). The call and
+/// this logger moved to `talos_config::process_posture` on 2026-10-15 so the
+/// worker, which holds every in-flight job's plaintext, takes the same posture.
 fn enforce_non_dumpable_posture(result: Result<(), String>) {
-    match result {
-        Ok(()) => tracing::info!("process marked non-dumpable (PR_SET_DUMPABLE=0)"),
-        Err(e) => tracing::warn!(error = %e, "could not mark the process non-dumpable"),
-    }
+    talos_config::process_posture::log_non_dumpable_outcome(&result);
 }
 
 /// Install the fmt/OTLP tracing subscriber. Extracted verbatim from the top
@@ -1200,22 +1168,3 @@ mod rpc_subscribers;
 // build test 1773350690
 
 mod tenancy;
-
-#[cfg(test)]
-mod non_dumpable_tests {
-    #[cfg(target_os = "linux")]
-    use super::*;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[allow(unsafe_code)] // prctl(PR_GET_DUMPABLE) FFI read.
-    fn the_process_is_non_dumpable_afterwards() {
-        extern "C" {
-            fn prctl(option: std::ffi::c_int, ...) -> std::ffi::c_int;
-        }
-        const PR_GET_DUMPABLE: std::ffi::c_int = 3;
-        make_process_non_dumpable().expect("prctl");
-        // SAFETY: PR_GET_DUMPABLE takes no further arguments.
-        assert_eq!(unsafe { prctl(PR_GET_DUMPABLE) }, 0);
-    }
-}

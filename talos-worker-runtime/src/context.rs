@@ -1676,7 +1676,7 @@ impl TalosContext {
         allowed_hosts: Vec<String>,
         allowed_methods: Vec<String>,
         max_memory_mb: usize,
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
         redis_client: Option<Arc<redis::Client>>,
         nats_client: Option<Arc<async_nats::Client>>,
         allow_wasi_network: bool,
@@ -4245,7 +4245,10 @@ mod secret_use_ledger_tests {
         Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
     ) {
         let mut secrets = HashMap::new();
-        secrets.insert(PATH.to_string(), "tok-plaintext".to_string());
+        secrets.insert(
+            PATH.to_string(),
+            zeroize::Zeroizing::new("tok-plaintext".to_string()),
+        );
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
             // Every destination these tests resolve for is NAMED: since E-3
@@ -4485,7 +4488,10 @@ mod secret_use_ledger_tests {
     #[tokio::test]
     async fn an_llm_provider_key_is_ledgered_and_a_tier1_refusal_is_not() {
         let mut secrets = HashMap::new();
-        secrets.insert("anthropic/api_key".to_string(), "sk-ant-test".to_string());
+        secrets.insert(
+            "anthropic/api_key".to_string(),
+            zeroize::Zeroizing::new("sk-ant-test".to_string()),
+        );
         let mk = |tier| {
             TalosContext::new(
                 CapabilityWorld::Agent,

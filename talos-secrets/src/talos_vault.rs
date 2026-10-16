@@ -4,6 +4,7 @@ use std::time::Instant;
 use zeroize::Zeroizing;
 
 use crate::provider::{SecretProvider, SlotHandle};
+use talos_workflow_job_protocol::SecretMap;
 
 /// Maximum age for a live slot before it is considered stale (rotation boundary).
 ///
@@ -42,9 +43,10 @@ impl SlotEntry {
 
 /// Internal Talos vault backed by a pre-fetched secret map (v1).
 ///
-/// v1 constructor wraps a pre-fetched `HashMap<String, String>` that was
-/// resolved by the controller and passed via the job message. Each value is
-/// wrapped in `Zeroizing<String>` so memory is zeroed on drop.
+/// v1 constructor takes the [`SecretMap`] the controller resolved and the
+/// worker opened (an envelope or a sealed claim): every value is already a
+/// `Zeroizing<String>`, so the map moves in without a plain copy and each
+/// value is wiped on drop.
 ///
 /// In v2 this will gain a `db_pool + master_key` constructor for on-demand
 /// DB-backed resolution, removing the need for the pre-fetch in parallel.rs.
@@ -115,17 +117,14 @@ fn has_auth_scheme_prefix(value: &str, scheme: &str) -> bool {
 }
 
 impl TalosVaultProvider {
-    /// v1 constructor: consume the pre-fetched secrets HashMap, wrapping each
-    /// value in `Zeroizing<String>`. The original HashMap is dropped after
-    /// construction, leaving a single copy inside this struct.
-    pub fn from_resolved(secrets: HashMap<String, String>) -> Self {
-        let resolved = secrets
-            .into_iter()
-            .map(|(k, v)| (k, Zeroizing::new(v)))
-            .collect();
+    /// v1 constructor: take the opened [`SecretMap`] by move. Until
+    /// 2026-10-15 this took a `HashMap<String, String>` and wrapped each value
+    /// here, which made every caller carry a plain map up to this line
+    /// (security review 2026-10-15, C-10).
+    pub fn from_resolved(secrets: SecretMap) -> Self {
         Self {
             slots: DashMap::new(),
-            resolved,
+            resolved: secrets,
             max_slot_age_secs: DEFAULT_MAX_SLOT_AGE_SECS,
         }
     }
@@ -306,7 +305,7 @@ mod tests {
     async fn slot_handles_are_random_not_sequential() {
         let mut map = HashMap::new();
         for i in 0..50 {
-            map.insert(format!("path/{i}"), format!("val{i}"));
+            map.insert(format!("path/{i}"), Zeroizing::new(format!("val{i}")));
         }
         let provider = TalosVaultProvider::from_resolved(map);
         let exec_id = uuid::Uuid::new_v4();
@@ -349,7 +348,10 @@ mod tests {
     #[tokio::test]
     async fn slot_lifecycle_and_release() {
         let mut map = HashMap::new();
-        map.insert("test/key".to_string(), "super-secret-value".to_string());
+        map.insert(
+            "test/key".to_string(),
+            Zeroizing::new("super-secret-value".to_string()),
+        );
 
         let provider = TalosVaultProvider::from_resolved(map);
         let exec_id = uuid::Uuid::new_v4();
@@ -369,7 +371,7 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(
             "test/bearer".to_string(),
-            "Bearer already-has-prefix".to_string(),
+            Zeroizing::new("Bearer already-has-prefix".to_string()),
         );
 
         let provider = TalosVaultProvider::from_resolved(map);
@@ -392,7 +394,7 @@ mod tests {
     async fn bearer_prefix_case_insensitive() {
         for stored in ["Bearer abc", "bearer abc", "BEARER abc", "BeArEr abc"] {
             let mut map = HashMap::new();
-            map.insert("test/key".into(), stored.to_string());
+            map.insert("test/key".into(), Zeroizing::new(stored.to_string()));
             let provider = TalosVaultProvider::from_resolved(map);
             let handle = provider
                 .resolve("test/key", uuid::Uuid::new_v4())
@@ -429,7 +431,7 @@ mod tests {
             ("embedded-crlf-mid", "abc\r\nX: y\r\ndef"),
         ] {
             let mut map = HashMap::new();
-            map.insert("test/bad".into(), bad_value.to_string());
+            map.insert("test/bad".into(), Zeroizing::new(bad_value.to_string()));
             let provider = TalosVaultProvider::from_resolved(map);
             let handle = provider
                 .resolve("test/bad", uuid::Uuid::new_v4())
@@ -462,7 +464,7 @@ mod tests {
             // Tab (0x09) is a valid HTTP header byte; should NOT be rejected.
         ] {
             let mut map = HashMap::new();
-            map.insert("test/ok".into(), stored.to_string());
+            map.insert("test/ok".into(), Zeroizing::new(stored.to_string()));
             let provider = TalosVaultProvider::from_resolved(map);
             let handle = provider
                 .resolve("test/ok", uuid::Uuid::new_v4())
@@ -485,7 +487,7 @@ mod tests {
             "BASIC dXNlcjpwYXNz",
         ] {
             let mut map = HashMap::new();
-            map.insert("test/basic".into(), stored.to_string());
+            map.insert("test/basic".into(), Zeroizing::new(stored.to_string()));
             let provider = TalosVaultProvider::from_resolved(map);
             let handle = provider
                 .resolve("test/basic", uuid::Uuid::new_v4())
@@ -508,7 +510,10 @@ mod tests {
     #[tokio::test]
     async fn bearer_only_with_trailing_space_counts() {
         let mut map = HashMap::new();
-        map.insert("test/key".into(), "Bearerlooks-like-not".into());
+        map.insert(
+            "test/key".into(),
+            Zeroizing::new("Bearerlooks-like-not".into()),
+        );
         let provider = TalosVaultProvider::from_resolved(map);
         let handle = provider
             .resolve("test/key", uuid::Uuid::new_v4())
@@ -531,7 +536,10 @@ mod tests {
     #[tokio::test]
     async fn sign_produces_hmac() {
         let mut map = HashMap::new();
-        map.insert("signing/key".to_string(), "my-hmac-key".to_string());
+        map.insert(
+            "signing/key".to_string(),
+            Zeroizing::new("my-hmac-key".to_string()),
+        );
 
         let provider = TalosVaultProvider::from_resolved(map);
         let handle = provider
@@ -552,7 +560,7 @@ mod tests {
     #[tokio::test]
     async fn sign_rejects_empty_secret() {
         let mut map = HashMap::new();
-        map.insert("signing/key".to_string(), String::new()); // empty!
+        map.insert("signing/key".to_string(), Zeroizing::new(String::new())); // empty!
 
         let provider = TalosVaultProvider::from_resolved(map);
         let handle = provider
@@ -571,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn stale_slot_rejected() {
         let mut map = HashMap::new();
-        map.insert("test/key".to_string(), "secret".to_string());
+        map.insert("test/key".to_string(), Zeroizing::new("secret".to_string()));
 
         // Set max age to 0 so any slot is immediately stale.
         let provider = TalosVaultProvider::from_resolved(map).with_max_slot_age(0);

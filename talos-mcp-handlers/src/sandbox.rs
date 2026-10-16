@@ -2214,7 +2214,7 @@ async fn handle_run_sandbox(
     // path that is MINTED is minted only when the caller's declared
     // `allowed_secrets` covers it: a `vault://` reference in the input is
     // not a grant. With no user identity nothing is minted at all.
-    let mut secrets: std::collections::HashMap<String, String> = if !allowed_secrets.is_empty() {
+    let mut secrets: talos_workflow_job_protocol::SecretMap = if !allowed_secrets.is_empty() {
         talos_oauth::resolver::resolve_for_standalone_run(
             state.secrets_manager.clone(),
             &declared_secrets,
@@ -2222,7 +2222,6 @@ async fn handle_run_sandbox(
             Some(agent.user_id),
         )
         .await
-        .map(talos_oauth::resolver::into_runtime_secrets)
         .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
@@ -2316,11 +2315,11 @@ async fn handle_run_sandbox(
             .get_llm_vault_keys(Some(agent.user_id))
             .await
         {
-            // The cache returns Zeroizing<String>; the destination is a plain
-            // map that is sealed into the job envelope. The unzeroized clone
-            // lives only for this request.
+            // The cache returns Zeroizing<String> and the destination is a
+            // SecretMap of the same: the key moves in, never copied plain
+            // (until 2026-10-15 it was cloned out into a plain map here).
             for (k, v) in llm_keys {
-                secrets.entry(k).or_insert_with(|| v.as_str().to_string());
+                secrets.entry(k).or_insert(v);
             }
         }
     }
@@ -4431,7 +4430,7 @@ async fn handle_test_module(
     // a reference typed into `config`). In a rehearsal (`http_fixtures`)
     // nothing is sent, so nothing is minted either: the grant is empty.
     let mint_grant = test_module_mint_grant(http_replay.is_some(), &module.allowed_secrets);
-    let mut secrets: std::collections::HashMap<String, String> = if !allowed_secrets.is_empty() {
+    let mut secrets: talos_workflow_job_protocol::SecretMap = if !allowed_secrets.is_empty() {
         talos_oauth::resolver::resolve_for_standalone_run(
             state.secrets_manager.clone(),
             mint_grant,
@@ -4439,7 +4438,6 @@ async fn handle_test_module(
             Some(user_id),
         )
         .await
-        .map(talos_oauth::resolver::into_runtime_secrets)
         .unwrap_or_default()
     } else {
         std::collections::HashMap::new()
@@ -4510,11 +4508,11 @@ async fn handle_test_module(
             .get_llm_vault_keys(Some(user_id))
             .await
         {
-            // The cache returns Zeroizing<String>; the destination is a plain
-            // map that is sealed into the job envelope. The unzeroized clone
-            // lives only for this request.
+            // The cache returns Zeroizing<String> and the destination is a
+            // SecretMap of the same: the key moves in, never copied plain
+            // (until 2026-10-15 it was cloned out into a plain map here).
             for (k, v) in llm_keys {
-                secrets.entry(k).or_insert_with(|| v.as_str().to_string());
+                secrets.entry(k).or_insert(v);
             }
         }
     }

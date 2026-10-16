@@ -332,6 +332,11 @@ services:
       METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:?METRICS_AUTH_TOKENS required in .env.production}
     security_opt:
       - "no-new-privileges:true"
+    # The worker holds every in-flight job's opened secrets; it needs no
+    # capability (the Helm chart drops ALL for it too, values.yaml
+    # containerSecurityContext). 2026-10-15.
+    cap_drop:
+      - ALL
     depends_on:
       nats:
         condition: service_healthy

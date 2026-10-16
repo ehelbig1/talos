@@ -30,7 +30,7 @@ talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
 serde_json.workspace = true
 # Wipe opened secret plaintext (claim reply bytes, per-step maps) on drop.
-zeroize.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["default", "env-filter", "fmt"] }
 uuid = { workspace = true, features = ["serde", "v4"] }

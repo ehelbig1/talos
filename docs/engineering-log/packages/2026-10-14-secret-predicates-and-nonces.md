@@ -75,6 +75,10 @@ Package 10 of the review's remediation.
   (`EncryptedSecrets::encrypt_with_aad`, `SealContext::new`, now generic over
   the value type and serialising borrowed views). A standalone run's map
   leaves it at one place, `talos_oauth::resolver::into_runtime_secrets`.
+  - **Correction, 2026-10-15:** that exit is deleted. The runtime, the
+    provider, the envelope decrypt and the claim client all take or return a
+    `SecretMap` now, so a standalone run's map never leaves the type
+    (`2026-10-15-worker-secret-map-zeroizing.md`, check 107).
 - **C-12.** `security_audit` reports `kek_posture` (weight 0): `Warn` "two
   KEKs live" under `KEK_PROVIDER=vault` without `KEK_DISABLE_LEGACY`.
   Recommendation: flip `KEK_DISABLE_LEGACY=true` once `dekMigrationStatus` is

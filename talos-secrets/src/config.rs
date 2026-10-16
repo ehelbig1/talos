@@ -12,12 +12,15 @@ pub enum ProviderConfig {
 
 /// Construct the appropriate provider from config.
 ///
-/// The `secrets` map is consumed by `TalosVaultProvider::from_resolved()`.
-/// When `audit` is `true`, the provider is wrapped in `AuditingProvider`
-/// which logs every resolve / expose / release via `tracing`.
+/// The `secrets` map (a [`SecretMap`] of `Zeroizing` values) is consumed by
+/// `TalosVaultProvider::from_resolved()`. When `audit` is `true`, the
+/// provider is wrapped in `AuditingProvider` which logs every resolve /
+/// expose / release via `tracing`.
+///
+/// [`SecretMap`]: talos_workflow_job_protocol::SecretMap
 pub fn build_provider(
     config: &ProviderConfig,
-    secrets: std::collections::HashMap<String, String>,
+    secrets: talos_workflow_job_protocol::SecretMap,
     audit: bool,
 ) -> Box<dyn crate::SecretProvider> {
     match config {

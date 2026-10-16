@@ -46,7 +46,7 @@ ed25519-dalek.workspace = true
 # `zeroize` (already transitively present) clears the ephemeral secret + derived
 # key material after each open.
 x25519-dalek = { version = "3", features = ["getrandom"] }
-zeroize.workspace = true
+zeroize = { workspace = true, features = ["serde"] }
 
 [features]
 default = []

@@ -1703,6 +1703,7 @@ enforced by `clippy.toml`.
   104. a data-access function that takes user_id binds it
   105. a migration does not UPDATE, DELETE or TRUNCATE an append-only audit table
   106. every call that compiles module source or writes a module's grants passes both gates
+  107. a secret map is a SecretMap of Zeroizing values, never HashMap<String, String>
 
 ### The actor write ceiling → [`2026-10-05-actor-write-ceiling.md`](docs/engineering-log/2026-10-05-actor-write-ceiling.md)
 

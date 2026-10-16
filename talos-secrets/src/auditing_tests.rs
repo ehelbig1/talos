@@ -215,7 +215,10 @@ mod tests {
     async fn auditing_provider_with_talos_vault_integration() {
         // Integration test: wrap an actual TalosVaultProvider
         let mut map = HashMap::new();
-        map.insert("vault/key".to_string(), "my-secret".to_string());
+        map.insert(
+            "vault/key".to_string(),
+            zeroize::Zeroizing::new("my-secret".to_string()),
+        );
 
         let inner = TalosVaultProvider::from_resolved(map);
         let provider = AuditingProvider::new(inner);

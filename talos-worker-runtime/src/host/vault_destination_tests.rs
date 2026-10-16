@@ -28,7 +28,10 @@ const PLAINTEXT: &str = "destination-test-plaintext";
 
 fn ctx(hosts: &[&str]) -> (TalosContext, HostDiagSink) {
     let mut secrets = HashMap::new();
-    secrets.insert(GRANTED_PATH.to_string(), PLAINTEXT.to_string());
+    secrets.insert(
+        GRANTED_PATH.to_string(),
+        zeroize::Zeroizing::new(PLAINTEXT.to_string()),
+    );
     let mut c = TalosContext::new(
         CapabilityWorld::Http,
         hosts.iter().map(|h| h.to_string()).collect(),

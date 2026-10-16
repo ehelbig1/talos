@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "RFC 0010 P3 (D3b) controller-side per-execution secret-envelope sealing: in-flight seal-context store, claim handler, and Redis lease for the claim/lease state machine."
+description = "RFC 0010 P3 (D3b) controller-side per-execution secret-envelope sealing: in-flight seal-context store, claim handler and claim responder."
 
 [dependencies]
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
@@ -13,8 +13,6 @@ dashmap.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 zeroize.workspace = true
 serde_json.workspace = true
-redis = { workspace = true, features = ["tokio-comp", "connection-manager", "script"] }
-talos-redis = { path = "../talos-redis" }
 async-nats.workspace = true
 futures.workspace = true
 tokio = { workspace = true, features = ["rt", "macros", "sync"] }

@@ -497,7 +497,10 @@ mod envelope_key_derivation_tests {
             .unwrap(),
             nonce: nonce.clone(),
         };
-        assert_eq!(v2.decrypt_with_aad(root, aad).expect("opens"), expected);
+        assert_eq!(
+            super::plain_secret_map(&v2.decrypt_with_aad(root, aad).expect("opens")),
+            expected
+        );
         assert!(v2
             .decrypt_with_aad(root, b"made-up execution 0002")
             .is_err());
@@ -509,7 +512,10 @@ mod envelope_key_derivation_tests {
             .unwrap(),
             nonce,
         };
-        assert_eq!(v1.decrypt(root).expect("opens"), expected);
+        assert_eq!(
+            super::plain_secret_map(&v1.decrypt(root).expect("opens")),
+            expected
+        );
     }
 
     /// Known answers for the key derivation, computed OUTSIDE this code — by
@@ -2129,6 +2135,23 @@ pub use talos_workflow_engine_core::write_ceiling_denies;
 /// pipeline and engine-core sits below job-protocol in the dep graph.
 pub use talos_workflow_engine_core::EgressScope;
 pub use talos_workflow_engine_core::LlmTier;
+/// The resolved secret map, `HashMap<String, Zeroizing<String>>`: every value
+/// is wiped when dropped. It is the ONE type a secret map has from the store
+/// to the worker's slot table — the controller resolves one, the envelope
+/// opens into one, the claim client returns one, the runtime takes one. No
+/// `HashMap<String, String>` of secrets exists after the AEAD opens
+/// (security review 2026-10-15, C-10; structural lint check 107).
+pub use talos_workflow_engine_core::SecretMap;
+
+/// Test helper: an opened [`SecretMap`] as plain text, so a test can compare
+/// it with the fixture it encrypted. Test code only — production never
+/// unwraps a whole map.
+#[cfg(test)]
+pub(crate) fn plain_secret_map(map: &SecretMap) -> HashMap<String, String> {
+    map.iter()
+        .map(|(k, v)| (k.clone(), v.to_string()))
+        .collect()
+}
 pub use talos_workflow_engine_core::WriteCeiling;
 /// Re-exported so the worker can name the axis without a direct
 /// `talos-workflow-engine-core` dependency — `talos-worker-runtime` reaches
@@ -4857,7 +4880,7 @@ impl EncryptedSecrets {
     /// `key` must be the same 32-byte key used for encryption.
     /// Backwards-compatible no-AAD wrapper — passes empty AAD.
     /// Use [`Self::decrypt_with_aad`] for new call sites.
-    pub fn decrypt(&self, key: &[u8]) -> Result<HashMap<String, String>, String> {
+    pub fn decrypt(&self, key: &[u8]) -> Result<SecretMap, String> {
         self.decrypt_with_aad(key, &[])
     }
 
@@ -4867,11 +4890,7 @@ impl EncryptedSecrets {
     /// time. If they differ, the tag will not validate and this
     /// method returns the standard "wrong key or tampered ciphertext"
     /// error — same fail-closed surface as a bit-flipped ciphertext.
-    pub fn decrypt_with_aad(
-        &self,
-        key: &[u8],
-        aad: &[u8],
-    ) -> Result<HashMap<String, String>, String> {
+    pub fn decrypt_with_aad(&self, key: &[u8], aad: &[u8]) -> Result<SecretMap, String> {
         if key.len() != 32 {
             return Err(format!(
                 "WORKER_SHARED_KEY must be 32 bytes, got {}",
@@ -4905,8 +4924,9 @@ impl EncryptedSecrets {
         for aead_key in candidates {
             let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
                 .map_err(|e| format!("create cipher: {e}"))?;
-            // The decrypted JSON buffer is wiped once parsed. (The returned
-            // map holds plain Strings — its owner is responsible for it.)
+            // The decrypted JSON buffer is wiped once parsed, and the map it
+            // parses into holds `Zeroizing` values (a `SecretMap`), so no plain
+            // copy of a value outlives this function.
             if let Ok(plaintext) = cipher.decrypt(
                 nonce,
                 Payload {
@@ -4944,7 +4964,7 @@ impl EncryptedSecrets {
         &self,
         ring: &talos_workflow_engine_core::WorkerKeyRing,
         aad: &[u8],
-    ) -> Result<HashMap<String, String>, String> {
+    ) -> Result<SecretMap, String> {
         let mut keys = ring.verify_keys().iter();
         // INVARIANT: a ring is never empty, so `signing` is always present.
         let signing = keys.next().expect("WorkerKeyRing is never empty");
@@ -5234,7 +5254,7 @@ pub struct JobRequest {
     /// re-serialising cannot be made safe).
     pub input_payload: SignedJson,
 
-    /// AES-256-GCM encrypted `HashMap<String, String>` of secret values.
+    /// AES-256-GCM encrypted secret map (opens into a [`SecretMap`]).
     /// Encrypted with the pre-shared `WORKER_SHARED_KEY`.
     /// Never log or expose directly.
     // `default = "…::empty"` (not bare `#[serde(default)]`) because
@@ -9136,7 +9156,10 @@ mod decrypt_ring_tests {
         let cur = vec![0x01u8; 32];
         let enc = EncryptedSecrets::encrypt_with_aad(&secrets(), &cur, b"exec").unwrap();
         let ring = WorkerKeyRing::single(WorkerSharedKey::new(cur));
-        assert_eq!(enc.decrypt_with_ring(&ring, b"exec").unwrap(), secrets());
+        assert_eq!(
+            plain_secret_map(&enc.decrypt_with_ring(&ring, b"exec").unwrap()),
+            secrets()
+        );
     }
 
     #[test]
@@ -9151,7 +9174,10 @@ mod decrypt_ring_tests {
         assert!(enc.decrypt_with_ring(&new_only, b"exec").is_err());
 
         let ring = WorkerKeyRing::new(WorkerSharedKey::new(new), [WorkerSharedKey::new(old)]);
-        assert_eq!(enc.decrypt_with_ring(&ring, b"exec").unwrap(), secrets());
+        assert_eq!(
+            plain_secret_map(&enc.decrypt_with_ring(&ring, b"exec").unwrap()),
+            secrets()
+        );
     }
 
     #[test]
@@ -9187,7 +9213,7 @@ mod tests {
         assert_eq!(encrypted.nonce.len(), 12);
 
         let decrypted = encrypted.decrypt(&key).unwrap();
-        assert_eq!(decrypted, secrets);
+        assert_eq!(plain_secret_map(&decrypted), secrets);
     }
 
     #[test]
@@ -9212,7 +9238,7 @@ mod tests {
         let aad = b"job:abc-123";
         let enc = EncryptedSecrets::encrypt_with_aad(&secrets, &key, aad).unwrap();
         let dec = enc.decrypt_with_aad(&key, aad).unwrap();
-        assert_eq!(dec, secrets);
+        assert_eq!(plain_secret_map(&dec), secrets);
     }
 
     /// L-1: decrypting with a DIFFERENT AAD must fail. This is the
@@ -9329,7 +9355,10 @@ mod tests {
         let env = EncryptedSecrets::encrypt_with_aad(&secrets, &root, aad).unwrap();
 
         // Opens via the normal path (which derives the subkey).
-        assert_eq!(env.decrypt_with_aad(&root, aad).unwrap(), secrets);
+        assert_eq!(
+            plain_secret_map(&env.decrypt_with_aad(&root, aad).unwrap()),
+            secrets
+        );
 
         // Must NOT open if you treat the raw root as the AES-GCM key.
         let raw_cipher = Aes256Gcm::new_from_slice(&root).unwrap();
@@ -9358,7 +9387,7 @@ mod tests {
         secrets.insert("k".to_string(), "v".to_string());
         let enc = EncryptedSecrets::encrypt(&secrets, &key).unwrap();
         let dec = enc.decrypt(&key).unwrap();
-        assert_eq!(dec, secrets);
+        assert_eq!(plain_secret_map(&dec), secrets);
     }
 
     /// L-1: encrypt-no-AAD + decrypt-with-AAD must fail. Confirms the
