@@ -1,55 +1,13 @@
 /**
- * Dropdown menu for adding control-flow nodes (ForEach, FanIn, Loop, etc.)
- * to the workflow canvas. Extracted from WorkflowToolbar.
+ * Dropdown menu for adding control-flow nodes to the workflow canvas. The
+ * kinds and their words live in `@/lib/systemNodes`.
  */
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { Code2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useShallow } from "zustand/react/shallow";
-
-const SYSTEM_NODES = [
-  {
-    kind: "ForEach" as const,
-    label: "For Each",
-    desc: "Iterate over array items",
-  },
-  { kind: "FanIn" as const, label: "Fan-In", desc: "Merge parallel branches" },
-  {
-    kind: "WhileLoop" as const,
-    label: "While Loop",
-    desc: "Loop while condition is true",
-  },
-  { kind: "RepeatLoop" as const, label: "Repeat", desc: "Repeat N times" },
-  {
-    kind: "SubWorkflow" as const,
-    label: "Sub-Workflow",
-    desc: "Run another workflow",
-  },
-  {
-    kind: "ErrorHandler" as const,
-    label: "Error Handler",
-    desc: "Catch and handle errors",
-  },
-  { kind: "Wait" as const, label: "Wait", desc: "Pause for approval" },
-  {
-    kind: "Collect" as const,
-    label: "Collect",
-    desc: "Aggregate multiple inputs",
-  },
-  {
-    kind: "DynamicDispatch" as const,
-    label: "Dynamic Dispatch",
-    desc: "Route to module by name",
-  },
-  {
-    kind: "CapabilityDispatch" as const,
-    label: "Capability Dispatch",
-    desc: "Route to module by capability",
-  },
-] as const;
-
-export type SystemNodeKind = (typeof SYSTEM_NODES)[number]["kind"];
+import { SYSTEM_NODES, type SystemNodeKind } from "@/lib/systemNodes";
 
 interface ControlFlowMenuProps {
   onClose: () => void;

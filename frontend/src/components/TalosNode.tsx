@@ -206,6 +206,7 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           <div className="relative z-10">
             <NodeBadges
               systemNodeKind={data.systemNodeKind}
+              nodeLabel={data.label}
               capabilityWorld={data.capabilityWorld}
               joinMode={data.joinMode}
             />
