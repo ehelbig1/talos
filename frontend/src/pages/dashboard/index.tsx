@@ -30,6 +30,7 @@ import {
   ConfirmDialog,
   PageHeader,
   SkeletonStatRow,
+  PageContainer,
 } from "@/components/ui";
 import { usePersistedExecutionStore } from "@/store/executionStore";
 import { cn } from "@/lib/utils";
@@ -281,9 +282,8 @@ export default function Dashboard() {
 
   if (isLoading) {
     return (
-      <div className="h-full overflow-auto bg-background relative text-foreground/80 custom-scrollbar">
-        <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-surface-1 via-background to-background" />
-        <div className="relative max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
+      <div className="h-full overflow-auto bg-background text-foreground/80 custom-scrollbar">
+        <PageContainer>
           <div className="mb-12 h-12 w-80 rounded-2xl animate-pulse bg-surface-3/40" />
           <SkeletonStatRow className="mb-12" />
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
@@ -294,18 +294,14 @@ export default function Dashboard() {
               />
             ))}
           </div>
-        </div>
+        </PageContainer>
       </div>
     );
   }
 
   return (
-    <div className="h-full overflow-auto bg-background relative text-foreground/80 custom-scrollbar">
-      {/* Dynamic background */}
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/10 via-background to-background opacity-50" />
-
-      <div className="relative max-w-7xl mx-auto px-6 md:px-6 md:px-8 py-8 md:py-10">
-        {/* Header Section */}
+    <div className="h-full overflow-auto bg-background text-foreground/80 custom-scrollbar">
+      <PageContainer>
         <PageHeader
           title="Workflows"
           description={
@@ -473,7 +469,7 @@ export default function Dashboard() {
             </div>
           )}
         </section>
-      </div>
+      </PageContainer>
 
       {/* Overlays */}
       <ConfirmDialog

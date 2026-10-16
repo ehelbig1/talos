@@ -20,7 +20,7 @@ import {
   type ActorTemplate,
 } from "./actors/CreateActorPanel";
 import { Bot, Search, X, Plus, GitCompare, ChevronDown } from "lucide-react";
-import { Button, PageHeader } from "@/components/ui";
+import { Button, PageContainer, PageHeader } from "@/components/ui";
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -171,155 +171,149 @@ export default function Actors() {
   ];
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-hidden relative">
-      {/* Dynamic background */}
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-primary/10 via-background to-background opacity-50" />
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_bottom_right,_var(--tw-gradient-stops))] from-surface-2/20 via-transparent to-transparent opacity-30" />
-
-      {/* Header Area */}
-      <header className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-8 md:pt-10 shrink-0 relative z-10">
-        <PageHeader
-          title="Actors"
-          description={`${actors.length} actor${actors.length !== 1 ? "s" : ""}. Each actor runs workflows under its own capability ceiling and keeps its own memory.`}
-          actions={
-            <>
-              {compareMode && (
+    <div className="h-full overflow-auto bg-background custom-scrollbar">
+      <PageContainer>
+        <header>
+          <PageHeader
+            title="Actors"
+            description={`${actors.length} actor${actors.length !== 1 ? "s" : ""}. Each actor runs workflows under its own capability ceiling and keeps its own memory.`}
+            actions={
+              <>
+                {compareMode && (
+                  <Button
+                    variant={compareSet.size >= 2 ? "premium" : "outline"}
+                    disabled={compareSet.size < 2}
+                    onClick={() => {
+                      navigate(
+                        `/actors/compare?actors=${[...compareSet].join(",")}`,
+                      );
+                      setCompareMode(false);
+                      setCompareSet(new Set());
+                    }}
+                  >
+                    <GitCompare className="w-4 h-4" />
+                    {compareSet.size >= 2
+                      ? `Compare (${compareSet.size})`
+                      : "Select two or more"}
+                  </Button>
+                )}
                 <Button
-                  variant={compareSet.size >= 2 ? "premium" : "outline"}
-                  disabled={compareSet.size < 2}
+                  variant="outline"
+                  aria-pressed={compareMode}
                   onClick={() => {
-                    navigate(
-                      `/actors/compare?actors=${[...compareSet].join(",")}`,
-                    );
-                    setCompareMode(false);
+                    setCompareMode((v) => !v);
                     setCompareSet(new Set());
                   }}
                 >
                   <GitCompare className="w-4 h-4" />
-                  {compareSet.size >= 2
-                    ? `Compare (${compareSet.size})`
-                    : "Select two or more"}
+                  {compareMode ? "Cancel" : "Compare actors"}
                 </Button>
-              )}
-              <Button
-                variant="outline"
-                aria-pressed={compareMode}
-                onClick={() => {
-                  setCompareMode((v) => !v);
-                  setCompareSet(new Set());
-                }}
-              >
-                <GitCompare className="w-4 h-4" />
-                {compareMode ? "Cancel" : "Compare actors"}
-              </Button>
-              <Button onClick={() => setShowCreate(true)}>
-                <Plus className="w-4 h-4" />
-                New actor
-              </Button>
-            </>
-          }
-        />
-        {/* Operational Telemetry Header */}
-        {actors.length > 0 && (
-          <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 border border-white/5 rounded-2xl mb-10">
-            {[
-              {
-                label: "Actors",
-                value: actors.length,
-                color: "text-white",
-              },
-              {
-                label: "Active",
-                value: actors.filter((a) => a.status === "active").length,
-                color: "text-success",
-                dot: true,
-              },
-              {
-                label: "Suspended",
-                value: actors.filter((a) => a.status === "suspended").length,
-                color: "text-warning",
-              },
-              {
-                label: "Deleted",
-                value: actors.filter((a) => a.status === "terminated").length,
-                color: "text-destructive",
-              },
-              {
-                label: "Runs",
-                value:
-                  totalExecutions >= 1000
-                    ? `${(totalExecutions / 1000).toFixed(1)}k`
-                    : totalExecutions,
-                color: "text-primary",
-              },
-            ].map((stat) => (
-              <div
-                key={stat.label}
-                className="px-6 py-2 flex flex-col border-r border-white/5 last:border-0"
-              >
-                <span className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider mb-2">
-                  {stat.label}
-                </span>
-                <div className="flex items-center gap-3">
-                  {stat.dot && (
-                    <div className="w-2 h-2 rounded-full bg-success" />
-                  )}
-                  <span
-                    className={cn(
-                      "text-3xl font-semibold tabular-nums leading-none font-outfit tracking-tight",
-                      stat.color,
-                    )}
-                  >
-                    {stat.value}
+                <Button onClick={() => setShowCreate(true)}>
+                  <Plus className="w-4 h-4" />
+                  New actor
+                </Button>
+              </>
+            }
+          />
+          {/* Operational Telemetry Header */}
+          {actors.length > 0 && (
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-6 p-6 bg-surface-3/40 border border-white/5 rounded-2xl mb-10">
+              {[
+                {
+                  label: "Actors",
+                  value: actors.length,
+                  color: "text-white",
+                },
+                {
+                  label: "Active",
+                  value: actors.filter((a) => a.status === "active").length,
+                  color: "text-success",
+                  dot: true,
+                },
+                {
+                  label: "Suspended",
+                  value: actors.filter((a) => a.status === "suspended").length,
+                  color: "text-warning",
+                },
+                {
+                  label: "Deleted",
+                  value: actors.filter((a) => a.status === "terminated").length,
+                  color: "text-destructive",
+                },
+                {
+                  label: "Runs",
+                  value:
+                    totalExecutions >= 1000
+                      ? `${(totalExecutions / 1000).toFixed(1)}k`
+                      : totalExecutions,
+                  color: "text-primary",
+                },
+              ].map((stat) => (
+                <div
+                  key={stat.label}
+                  className="px-6 py-2 flex flex-col border-r border-white/5 last:border-0"
+                >
+                  <span className="text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider mb-2">
+                    {stat.label}
                   </span>
+                  <div className="flex items-center gap-3">
+                    {stat.dot && (
+                      <div className="w-2 h-2 rounded-full bg-success" />
+                    )}
+                    <span
+                      className={cn(
+                        "text-3xl font-semibold tabular-nums leading-none font-outfit tracking-tight",
+                        stat.color,
+                      )}
+                    >
+                      {stat.value}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Filter Toolbar */}
+          {actors.length > 0 && (
+            <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 border border-white/5 rounded-2xl">
+              <div className="relative flex-1 w-full group/search">
+                <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
+                <input
+                  type="text"
+                  placeholder="Search actors…"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui placeholder:text-muted-foreground/50 relative z-0"
+                />
+              </div>
+
+              <div className="flex items-center gap-3 w-full xl:w-auto px-2 xl:px-0">
+                <span className="text-xs font-semibold text-muted-foreground/60 whitespace-nowrap">
+                  Sort by
+                </span>
+                <div className="flex flex-wrap p-1 bg-surface-4/40 rounded-xl border border-white/5">
+                  {SORT_OPTIONS.map((opt) => (
+                    <button
+                      key={opt.key}
+                      onClick={() => setSortKey(opt.key)}
+                      className={cn(
+                        "px-3 h-8 text-xs font-medium rounded-lg transition-ui whitespace-nowrap",
+                        sortKey === opt.key
+                          ? "bg-primary text-white"
+                          : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
+                      )}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
                 </div>
               </div>
-            ))}
-          </div>
-        )}
-
-        {/* Filter Toolbar */}
-        {actors.length > 0 && (
-          <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 border border-white/5 rounded-2xl">
-            <div className="relative flex-1 w-full group/search">
-              <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
-              <input
-                type="text"
-                placeholder="Search actors…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui placeholder:text-muted-foreground/50 relative z-0"
-              />
             </div>
+          )}
+        </header>
 
-            <div className="flex items-center gap-3 w-full xl:w-auto px-2 xl:px-0">
-              <span className="text-xs font-semibold text-muted-foreground/60 whitespace-nowrap">
-                Sort by
-              </span>
-              <div className="flex flex-wrap p-1 bg-surface-4/40 rounded-xl border border-white/5">
-                {SORT_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.key}
-                    onClick={() => setSortKey(opt.key)}
-                    className={cn(
-                      "px-3 h-8 text-xs font-medium rounded-lg transition-ui whitespace-nowrap",
-                      sortKey === opt.key
-                        ? "bg-primary text-white"
-                        : "text-muted-foreground/70 hover:text-white hover:bg-white/5",
-                    )}
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        )}
-      </header>
-
-      {/* Content Area */}
-      <div className="flex-1 overflow-auto custom-scrollbar px-6 md:px-8 pt-2 pb-24 relative z-0">
-        <div className="max-w-7xl mx-auto">
+        <div className="pt-8">
           {isLoading ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-10">
               {[0, 1, 2, 3, 4, 5].map((i) => (
@@ -444,23 +438,23 @@ export default function Actors() {
             </div>
           )}
         </div>
-      </div>
 
-      <CreateActorPanel
-        open={showCreate}
-        onClose={() => setShowCreate(false)}
-        onCreate={(input) => createMut.mutate(input)}
-        isPending={createMut.isPending}
-      />
+        <CreateActorPanel
+          open={showCreate}
+          onClose={() => setShowCreate(false)}
+          onCreate={(input) => createMut.mutate(input)}
+          isPending={createMut.isPending}
+        />
 
-      <Suspense fallback={null}>
-        {quickRunActor && (
-          <QuickRunModal
-            actor={quickRunActor}
-            onClose={() => setQuickRunActor(null)}
-          />
-        )}
-      </Suspense>
+        <Suspense fallback={null}>
+          {quickRunActor && (
+            <QuickRunModal
+              actor={quickRunActor}
+              onClose={() => setQuickRunActor(null)}
+            />
+          )}
+        </Suspense>
+      </PageContainer>
     </div>
   );
 }

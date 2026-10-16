@@ -24,7 +24,7 @@ import { BudgetPanel } from "./actor-detail/BudgetPanel";
 import { PoliciesPanel } from "./actor-detail/PoliciesPanel";
 import { LogPanel } from "./actor-detail/LogPanel";
 import { HandoffsPanel } from "./actor-detail/HandoffsPanel";
-import { Button, PageHeader } from "@/components/ui";
+import { Button, PageContainer, PageHeader } from "@/components/ui";
 
 export default function ActorDetail() {
   const { id } = useParams<{ id: string }>();
@@ -84,11 +84,11 @@ export default function ActorDetail() {
 
   if (isLoading) {
     return (
-      <div className="flex flex-col h-full bg-background overflow-hidden">
-        <div className="h-24 w-full bg-surface-3/40 border-b border-white/5 animate-shimmer" />
-        <div className="flex-1 p-8 pt-12">
-          <div className="max-w-7xl mx-auto space-y-12">
-            <div className="grid grid-cols-4 gap-6">
+      <div className="h-full overflow-auto bg-background custom-scrollbar">
+        <PageContainer>
+          <div className="space-y-12">
+            <div className="h-12 w-80 rounded-2xl bg-surface-3/40 animate-shimmer" />
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-6">
               {[0, 1, 2, 3].map((i) => (
                 <div
                   key={i}
@@ -98,7 +98,7 @@ export default function ActorDetail() {
             </div>
             <div className="h-[400px] rounded-2xl bg-surface-3/20 border border-white/5 animate-shimmer" />
           </div>
-        </div>
+        </PageContainer>
       </div>
     );
   }
@@ -115,12 +115,9 @@ export default function ActorDetail() {
         <p className="text-muted-foreground font-medium">
           This actor does not exist or you do not have access to it.
         </p>
-        <button
-          onClick={() => navigate("/actors")}
-          className="px-6 py-2.5 text-sm font-semibold text-primary-foreground bg-primary rounded-xl transition-ui flex items-center gap-2"
-        >
-          <ChevronLeft className="w-4 h-4" /> Return to Registry
-        </button>
+        <Button onClick={() => navigate("/actors")}>
+          <ChevronLeft className="w-4 h-4" /> Back to actors
+        </Button>
       </div>
     );
   }
@@ -129,10 +126,8 @@ export default function ActorDetail() {
   const isTerminated = actor.status === "terminated";
 
   return (
-    <div className="flex flex-col h-full bg-background overflow-hidden relative">
-      <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(ellipse_at_top_right,_var(--tw-gradient-stops))] from-primary/5 via-background to-background opacity-50" />
-
-      <div className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-6 shrink-0 relative z-30">
+    <div className="h-full overflow-auto bg-background custom-scrollbar">
+      <PageContainer>
         <PageHeader
           backTo={{ to: "/actors", label: "Actors" }}
           title={
@@ -171,23 +166,19 @@ export default function ActorDetail() {
           }
           className="mb-4"
         />
-      </div>
 
-      {/* Tabs Sticky Bar */}
-      <TabBar
-        active={activeTab}
-        onChange={setActiveTab}
-        counts={{
-          workflows: workflows.length,
-          log: logEntries.length,
-          handoffs: handoffEntries.length,
-        }}
-        showHandoffs={showHandoffs}
-      />
+        <TabBar
+          active={activeTab}
+          onChange={setActiveTab}
+          counts={{
+            workflows: workflows.length,
+            log: logEntries.length,
+            handoffs: handoffEntries.length,
+          }}
+          showHandoffs={showHandoffs}
+        />
 
-      {/* Content Area */}
-      <div className="flex-1 overflow-auto custom-scrollbar relative z-10">
-        <div className="max-w-7xl mx-auto px-6 md:px-8 py-8">
+        <div className="pt-8">
           {activeTab === "summary" && (
             <SummaryPanel
               actor={actor}
@@ -234,7 +225,7 @@ export default function ActorDetail() {
             </div>
           )}
         </div>
-      </div>
+      </PageContainer>
     </div>
   );
 }

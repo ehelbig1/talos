@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useState, useEffect } from "react";
-import { Button, PageHeader } from "@/components/ui";
+import { Button, PageContainer, PageHeader } from "@/components/ui";
 
 const Modules = lazy(() => import("./Modules"));
 const Catalog = lazy(() => import("./Catalog"));
@@ -38,12 +38,8 @@ export default function Library() {
   }, []);
 
   return (
-    <div className="flex flex-col h-full overflow-hidden bg-background relative selection:bg-primary/30">
-      {/* Dynamic Background Glows */}
-      <div className="absolute inset-0 pointer-events-none overflow-hidden select-none z-0"></div>
-
-      {/* Header Area */}
-      <div className="w-full max-w-7xl mx-auto px-6 md:px-8 pt-8 md:pt-10 shrink-0 relative z-10">
+    <div className="h-full overflow-auto bg-background custom-scrollbar">
+      <PageContainer>
         <PageHeader
           title="Library"
           description="Templates you can install, and the modules you have created."
@@ -73,19 +69,11 @@ export default function Library() {
               </Button>
             </div>
           }
-          className="mb-0"
         />
-      </div>
-      {/* Tab content */}
-      <div className="flex-1 overflow-hidden relative z-10">
         <Suspense fallback={<TabLoading />}>
-          <div className="h-full overflow-auto custom-scrollbar">
-            <div className="max-w-7xl mx-auto px-6 md:px-8 pb-24">
-              {tab === "installed" ? <Modules /> : <Catalog />}
-            </div>
-          </div>
+          {tab === "installed" ? <Modules /> : <Catalog />}
         </Suspense>
-      </div>
+      </PageContainer>
     </div>
   );
 }
