@@ -369,9 +369,9 @@ export function GoogleCalendarSelector({
               )}
 
               {setupComplete && (
-                <div className="p-6 bg-emerald-500/5 border border-emerald-500/20 rounded-2xl mt-6">
+                <div className="p-6 bg-success/5 border border-success/20 rounded-2xl mt-6">
                   <div className="flex items-center gap-3 mb-3">
-                    <div className="p-1.5 rounded-lg bg-emerald-500/10 text-emerald-400">
+                    <div className="p-1.5 rounded-lg bg-success/10 text-success">
                       <CheckCircle className="h-5 w-5" />
                     </div>
                     <span className="font-semibold text-xs text-white">

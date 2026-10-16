@@ -380,8 +380,8 @@ export function TestWorkflowModal({
             {workflowName}
           </p>
           <div className="flex items-center gap-2">
-            <div className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-            <span className="text-2xs font-semibold text-emerald-500/60 uppercase tracking-wider">
+            <div className="w-1.5 h-1.5 rounded-full bg-success" />
+            <span className="text-2xs font-semibold text-success/60 uppercase tracking-wider">
               Sandboxed
             </span>
           </div>

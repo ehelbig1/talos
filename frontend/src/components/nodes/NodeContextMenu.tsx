@@ -69,7 +69,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
         role="menuitem"
       >
         <span className="flex items-center gap-2">
-          <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-indigo-400 transition-ui" />
+          <Copy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary transition-ui" />
           Duplicate
         </span>
         <kbd className="text-xs text-muted-foreground font-mono bg-white/5 px-1.5 py-0.5 rounded border border-white/5">
@@ -86,7 +86,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
           role="menuitem"
         >
           <span className="flex items-center gap-2">
-            <ClipboardCopy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-violet-400 transition-ui" />
+            <ClipboardCopy className="w-3.5 h-3.5 text-muted-foreground group-hover:text-primary transition-ui" />
             Copy Node ID
           </span>
         </button>
@@ -97,7 +97,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
       {/* Delete */}
       <button
         type="button"
-        className="w-full text-left px-3 py-2 text-xs font-semibold text-red-400 hover:bg-red-500/10 transition-ui flex items-center justify-between gap-2 group"
+        className="w-full text-left px-3 py-2 text-xs font-semibold text-destructive hover:bg-destructive/10 transition-ui flex items-center justify-between gap-2 group"
         onClick={() => {
           onDelete();
           onClose();
@@ -108,7 +108,7 @@ export const NodeContextMenu: React.FC<NodeContextMenuProps> = ({
           <Trash2 className="w-3.5 h-3.5 opacity-70 group-hover:opacity-100 transition-opacity" />
           Remove Node
         </span>
-        <kbd className="text-xs text-red-500/50 font-mono bg-red-500/5 px-1.5 py-0.5 rounded border border-red-500/10">
+        <kbd className="text-xs text-destructive/50 font-mono bg-destructive/5 px-1.5 py-0.5 rounded border border-destructive/10">
           ⌫
         </kbd>
       </button>

@@ -72,9 +72,9 @@ export function statusColors(status: string) {
 export function workflowStatusColor(status: string | null) {
   switch (status) {
     case "published":
-      return "text-emerald-400";
+      return "text-success";
     case "draft":
-      return "text-amber-400";
+      return "text-warning";
     case "archived":
       return "text-muted-foreground/70";
     default:
@@ -201,7 +201,7 @@ export function LocalEmptyState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center py-16 gap-3">
-      <div className="text-violet-500/30">{icon}</div>
+      <div className="text-primary/30">{icon}</div>
       <p className="text-muted-foreground text-sm">{message}</p>
     </div>
   );
@@ -217,7 +217,7 @@ export function ManagedViaMcp({ tools }: { tools: string[] }) {
         Use{" "}
         {tools.map((t, i) => (
           <React.Fragment key={t}>
-            <code className="text-violet-300 text-xs font-mono bg-violet-500/10 px-1 py-0.5 rounded">
+            <code className="text-primary text-xs font-mono bg-primary/10 px-1 py-0.5 rounded">
               {t}
             </code>
             {i < tools.length - 1 ? ", " : ""}
@@ -339,7 +339,7 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
 
   return (
     <div className="flex items-start gap-4 px-5 py-3 hover:bg-[rgba(255,255,255,0.02)] transition-ui">
-      <div className="w-7 h-7 rounded-lg bg-violet-500/10 flex items-center justify-center text-violet-400 text-xs shrink-0 mt-0.5">
+      <div className="w-7 h-7 rounded-lg bg-primary/10 flex items-center justify-center text-primary text-xs shrink-0 mt-0.5">
         {icon}
       </div>
       <div className="flex-1 min-w-0">
@@ -348,19 +348,19 @@ export function LogEntryRow({ entry }: { entry: ActorActionLogEntry }) {
         </p>
         <div className="flex items-center gap-2 mt-0.5 flex-wrap">
           {entry.workflowId && (
-            <span className="text-xs text-violet-400 font-mono">
+            <span className="text-xs text-primary font-mono">
               wf:{entry.workflowId.slice(0, 8)}
             </span>
           )}
           {entry.executionId && (
-            <span className="text-xs text-sky-400 font-mono">
+            <span className="text-xs text-info font-mono">
               ex:{entry.executionId.slice(0, 8)}
             </span>
           )}
           {isExecutionEntry && (
             <button
               onClick={handleExpand}
-              className="text-xs text-muted-foreground/70 hover:text-violet-300 transition-ui flex items-center gap-0.5"
+              className="text-xs text-muted-foreground/70 hover:text-white transition-ui flex items-center gap-0.5"
             >
               {expanded ? (
                 <>

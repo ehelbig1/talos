@@ -27,8 +27,7 @@ export function renderField(
     "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-ui",
     isValid === false &&
       "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
-    isValid === true &&
-      "border-emerald-500/40 ring-1 ring-emerald-500/20 bg-emerald-500/5",
+    isValid === true && "border-success/40 ring-1 ring-success/20 bg-success/5",
     "focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:bg-surface-3",
   );
 

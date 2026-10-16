@@ -292,7 +292,7 @@ export function SummaryPanel({
                       <button
                         onClick={() => doClone()}
                         disabled={clonePending}
-                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-sky-400 hover:bg-surface-4 hover:border-sky-400/20 transition-ui group/btn disabled:opacity-30"
+                        className="p-3 rounded-xl bg-surface-4/60 border border-white/5 text-muted-foreground hover:text-info hover:bg-surface-4 hover:border-info/20 transition-ui group/btn disabled:opacity-30"
                         title="Duplicate actor"
                         aria-label="Duplicate actor"
                       >
@@ -324,7 +324,7 @@ export function SummaryPanel({
             <StatCard
               label="Logic Nodes"
               value={actor.workflowCount}
-              accent="text-sky-400"
+              accent="text-info"
             />
             <StatCard
               label="Auth Level"

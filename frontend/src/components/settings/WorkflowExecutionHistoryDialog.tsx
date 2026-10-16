@@ -71,23 +71,23 @@ const STATUS_STYLES: Record<
   { badge: string; dot: string; label: string }
 > = {
   completed: {
-    badge: "bg-emerald-500/10 border-emerald-500/25 text-emerald-400",
-    dot: "bg-emerald-400",
+    badge: "bg-success/10 border-success/25 text-success",
+    dot: "bg-success",
     label: "Completed",
   },
   failed: {
-    badge: "bg-red-500/10 border-red-500/25 text-red-400",
-    dot: "bg-red-400",
+    badge: "bg-destructive/10 border-destructive/25 text-destructive",
+    dot: "bg-destructive",
     label: "Failed",
   },
   running: {
-    badge: "bg-indigo-500/10 border-indigo-500/25 text-indigo-400",
-    dot: "bg-indigo-400",
+    badge: "bg-primary/10 border-primary/25 text-primary",
+    dot: "bg-primary",
     label: "Running",
   },
   paused: {
-    badge: "bg-amber-500/10 border-amber-500/25 text-amber-400",
-    dot: "bg-amber-400",
+    badge: "bg-warning/10 border-warning/25 text-warning",
+    dot: "bg-warning",
     label: "Paused",
   },
   cancelled: {

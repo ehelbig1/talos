@@ -460,7 +460,7 @@ export const SmartClassifierConfig: React.FC<SmartClassifierConfigProps> = ({
                     type="checkbox"
                     checked={externalAck}
                     onChange={(e) => setExternalAck(e.target.checked)}
-                    className="mt-0.5 accent-amber-500"
+                    className="mt-0.5 accent-warning"
                     aria-label="Acknowledge external provider data egress"
                   />
                   <span className="text-2xs text-warning/70 font-medium leading-relaxed">

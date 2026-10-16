@@ -67,7 +67,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
               className={cn(
                 "px-2.5 py-1 text-xs rounded-lg border transition-ui",
                 filter === opt.id
-                  ? "bg-violet-500/20 border-violet-500/30 text-violet-300"
+                  ? "bg-primary/20 border-primary/30 text-primary"
                   : "border-white/5 text-muted-foreground hover:text-white hover:bg-surface-3/60",
               )}
             >
@@ -82,7 +82,7 @@ export function LogPanel({ actorId }: { actorId: string }) {
               value={search}
               onChange={(e) => setSearch(e.target.value)}
               placeholder="Search…"
-              className="bg-surface-3/60 border border-white/5 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 w-40"
+              className="bg-surface-3/60 border border-white/5 rounded-lg pl-7 pr-3 py-1.5 text-xs text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 w-40"
             />
           </div>
           {entries.length > 0 && (

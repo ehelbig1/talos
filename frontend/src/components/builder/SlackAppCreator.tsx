@@ -222,8 +222,8 @@ export function SlackAppCreator({
         {/* Token Step */}
         {step === "token" && (
           <>
-            <Section className="p-4 bg-yellow-100 border border-yellow-300 rounded">
-              <div className="text-sm text-yellow-800">
+            <Section className="p-4 bg-warning border border-warning rounded">
+              <div className="text-sm text-warning-foreground">
                 <strong>🔐 Authorization Required</strong>
                 <p className="mt-2">
                   To create a Slack app, you need a user token with{" "}
@@ -241,7 +241,7 @@ export function SlackAppCreator({
                     href="https://api.slack.com/apps"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-purple-800"
+                    className="text-primary-foreground"
                   >
                     api.slack.com/apps
                   </a>
@@ -286,7 +286,7 @@ export function SlackAppCreator({
             </Section>
 
             {error && (
-              <Section className="p-3 bg-red-100 border border-red-300 rounded">
+              <Section className="p-3 bg-destructive border border-destructive rounded">
                 ⚠️ {error}
               </Section>
             )}
@@ -331,7 +331,7 @@ export function SlackAppCreator({
               </p>
             </div>
 
-            <Section className="p-4 bg-blue-50 border border-blue-200 rounded">
+            <Section className="p-4 bg-info border border-info rounded">
               <div className="text-sm mb-2 font-bold">📝 App Credentials:</div>
               <div className="text-xs font-mono leading-snug">
                 {createdApp.app_id && (
@@ -352,8 +352,8 @@ export function SlackAppCreator({
               </div>
             </Section>
 
-            <Section className="p-4 bg-green-100 border border-green-200 rounded">
-              <div className="text-sm text-green-800">
+            <Section className="p-4 bg-success border border-success rounded">
+              <div className="text-sm text-success-foreground">
                 <strong>✓ Next Steps:</strong>
                 <ol className="ml-6 list-decimal">
                   <li>Install the app to your Slack workspace</li>

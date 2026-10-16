@@ -13,7 +13,7 @@ export const NoteBox = React.forwardRef<
     <div
       ref={ref}
       className={cn(
-        "bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 p-3 rounded-lg text-sm",
+        "bg-primary/10 text-primary border border-primary/20 p-3 rounded-lg text-sm",
         className,
       )}
       {...props}

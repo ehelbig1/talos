@@ -65,19 +65,19 @@ export function BudgetPanel({
             {summary.totalExecutions > 0 && (
               <div className="w-full h-2 bg-background rounded-full overflow-hidden flex">
                 <div
-                  className="h-full bg-emerald-500 transition-ui"
+                  className="h-full bg-success transition-ui"
                   style={{
                     width: `${(summary.successfulExecutions / summary.totalExecutions) * 100}%`,
                   }}
                 />
                 <div
-                  className="h-full bg-red-500 transition-ui"
+                  className="h-full bg-destructive transition-ui"
                   style={{
                     width: `${(summary.failedExecutions / summary.totalExecutions) * 100}%`,
                   }}
                 />
                 <div
-                  className="h-full bg-sky-500 transition-ui"
+                  className="h-full bg-info transition-ui"
                   style={{
                     width: `${(summary.activeExecutions / summary.totalExecutions) * 100}%`,
                   }}
@@ -89,17 +89,17 @@ export function BudgetPanel({
               <StatCard
                 label="Successful"
                 value={summary.successfulExecutions}
-                accent="text-emerald-400"
+                accent="text-success"
               />
               <StatCard
                 label="Failed"
                 value={summary.failedExecutions}
-                accent="text-red-400"
+                accent="text-destructive"
               />
               <StatCard
                 label="Active"
                 value={summary.activeExecutions}
-                accent="text-sky-400"
+                accent="text-info"
               />
             </div>
             {successRate !== null && (
@@ -173,10 +173,10 @@ export function BudgetPanel({
                     className={cn(
                       "h-full transition-ui",
                       tokenPct >= 90
-                        ? "bg-red-500"
+                        ? "bg-destructive"
                         : tokenPct >= 75
-                          ? "bg-amber-500"
-                          : "bg-emerald-500",
+                          ? "bg-warning"
+                          : "bg-success",
                     )}
                     style={{ width: `${tokenPct}%` }}
                   />

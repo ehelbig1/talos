@@ -38,26 +38,26 @@ const MEMORY_TYPE_META: Record<
   semantic: {
     label: "Semantic",
     ttl: "Permanent",
-    color: "text-violet-400",
-    bg: "bg-violet-500/10",
+    color: "text-primary",
+    bg: "bg-primary/10",
   },
   episodic: {
     label: "Episodic",
     ttl: "7 days",
-    color: "text-sky-400",
-    bg: "bg-sky-500/10",
+    color: "text-info",
+    bg: "bg-info/10",
   },
   working: {
     label: "Working",
     ttl: "1 hour",
-    color: "text-amber-400",
-    bg: "bg-amber-500/10",
+    color: "text-warning",
+    bg: "bg-warning/10",
   },
   scratchpad: {
     label: "Scratchpad",
     ttl: "24 hours",
-    color: "text-emerald-400",
-    bg: "bg-emerald-500/10",
+    color: "text-success",
+    bg: "bg-success/10",
   },
 };
 
@@ -129,9 +129,9 @@ function MemoryEntryRow({
   const { label: ttlLabel, urgency } = ttlStatus(entry.expiresAt);
   const ttlColor =
     urgency === 3
-      ? "text-red-400 bg-red-500/10"
+      ? "text-destructive bg-destructive/10"
       : urgency === 2
-        ? "text-amber-400 bg-amber-500/10"
+        ? "text-warning bg-warning/10"
         : "text-muted-foreground/70 bg-surface-3/60";
 
   const handleExtend = async () => {
@@ -156,7 +156,7 @@ function MemoryEntryRow({
     <div className="bg-background border border-white/5 rounded-xl px-4 py-3 space-y-1.5">
       <div className="flex items-center justify-between gap-2 flex-wrap">
         <div className="flex items-center gap-2 min-w-0 flex-wrap">
-          <code className="text-xs font-mono text-violet-300 bg-violet-500/10 px-1.5 py-0.5 rounded truncate max-w-[200px]">
+          <code className="text-xs font-mono text-primary bg-primary/10 px-1.5 py-0.5 rounded truncate max-w-[200px]">
             {entry.key}
           </code>
           <MemoryTypeBadge type={entry.memoryType} />
@@ -177,7 +177,7 @@ function MemoryEntryRow({
               onClick={handleExtend}
               disabled={extending}
               title="Refresh TTL to full duration"
-              className="text-xs text-muted-foreground/70 hover:text-emerald-400 transition-ui px-1.5 py-0.5 rounded disabled:opacity-40"
+              className="text-xs text-muted-foreground/70 hover:text-success transition-ui px-1.5 py-0.5 rounded disabled:opacity-40"
             >
               {extending ? (
                 <Loader2 className="w-3 h-3 animate-spin" />
@@ -201,7 +201,7 @@ function MemoryEntryRow({
           )}
           <button
             onClick={() => onEdit(entry)}
-            className="p-1 text-muted-foreground/70 hover:text-violet-400 transition-ui"
+            className="p-1 text-muted-foreground/70 hover:text-primary transition-ui"
             aria-label="Edit"
           >
             <Pencil className="w-3.5 h-3.5" />
@@ -209,7 +209,7 @@ function MemoryEntryRow({
           <button
             onClick={() => onDelete(entry.key)}
             disabled={deleting}
-            className="p-1 text-muted-foreground/70 hover:text-red-400 transition-ui disabled:opacity-40"
+            className="p-1 text-muted-foreground/70 hover:text-destructive transition-ui disabled:opacity-40"
             aria-label="Delete"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -282,7 +282,7 @@ function MemoryForm({
   const isEditing = !!initial;
 
   return (
-    <div className="bg-surface-3/60 border border-violet-500/20 rounded-2xl px-6 py-5 space-y-4">
+    <div className="bg-surface-3/60 border border-primary/20 rounded-2xl px-6 py-5 space-y-4">
       <h3 className="text-sm font-semibold text-white">
         {isEditing ? `Edit memory: ${initial?.key}` : "New memory"}
       </h3>
@@ -294,7 +294,7 @@ function MemoryForm({
           onChange={(e) => setKey(e.target.value)}
           disabled={isEditing}
           placeholder="e.g. persona"
-          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/50 disabled:opacity-50 font-mono"
+          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/50 disabled:opacity-50 font-mono"
         />
       </div>
 
@@ -322,7 +322,7 @@ function MemoryForm({
           ))}
         </div>
         {memType === "semantic" && (
-          <p className="text-xs text-violet-400/70 mt-1">
+          <p className="text-xs text-primary/70 mt-1">
             Semantic memories persist permanently and are injected as{" "}
             <code className="font-mono">__actor_context__</code> when this actor
             triggers a workflow with inject_memory_context enabled.
@@ -343,11 +343,11 @@ function MemoryForm({
           className={cn(
             "w-full bg-background border rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none font-mono resize-y",
             jsonError
-              ? "border-red-500/50 focus:border-red-500/70"
-              : "border-white/10 focus:border-violet-500/50",
+              ? "border-destructive/50 focus:border-destructive/70"
+              : "border-white/10 focus:border-primary/50",
           )}
         />
-        {jsonError && <p className="text-xs text-red-400">{jsonError}</p>}
+        {jsonError && <p className="text-xs text-destructive">{jsonError}</p>}
       </div>
 
       <div className="flex justify-end gap-2">
@@ -499,12 +499,12 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
   return (
     <div className="space-y-5">
       {/* Info banner */}
-      <div className="bg-violet-500/10 border border-violet-500/20 rounded-2xl px-5 py-4">
+      <div className="bg-primary/10 border border-primary/20 rounded-2xl px-5 py-4">
         <div className="flex items-start gap-3">
-          <Brain className="w-5 h-5 text-violet-400 shrink-0 mt-0.5" />
-          <p className="text-violet-200 text-sm leading-relaxed">
+          <Brain className="w-5 h-5 text-primary shrink-0 mt-0.5" />
+          <p className="text-primary text-sm leading-relaxed">
             <strong>Semantic</strong> memories are permanent and injected as{" "}
-            <code className="font-mono text-xs bg-violet-500/20 px-1 rounded">
+            <code className="font-mono text-xs bg-primary/20 px-1 rounded">
               __actor_context__
             </code>{" "}
             when this actor triggers a workflow with{" "}
@@ -539,7 +539,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
             value={memSearch}
             onChange={(e) => setMemSearch(e.target.value)}
             placeholder="Search key or value…"
-            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-violet-500/40 transition-ui"
+            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 transition-ui"
           />
           {memSearch && (
             <button
@@ -640,11 +640,11 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
         </div>
       ) : memories.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-14 gap-3">
-          <Brain className="w-12 h-12 text-violet-500/20" />
+          <Brain className="w-12 h-12 text-primary/20" />
           <p className="text-muted-foreground/70 text-sm">No memories yet.</p>
           <button
             onClick={() => setShowForm(true)}
-            className="text-xs text-violet-400 hover:text-violet-300 transition-ui"
+            className="text-xs text-primary hover:text-white transition-ui"
           >
             Add the first memory →
           </button>
@@ -659,7 +659,7 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
               setMemSearch("");
               setFilterType("all");
             }}
-            className="text-xs text-violet-400 hover:text-violet-300 transition-ui"
+            className="text-xs text-primary hover:text-white transition-ui"
           >
             Clear filters →
           </button>

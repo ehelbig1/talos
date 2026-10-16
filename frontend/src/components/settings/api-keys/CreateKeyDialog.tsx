@@ -74,7 +74,7 @@ export function CreateKeyDialog({
       >
         <div className="px-8 py-6 border-b border-white/5 flex items-center justify-between bg-white/[0.02]">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-indigo-500/10 rounded-xl flex items-center justify-center border border-indigo-500/20 text-indigo-400">
+            <div className="w-10 h-10 bg-primary/10 rounded-xl flex items-center justify-center border border-primary/20 text-primary">
               <Key size={20} />
             </div>
             <div>
@@ -102,7 +102,7 @@ export function CreateKeyDialog({
               Key name
             </label>
             <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-ui">
+              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-primary transition-ui">
                 <Fingerprint size={18} />
               </div>
               <Input
@@ -111,7 +111,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onNameChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-ui h-12 text-sm font-medium rounded-xl"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-primary focus:ring-primary/10 transition-ui h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -121,7 +121,7 @@ export function CreateKeyDialog({
               Expiration Policy
             </label>
             <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-indigo-400 transition-ui">
+              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-primary transition-ui">
                 <Calendar size={18} />
               </div>
               <Input
@@ -131,7 +131,7 @@ export function CreateKeyDialog({
                 onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
                   onExpiresInChange(e.target.value)
                 }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-indigo-500 focus:ring-indigo-500/10 transition-ui h-12 text-sm font-medium rounded-xl"
+                className="pl-12 bg-surface-4/60 border-white/5 focus:border-primary focus:ring-primary/10 transition-ui h-12 text-sm font-medium rounded-xl"
               />
             </div>
           </div>
@@ -148,7 +148,7 @@ export function CreateKeyDialog({
                   className={cn(
                     "flex flex-col items-start p-4 rounded-xl border transition-ui text-left group/scope",
                     selectedScopes.includes(s.value)
-                      ? "bg-indigo-500/10 border-indigo-500/40 text-indigo-100"
+                      ? "bg-primary/10 border-primary/40 text-primary"
                       : "bg-surface-4/60 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]",
                   )}
                 >
@@ -157,7 +157,7 @@ export function CreateKeyDialog({
                       className={cn(
                         "text-xs font-medium",
                         selectedScopes.includes(s.value)
-                          ? "text-indigo-400"
+                          ? "text-primary"
                           : "text-muted-foreground",
                       )}
                     >
@@ -167,7 +167,7 @@ export function CreateKeyDialog({
                       className={cn(
                         "w-4 h-4 rounded-full border transition-ui flex items-center justify-center",
                         selectedScopes.includes(s.value)
-                          ? "bg-indigo-500 border-indigo-500"
+                          ? "bg-primary border-primary"
                           : "bg-surface-3/60 border-white/5",
                       )}
                     >
@@ -203,7 +203,7 @@ export function CreateKeyDialog({
           <Button
             onClick={onCreate}
             disabled={isPending || !name || selectedScopes.length === 0}
-            className="bg-indigo-600 hover:bg-indigo-500 text-white shadow-indigo-600/20 px-8 h-11 rounded-xl font-bold transition-ui"
+            className="bg-primary hover:bg-primary/90 text-white shadow-primary/20 px-8 h-11 rounded-xl font-bold transition-ui"
           >
             {isPending ? (
               <div className="flex items-center gap-2">

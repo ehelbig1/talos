@@ -319,12 +319,12 @@ export function ModuleBuilder({
                   <div className="relative p-10 bg-surface-2/40 border border-white/5 rounded-2xl space-y-10 bg-surface-3 border border-white/10">
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-3">
-                        <Webhook className="h-5 w-5 text-indigo-400" />
-                        <h3 className="text-xs font-semibold text-indigo-400">
+                        <Webhook className="h-5 w-5 text-primary" />
+                        <h3 className="text-xs font-semibold text-primary">
                           Webhook Orchestration
                         </h3>
                       </div>
-                      <Badge className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
+                      <Badge className="bg-primary/10 text-primary border-primary/20 text-2xs font-semibold px-2 py-1 uppercase tracking-wider">
                         Receives webhooks
                       </Badge>
                     </div>
@@ -347,7 +347,7 @@ export function ModuleBuilder({
                             }
                             min="1"
                             max="1000"
-                            className="h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl"
+                            className="h-14 bg-surface-3/60 border-white/5 focus:border-primary/40 text-sm font-semibold rounded-2xl"
                           />
                           <span className="absolute right-5 top-1/2 -translate-y-1/2 text-xs font-medium text-muted-foreground/50">
                             requests/min
@@ -369,7 +369,7 @@ export function ModuleBuilder({
                             value={ipInput}
                             onChange={(e) => setIpInput(e.target.value)}
                             placeholder="0.0.0.0"
-                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-indigo-500/40 text-sm font-semibold rounded-2xl"
+                            className="flex-1 h-14 bg-surface-3/60 border-white/5 focus:border-primary/40 text-sm font-semibold rounded-2xl"
                             onKeyDown={(e) => {
                               if (e.key === "Enter" && ipInput.trim()) {
                                 setWebhookSettings({
@@ -397,7 +397,7 @@ export function ModuleBuilder({
                                 setIpInput("");
                               }
                             }}
-                            className="h-14 px-6 bg-indigo-500 hover:bg-indigo-400 text-white border-none rounded-2xl transition-ui"
+                            className="h-14 px-6 bg-primary hover:bg-primary/90 text-white border-none rounded-2xl transition-ui"
                           >
                             Add
                           </Button>
@@ -407,7 +407,7 @@ export function ModuleBuilder({
                             {webhookSettings.allowedIps.map((ip, index) => (
                               <span
                                 key={ip}
-                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-indigo-400"
+                                className="px-4 py-2 bg-surface-3/80 border border-white/10 rounded-xl text-2xs font-semibold uppercase tracking-wider flex items-center gap-3 text-primary"
                               >
                                 {ip}
                                 <button
@@ -562,7 +562,7 @@ function WebhookSuccessView({
       {isSlackWebhook ? (
         <div className="bg-surface-2/40 border border-white/5 rounded-2xl p-12 relative overflow-hidden bg-surface-3 border border-white/10">
           <div className="flex items-center gap-4 mb-10">
-            <Webhook className="w-6 h-6 text-indigo-400" />
+            <Webhook className="w-6 h-6 text-primary" />
             <h3 className="text-xs font-semibold text-white">
               Set up Slack events
             </h3>
@@ -592,7 +592,7 @@ function WebhookSuccessView({
                       href={`https://${step.link}`}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="text-indigo-400 underline decoration-indigo-400/20 underline-offset-4 hover:decoration-indigo-400 transition-ui ml-1"
+                      className="text-primary underline decoration-primary/20 underline-offset-4 hover:decoration-primary transition-ui ml-1"
                     >
                       {step.link}
                     </a>
@@ -645,7 +645,7 @@ function WebhookSuccessView({
       <Button
         type="button"
         onClick={onClose}
-        className="w-full h-16 bg-success hover:bg-success/90 text-white text-sm font-semibold rounded-2xl transition-ui"
+        className="w-full h-16 bg-success hover:bg-success/90 text-success-foreground text-sm font-semibold rounded-2xl transition-ui"
       >
         Acknowledge Deployment
       </Button>

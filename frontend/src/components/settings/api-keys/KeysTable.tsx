@@ -40,7 +40,7 @@ export function KeysTable({
       <Card className="relative bg-surface-3/80 border-white/10 overflow-hidden rounded-[20px] border">
         {isLoading ? (
           <div className="p-24 flex flex-col items-center justify-center gap-4">
-            <LoadingSpinner className="w-8 h-8 text-indigo-500" />
+            <LoadingSpinner className="w-8 h-8 text-primary" />
             <p className="text-xs text-muted-foreground font-bold">
               Loading Keys...
             </p>
@@ -75,11 +75,11 @@ export function KeysTable({
                     return (
                       <tr
                         key={k.id}
-                        className="group hover:bg-indigo-500/[0.02] transition-ui"
+                        className="group hover:bg-primary/[0.02] transition-ui"
                       >
                         <td className="px-8 py-5">
                           <div className="flex items-center gap-3">
-                            <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400">
+                            <div className="w-8 h-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
                               <Key className="w-4 h-4" />
                             </div>
                             <div className="text-sm font-bold text-foreground leading-tight">
@@ -92,7 +92,7 @@ export function KeysTable({
                             {k.scopes.map((s) => (
                               <span
                                 key={s}
-                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-2xs text-indigo-400 uppercase tracking-wider font-bold"
+                                className="px-2 py-0.5 bg-surface-4/60 border border-white/10 rounded text-2xs text-primary uppercase tracking-wider font-bold"
                               >
                                 {s.split(":").pop()}
                               </span>
@@ -107,17 +107,17 @@ export function KeysTable({
                         </td>
                         <td className="px-8 py-5">
                           {isExpired ? (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-red-500/10 border border-red-500/20 text-xs font-bold text-red-400 rounded-md">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-destructive/10 border border-destructive/20 text-xs font-bold text-destructive rounded-md">
                               <Clock className="w-3 h-3" />
                               Expired
                             </span>
                           ) : k.expiresAt ? (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-amber-500/10 border border-amber-500/20 text-xs font-bold text-amber-500 rounded-md">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-warning/10 border border-warning/20 text-xs font-bold text-warning rounded-md">
                               <Calendar className="w-3.5 h-3.5" />
                               {formatDate(k.expiresAt)}
                             </span>
                           ) : (
-                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-500/10 border border-indigo-500/20 text-xs font-bold text-indigo-400 rounded-md">
+                            <span className="inline-flex items-center gap-1.5 px-2 py-1 bg-primary/10 border border-primary/20 text-xs font-bold text-primary rounded-md">
                               <Shield className="w-3 h-3" />
                               Permanent
                             </span>
@@ -129,7 +129,7 @@ export function KeysTable({
                               variant="ghost"
                               size="sm"
                               onClick={() => onRotate(k.id)}
-                              className="text-muted-foreground hover:text-indigo-400 hover:bg-indigo-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-primary hover:bg-primary/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <RefreshCw className="w-4 h-4" />
                               Rotate
@@ -138,7 +138,7 @@ export function KeysTable({
                               variant="ghost"
                               size="sm"
                               onClick={() => onRevoke(k.id)}
-                              className="text-muted-foreground hover:text-amber-400 hover:bg-amber-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-warning hover:bg-warning/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <Shield className="w-4 h-4" />
                               Revoke
@@ -147,7 +147,7 @@ export function KeysTable({
                               variant="ghost"
                               size="sm"
                               onClick={() => onDelete(k.id)}
-                              className="text-muted-foreground hover:text-red-400 hover:bg-red-400/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
+                              className="text-muted-foreground hover:text-destructive hover:bg-destructive/10 h-9 px-3 font-bold transition-ui text-xs gap-1.5"
                             >
                               <Trash2 className="w-4 h-4" />
                               Delete
