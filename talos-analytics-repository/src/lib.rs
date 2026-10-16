@@ -684,6 +684,34 @@ pub struct WorkflowAlertRow {
     pub execution_archived: bool,
 }
 
+/// One workflow's sends and the taps they drew, for `get_message_engagement`.
+///
+/// Sends are `message_deliveries` rows (one per send node that delivered on a
+/// real run, rehearsals left out); taps are action links minted in the same
+/// executions and used (`workflow_action_tokens.used_at`). A tap is set
+/// against the execution that minted its link, so a message with several
+/// links counts every link tapped, and `executions_tapped` says how many
+/// messages drew at least one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageEngagementRow {
+    pub workflow_id: Uuid,
+    pub workflow_name: String,
+    /// Send nodes that delivered.
+    pub sends: i64,
+    /// Notifications delivered (a list counts each part).
+    pub parts_sent: i64,
+    /// Actions delivered across those notifications.
+    pub actions_sent: i64,
+    /// Actions delivered as one-tap (background POST) actions.
+    pub one_tap_actions: i64,
+    /// Executions that delivered at least one message.
+    pub executions: i64,
+    /// Executions among those whose action links were tapped at least once.
+    pub executions_tapped: i64,
+    /// Action links minted in those executions and tapped.
+    pub taps: i64,
+}
+
 /// Compact alert row for `get_recent_alerts_summary`.
 #[derive(Debug)]
 pub struct RecentAlertSummaryRow {
@@ -4523,6 +4551,76 @@ impl AnalyticsRepository {
 
     /// Recent alerts within a window of `hours`, joined with workflow name.
     /// Cap at 20 — this is a summary view.
+    /// Sends and taps per workflow over the last `days`, for the caller's own
+    /// workflows only (the `workflows.user_id` join; a tap is also held to the
+    /// token's own `user_id`). Rows whose run was a rehearsal
+    /// (`started_by_kind = 'test'`) are left out: a test send reaches a real
+    /// phone, and still is not a message the owner was meant to act on.
+    /// Ordered by sends, then name; at most 200 workflows.
+    pub async fn message_engagement(
+        &self,
+        user_id: Uuid,
+        days: i32,
+    ) -> Result<Vec<MessageEngagementRow>> {
+        let rows = sqlx::query(
+            "WITH sends AS ( \
+                 SELECT d.workflow_id, d.execution_id, d.parts_sent, d.actions_sent, d.one_tap_actions \
+                 FROM message_deliveries d \
+                 JOIN workflows w ON w.id = d.workflow_id \
+                 WHERE w.user_id = $1 \
+                   AND d.sent_at >= NOW() - make_interval(days => $2::int) \
+                   AND d.started_by_kind IS DISTINCT FROM 'test' \
+             ), \
+             sent_executions AS ( \
+                 SELECT DISTINCT workflow_id, execution_id FROM sends \
+             ), \
+             taps AS ( \
+                 SELECT se.workflow_id, se.execution_id, COUNT(*)::bigint AS taps \
+                 FROM workflow_action_tokens t \
+                 JOIN sent_executions se ON se.execution_id = t.source_execution_id \
+                 WHERE t.user_id = $1 AND t.used_at IS NOT NULL \
+                 GROUP BY se.workflow_id, se.execution_id \
+             ), \
+             taps_by_workflow AS ( \
+                 SELECT workflow_id, SUM(taps)::bigint AS taps, COUNT(*)::bigint AS executions_tapped \
+                 FROM taps GROUP BY workflow_id \
+             ) \
+             SELECT w.id AS workflow_id, w.name AS workflow_name, \
+                    COUNT(*)::bigint AS sends, \
+                    SUM(s.parts_sent)::bigint AS parts_sent, \
+                    SUM(s.actions_sent)::bigint AS actions_sent, \
+                    SUM(s.one_tap_actions)::bigint AS one_tap_actions, \
+                    COUNT(DISTINCT s.execution_id)::bigint AS executions, \
+                    COALESCE(tw.executions_tapped, 0)::bigint AS executions_tapped, \
+                    COALESCE(tw.taps, 0)::bigint AS taps \
+             FROM sends s \
+             JOIN workflows w ON w.id = s.workflow_id \
+             LEFT JOIN taps_by_workflow tw ON tw.workflow_id = s.workflow_id \
+             GROUP BY w.id, w.name, tw.executions_tapped, tw.taps \
+             ORDER BY sends DESC, w.name \
+             LIMIT 200",
+        )
+        .bind(user_id)
+        .bind(days)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.iter()
+            .map(|r| -> Result<MessageEngagementRow> {
+                Ok(MessageEngagementRow {
+                    workflow_id: r.try_get("workflow_id")?,
+                    workflow_name: r.try_get("workflow_name")?,
+                    sends: r.try_get("sends")?,
+                    parts_sent: r.try_get("parts_sent")?,
+                    actions_sent: r.try_get("actions_sent")?,
+                    one_tap_actions: r.try_get("one_tap_actions")?,
+                    executions: r.try_get("executions")?,
+                    executions_tapped: r.try_get("executions_tapped")?,
+                    taps: r.try_get("taps")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     pub async fn list_recent_alerts_summary(
         &self,
         user_id: Uuid,

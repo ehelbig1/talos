@@ -2266,6 +2266,16 @@ pub struct TalosMetrics {
     /// `envelope::apply_entry`). Labels: reason=validation|db|tenancy|namespace.
     /// Sustained bump means alert entries are being lost.
     pub ops_alert_ingest_failures_total: CounterVec,
+    /// `message_deliveries` rows the engine's node hook wrote: one per send
+    /// node that completed with the notification contract's verdict on a
+    /// real run (`talos_workflow_engine_core::delivery_verdict`).
+    pub message_deliveries_recorded_total: Counter,
+    /// Sends the hook saw and did not record. Labels:
+    /// reason=db (the insert failed) | malformed (the adapter's verdict is
+    /// outside the contract's bounds) | no_workflow (the run has no workflow
+    /// row to attribute the send to). A sustained `db` or `malformed` bump
+    /// means the engagement report is under-counting.
+    pub message_delivery_record_failures_total: CounterVec,
     /// Alerts auto-resolved by a source-signaled recovery
     /// (`status_event: "resolved"` in the __ops_alert__ envelope or a
     /// `report_ops_alert` call).
@@ -4315,6 +4325,34 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(ops_alert_ingest_failures_total.clone()))?;
 
+        let message_deliveries_recorded_total = Counter::new(
+            "talos_message_deliveries_recorded_total",
+            "message_deliveries rows written by the engine's node hook: one \
+             per send node that completed with the notification contract's \
+             verdict on a real run. A dry run and a skip write nothing.",
+        )?;
+        registry.register(Box::new(message_deliveries_recorded_total.clone()))?;
+
+        let message_delivery_record_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_message_delivery_record_failures_total",
+                "Sends the node hook saw and did not record. Labels: \
+                 reason=db|malformed|no_workflow. A sustained db or \
+                 malformed bump means the message-engagement report is \
+                 under-counting.",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(message_delivery_record_failures_total.clone()))?;
+        // Closed label set, every value written by a live site in
+        // talos-engine's node hook: seeded so an alert's `== 0` arm can read
+        // a zero rather than an absent series.
+        for reason in ["db", "malformed", "no_workflow"] {
+            message_delivery_record_failures_total
+                .with_label_values(&[reason])
+                .inc_by(0.0);
+        }
+
         let ops_alert_auto_resolved_total = Counter::new(
             "talos_ops_alert_auto_resolved_total",
             "ops_alerts rows resolved by a status_event: 'resolved' signal \
@@ -4577,6 +4615,8 @@ impl TalosMetrics {
             rpc_write_ceiling_refusals_total,
             dispatch_refused_total,
             ops_alert_ingest_failures_total,
+            message_deliveries_recorded_total,
+            message_delivery_record_failures_total,
             ops_alert_auto_resolved_total,
             module_payload_encryption_failures_total,
             secret_decrypt_failures_total,

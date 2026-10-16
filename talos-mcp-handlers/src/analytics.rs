@@ -632,6 +632,16 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "get_message_engagement",
+            "description": "Messages the platform sent and the taps they drew, per workflow, over a window. A send is a notify-* node that delivered on a real run (recorded by the engine from the adapter's verdict; dry runs and rehearsals are left out); a tap is an action link minted in the same execution and used. `executions_tapped / executions` is the share of messages that drew at least one tap. Use it before adding a message or a button: a message nobody taps is noise.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "days": { "type": "number", "description": "Look back this many days (default: 14, min: 1, max: 90)" }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "get_workflow_reuse_stats",
             "description": "Get reuse analytics across workflows: invocation counts, unique sessions, repeat-use ratio, and estimated token savings. Two lists: `workflows` is ranked by counted invocations from workflow_executions; `parent_dispatched` names workflows an enabled parent invokes as a sub-workflow, whose invocations are real but UNCOUNTED (a sub-workflow run records no execution row), so their total_invocations is null rather than 0 and they are kept out of the ranking. Each `parent_dispatched` row also carries `child_runs_since_ledger` — a count from the RFC 0012 child-run ledger, floored at `child_runs_counted_from` (the later of the window and `ledger_since`) and null, never 0, when the ledger has nothing to say.",
             "inputSchema": {
@@ -839,6 +849,9 @@ pub async fn dispatch(
         }
         "get_workflows_by_capability" => {
             Some(handle_get_workflows_by_capability(req_id, args, state, user_id).await)
+        }
+        "get_message_engagement" => {
+            Some(handle_get_message_engagement(req_id, args, state, user_id).await)
         }
         "get_workflow_reuse_stats" => {
             Some(handle_get_workflow_reuse_stats(req_id, args, state, user_id).await)
@@ -7538,6 +7551,64 @@ fn child_runs_note(ledger_has_started: bool, days: i64) -> String {
          ledger_since) to now. It is a SECOND number with its own floor, not a \
          substitute for total_invocations, and the list is not ranked by it. {}",
         talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+    )
+}
+
+/// Sends and taps per workflow: `message_deliveries` joined to the action
+/// links tapped in the same executions. Thin: parse `days`, one repository
+/// read, totals summed here.
+async fn handle_get_message_engagement(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let days = match crate::utils::validate_range_f64(args, "days", 1.0, 90.0, 14.0, &req_id) {
+        Ok(v) => v as i32,
+        Err(resp) => return resp,
+    };
+    let rows = match state.analytics_repo.message_engagement(user_id, days).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("get_message_engagement query failed: {:#}", e);
+            return mcp_error(req_id, -32000, "Failed to read message engagement");
+        }
+    };
+    let total = |pick: fn(&talos_analytics_repository::MessageEngagementRow) -> i64| -> i64 {
+        rows.iter().map(pick).sum()
+    };
+    let workflows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "workflow_id": r.workflow_id,
+                "workflow_name": r.workflow_name,
+                "sends": r.sends,
+                "parts_sent": r.parts_sent,
+                "actions_sent": r.actions_sent,
+                "one_tap_actions": r.one_tap_actions,
+                "executions": r.executions,
+                "executions_tapped": r.executions_tapped,
+                "taps": r.taps,
+            })
+        })
+        .collect();
+    let result = serde_json::json!({
+        "days": days,
+        "totals": {
+            "sends": total(|r| r.sends),
+            "parts_sent": total(|r| r.parts_sent),
+            "actions_sent": total(|r| r.actions_sent),
+            "executions": total(|r| r.executions),
+            "executions_tapped": total(|r| r.executions_tapped),
+            "taps": total(|r| r.taps),
+        },
+        "workflows": workflows,
+        "population": "notify-* sends on real runs (dry runs and rehearsals excluded); taps are action links minted in the same executions and used. Email sends are not in this table.",
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
 }
 

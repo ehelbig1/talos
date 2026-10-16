@@ -175,6 +175,68 @@ fn the_same_notification_gets_the_same_verdict_from_every_adapter() {
     }
 }
 
+/// The engine records a sent message by reading the adapter's verdict
+/// (`talos_workflow_engine_core::delivery_verdict`). This holds the reader to
+/// the real verdict every adapter returns: a send reads as the send it was,
+/// and a skip or a dry run reads as nothing sent.
+#[test]
+fn the_engine_reads_every_adapters_verdict_as_the_send_it_was() {
+    use talos_workflow_engine_core::delivery_verdict::{read_delivery_verdict, DeliveryReading};
+
+    let full = json!({ "notification": {
+        "title": "Morning", "body": "Three things today.",
+        "actions": [
+            { "title": "Done", "link": "https://talos.example.test/action-links/aaaa", "one_tap": true, "keep": true },
+            { "title": "Open", "link": "https://talos.example.test/list" },
+        ] } });
+    for adapter in ADAPTERS {
+        let sent =
+            deliver(adapter, full.clone()).unwrap_or_else(|e| panic!("{}: {e}", adapter.slug));
+        let _ = host::http::requests();
+        match read_delivery_verdict(&sent) {
+            DeliveryReading::Sent(d) => {
+                assert_eq!(
+                    (
+                        d.parts_total,
+                        d.parts_sent,
+                        d.actions_sent,
+                        d.one_tap_actions
+                    ),
+                    (1, 1, 2, u32::from(adapter.one_tap)),
+                    "{}: {sent}",
+                    adapter.slug
+                );
+                assert!(d.kept_actions <= d.actions_sent, "{}: {sent}", adapter.slug);
+                assert!(!d.provider.is_empty(), "{}", adapter.slug);
+            }
+            other => panic!("{}: a send read as {other:?}: {sent}", adapter.slug),
+        }
+
+        let skipped = deliver(adapter, json!({ "skip": true })).unwrap();
+        assert_eq!(
+            read_delivery_verdict(&skipped),
+            DeliveryReading::NothingSent,
+            "{}: {skipped}",
+            adapter.slug
+        );
+
+        let mut dry = full.clone();
+        dry["config"] = (adapter.config)();
+        dry["config"]["DRY_RUN"] = json!(true);
+        host::http::respond(200, "{}");
+        let dry: Value = (adapter.run)(dry.to_string())
+            .map(|s| serde_json::from_str(&s).expect("a JSON verdict"))
+            .unwrap_or_else(|e| panic!("{}: {e}", adapter.slug));
+        let _ = host::http::requests();
+        assert_eq!(
+            read_delivery_verdict(&dry),
+            DeliveryReading::NothingSent,
+            "{}: a dry run read as a send: {dry}",
+            adapter.slug
+        );
+    }
+}
+
 #[test]
 fn every_adapter_refuses_and_skips_alike() {
     for adapter in ADAPTERS {

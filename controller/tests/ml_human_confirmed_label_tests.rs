@@ -87,6 +87,7 @@ fn complete(
             max_write_ceiling: WriteCeiling::Write,
             http_verb_ceiling: None,
             started_by_kind,
+            dry_run: false,
             wall_time_ms: 1,
         },
         output,

@@ -401,6 +401,113 @@ impl ControllerNodeHook {
             "engine_node",
         );
     }
+
+    /// Record a message the node sent, when `output` is a `notify-*`
+    /// adapter's verdict (`docs/notification-contract.md`, "What every adapter
+    /// returns"; read by
+    /// [`talos_workflow_engine_core::delivery_verdict::read_delivery_verdict`]).
+    ///
+    /// The node's output is encrypted at rest, so this row is the only count
+    /// of what was sent, and the only thing a tap on an action link
+    /// (`workflow_action_tokens.source_execution_id`) can be set against.
+    ///
+    /// Refused before the output is read: a system node (no module sends), a
+    /// dry run by the engine's own flag (`ctx.dry_run`), and an output the
+    /// worker stamped as stubbed (`__dry_run__`, the job protocol's report).
+    /// The adapter's own `dry_run` and `skipped` words are read after. A
+    /// verdict outside the contract's bounds is counted
+    /// (`message_delivery_record_failures_total{reason="malformed"}`) and
+    /// not written, so a failed CHECK never stands in for a reason. The
+    /// insert runs on a spawned task and its failure is logged and counted,
+    /// never returned: a report that under-counts is the consequence, not a
+    /// failed node.
+    pub fn record_message_delivery_if_present(
+        &self,
+        ctx: &NodeCompletionContext<'_>,
+        output: &JsonValue,
+    ) {
+        use talos_workflow_engine_core::delivery_verdict::{
+            read_delivery_verdict, DeliveryReading,
+        };
+
+        if ctx.module_id.is_none() || ctx.dry_run {
+            return;
+        }
+        if talos_workflow_job_protocol::read_dry_run_report(output).is_some() {
+            return;
+        }
+        let verdict = match read_delivery_verdict(output) {
+            DeliveryReading::Sent(verdict) => verdict,
+            DeliveryReading::NotASend | DeliveryReading::NothingSent => return,
+            DeliveryReading::Malformed(field) => {
+                tracing::warn!(
+                    node_id = %ctx.node_id,
+                    execution_id = %ctx.execution_id,
+                    field,
+                    "a send verdict is outside the notification contract's bounds — the send was not recorded"
+                );
+                bump_delivery_failure("malformed");
+                return;
+            }
+        };
+
+        let pool = self.pool.clone();
+        let workflow_id = ctx.workflow_id;
+        let execution_id = ctx.execution_id;
+        let node_id = ctx.node_id;
+        let started_by_kind = ctx.started_by_kind.map(str::to_owned);
+        tokio::spawn(async move {
+            let delivery = talos_execution_repository::message_deliveries::MessageDelivery {
+                workflow_id,
+                execution_id,
+                node_id,
+                provider: &verdict.provider,
+                parts_total: verdict.parts_total,
+                parts_sent: verdict.parts_sent,
+                actions_sent: verdict.actions_sent,
+                one_tap_actions: verdict.one_tap_actions,
+                kept_actions: verdict.kept_actions,
+                started_by_kind: started_by_kind.as_deref(),
+            };
+            match talos_execution_repository::message_deliveries::record_message_delivery(
+                &pool, delivery,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if let Some(m) = talos_metrics::global() {
+                        m.message_deliveries_recorded_total.inc();
+                    }
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        %workflow_id,
+                        %execution_id,
+                        "a send completed in a run with no workflow row — not recorded"
+                    );
+                    bump_delivery_failure("no_workflow");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %workflow_id,
+                        %execution_id,
+                        %node_id,
+                        error = %e,
+                        "recording a sent message failed — the engagement report will under-count it"
+                    );
+                    bump_delivery_failure("db");
+                }
+            }
+        });
+    }
+}
+
+fn bump_delivery_failure(reason: &str) {
+    if let Some(m) = talos_metrics::global() {
+        m.message_delivery_record_failures_total
+            .with_label_values(&[reason])
+            .inc();
+    }
 }
 
 impl NodeLifecycleHook for ControllerNodeHook {
@@ -456,6 +563,12 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // ── 4. `__ops_alert__` protocol: persist normalized ops-alerts ──
         // Outside the write ceiling by the same decision — see step 3.
         self.persist_ops_alert_if_present(ctx.actor_id, output);
+
+        // ── 5. A sent message: the notification contract's verdict ──
+        // Platform bookkeeping keyed by the WORKFLOW (as `judge_scores` is),
+        // not an actor-data write, so the ceiling does not apply. Refused on
+        // the engine's dry-run flag before the output is read.
+        self.record_message_delivery_if_present(&ctx, output);
     }
 
     fn on_pipeline_step_completed(

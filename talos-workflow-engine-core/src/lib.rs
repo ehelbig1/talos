@@ -121,6 +121,7 @@ mod child_run_recorder;
 pub mod child_workflow_refs;
 pub mod connections_reader;
 mod context;
+pub mod delivery_verdict;
 pub mod dispatch_targets;
 mod dispatcher;
 mod edge;
