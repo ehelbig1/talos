@@ -332,7 +332,7 @@ export default function Actors() {
               <h2 className="text-3xl font-semibold text-white tracking-tight font-outfit mb-4">
                 Could not load actors
               </h2>
-              <p className="text-muted-foreground/70 text-sm max-w-sm font-bold leading-relaxed text-center px-10">
+              <p className="text-muted-foreground/70 text-sm max-w-sm font-medium leading-relaxed text-center px-10">
                 {sanitizeErrorMessage(
                   error instanceof Error
                     ? error.message

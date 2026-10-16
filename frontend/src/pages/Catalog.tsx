@@ -171,7 +171,7 @@ function TemplateCard({
       </div>
 
       {/* Description */}
-      <p className="text-xs text-muted-foreground/50 font-bold leading-relaxed line-clamp-2 flex-1 mb-8 relative z-10">
+      <p className="text-xs text-muted-foreground/50 font-medium leading-relaxed line-clamp-2 flex-1 mb-8 relative z-10">
         {template.description ?? "No description yet."}
       </p>
 

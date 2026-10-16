@@ -71,22 +71,19 @@ export function ServiceCard({
       data-provider-id={providerId}
       className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 transition-ui hover:border-white/10 group relative overflow-hidden flex flex-col h-full"
     >
-      <div className="flex items-start justify-between gap-3 mb-8 relative z-10">
-        <div className="flex items-center gap-5 min-w-0">
+      <div className="flex flex-wrap items-start gap-3 mb-6 relative z-10">
+        <div className="flex items-center gap-4 min-w-[9rem] flex-1">
           <div
-            className="w-14 h-14 rounded-2xl flex items-center justify-center text-white transition-ui"
-            style={{
-              background: `linear-gradient(135deg, ${color}, ${color}dd)`,
-              boxShadow: `0 10px 25px -5px ${color}44`,
-            }}
+            className="w-12 h-12 shrink-0 rounded-2xl flex items-center justify-center text-white"
+            style={{ background: color }}
           >
-            <Icon size={28} />
+            <Icon size={24} />
           </div>
-          <div>
-            <h3 className="text-xl font-semibold text-white tracking-tight">
+          <div className="min-w-0">
+            <h3 className="text-lg font-semibold text-white tracking-tight">
               {title}
             </h3>
-            <p className="text-xs text-muted-foreground/60 font-semibold mt-0.5">
+            <p className="text-xs text-muted-foreground/60 font-medium mt-0.5">
               {description}
             </p>
           </div>
@@ -94,14 +91,14 @@ export function ServiceCard({
         {configured ? (
           <button
             onClick={onConnect}
-            className="p-2.5 bg-white/5 border border-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary transition-ui rounded-xl"
+            className="ml-auto p-2.5 bg-white/5 border border-white/5 hover:bg-primary/10 hover:border-primary/20 hover:text-primary transition-ui rounded-xl"
             title="Connect account"
             aria-label="Connect account"
           >
             <Plus size={18} />
           </button>
         ) : (
-          <span className="shrink-0 whitespace-nowrap text-2xs font-semibold text-muted-foreground/50 uppercase tracking-wider px-3 py-1.5 border border-white/5 rounded-xl">
+          <span className="ml-auto shrink-0 whitespace-nowrap text-2xs font-semibold text-muted-foreground/60 uppercase tracking-wider px-3 py-1.5 border border-white/5 rounded-xl">
             Coming soon
           </span>
         )}

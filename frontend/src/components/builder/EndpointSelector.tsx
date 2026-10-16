@@ -396,7 +396,7 @@ export function EndpointSelector({
                       </label>
                     </div>
                     {prop.description && (
-                      <p className="text-2xs font-bold text-muted-foreground/50 leading-relaxed px-1">
+                      <p className="text-2xs font-medium text-muted-foreground/50 leading-relaxed px-1">
                         {prop.description}
                       </p>
                     )}
@@ -492,7 +492,7 @@ function ParameterInput({
         </Badge>
       </div>
       {parameter.description && (
-        <p className="text-2xs font-bold text-muted-foreground/50 leading-relaxed px-1">
+        <p className="text-2xs font-medium text-muted-foreground/50 leading-relaxed px-1">
           {parameter.description}
         </p>
       )}

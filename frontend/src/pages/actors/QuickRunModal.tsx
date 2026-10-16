@@ -63,7 +63,7 @@ export function QuickRunModal({ actor, onClose }: QuickRunModalProps) {
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <p className="text-muted-foreground/70 text-2xs font-bold uppercase tracking-wider">
+                  <p className="text-muted-foreground/70 text-2xs font-medium uppercase tracking-wider">
                     Execution id
                   </p>
                   <p className="text-white font-mono text-xs break-all selection:bg-success/30">

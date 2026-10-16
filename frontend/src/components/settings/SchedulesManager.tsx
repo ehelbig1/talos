@@ -99,7 +99,7 @@ function AddScheduleDialog({
               <h3 className="text-xl font-semibold text-white tracking-tight font-outfit">
                 New schedule
               </h3>
-              <p className="text-xs text-muted-foreground/70 font-bold mt-1">
+              <p className="text-xs text-muted-foreground/70 font-medium mt-1">
                 Run a workflow on a cron schedule
               </p>
             </div>
@@ -521,25 +521,20 @@ export default function SchedulesManager() {
   return (
     <div className="max-w-6xl mx-auto py-4 space-y-10">
       {/* Page header */}
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-6">
-          <div className="w-16 h-16 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning relative">
-            <Clock size={32} className="relative z-10" />
-          </div>
-          <div>
-            <SectionHeader
-              level="h2"
-              className="text-3xl font-semibold text-white tracking-tight font-outfit mb-1"
-            >
-              Schedules
-            </SectionHeader>
-            <p className="text-xs text-muted-foreground/70 font-semibold">
-              Workflows that run on a timer
-            </p>
-          </div>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            Schedules
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            Workflows that run on a timer.
+          </p>
         </div>
-        <Button onClick={() => setShowAdd(true)} className="h-14 px-8">
-          <Plus className="w-5 h-5 mr-2" />
+        <Button onClick={() => setShowAdd(true)} className="w-full md:w-auto">
+          <Plus className="w-4 h-4" />
           New schedule
         </Button>
       </div>

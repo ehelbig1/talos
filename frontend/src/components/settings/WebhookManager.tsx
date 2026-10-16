@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Dialog } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
@@ -248,24 +249,22 @@ export default function WebhookManager() {
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden">
         {/* Header */}
         <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-8 mb-8 relative z-10">
-          <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
-              <Webhook className="w-8 h-8 text-primary" />
-            </div>
-            <div>
-              <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
-                Webhooks
-              </h3>
-              <p className="text-xs text-muted-foreground/70 font-semibold mt-2">
-                Start workflows from incoming HTTP requests
-              </p>
-            </div>
+          <div>
+            <SectionHeader
+              level="h2"
+              className="text-2xl font-semibold text-white tracking-tight"
+            >
+              Webhooks
+            </SectionHeader>
+            <p className="text-sm text-muted-foreground mt-2">
+              Start workflows from incoming HTTP requests.
+            </p>
           </div>
           <Button
             onClick={() => setShowCreate(true)}
-            className="h-14 px-8 rounded-2xl flex items-center gap-3 w-full md:w-auto"
+            className="w-full md:w-auto"
           >
-            <Plus className="w-5 h-5" />
+            <Plus className="w-4 h-4" />
             New webhook
           </Button>
         </div>
@@ -387,19 +386,6 @@ export default function WebhookManager() {
             })}
           </div>
         )}
-
-        <div className="mt-10 pt-6 border-t border-white/5 flex items-center justify-between relative z-10">
-          <div className="flex items-center gap-3">
-            <div className="w-2 h-2 rounded-full bg-success" />
-            <span className="text-xs text-muted-foreground/70 font-semibold">
-              Ingress Monitoring Active &bull; Polling 30s Intervals
-            </span>
-          </div>
-          <span className="text-xs text-muted-foreground/50 font-semibold">
-            {triggers.length} webhook
-            {triggers.length !== 1 ? "s" : ""}
-          </span>
-        </div>
       </div>
     </>
   );

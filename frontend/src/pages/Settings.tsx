@@ -7,26 +7,8 @@ import { useAuth } from "@/contexts/AuthContext";
 import { Link, useNavigate } from "react-router";
 import { cn } from "@/lib/utils";
 import { PageContainer, PageHeader } from "@/components/ui";
-import {
-  Lock as LockIcon,
-  User as UserIcon,
-  Plug,
-  Server,
-  Webhook,
-  Key,
-  Shield,
-  Building,
-  CheckSquare,
-  Calendar,
-  FileSearch,
-  Inbox,
-  BarChart,
-  Layers,
-  type LucideIcon,
-  Activity,
-  AlertTriangle,
-  BrainCircuit,
-} from "lucide-react";
+import { SETTINGS_GROUPS, type SettingsSection } from "@/lib/settingsSections";
+import { User as UserIcon } from "lucide-react";
 
 // Lazy-loaded panel chunks with module references for prefetching.
 const integrationsImport = () =>
@@ -109,80 +91,6 @@ const prefetchMap: Record<string, () => Promise<unknown>> = {
 
 // ─── Sidebar data ─────────────────────────────────────────────────────────────
 
-interface SidebarItem {
-  value: string;
-  label: string;
-  icon: LucideIcon;
-  /** A page of its own, listed here so it has a home; it is not a section. */
-  to?: string;
-}
-
-interface SidebarCategory {
-  label: string;
-  items: SidebarItem[];
-}
-
-/* Six groups, one line each where one will do. Account is ONE section: the
-   profile, password, two-factor and connected sign-ins stack on one page (the
-   old #password, #two-factor and #oauth hashes still land on their card). */
-const SIDEBAR_CATEGORIES: SidebarCategory[] = [
-  {
-    label: "Account",
-    items: [{ value: "account", label: "Account and sign-in", icon: UserIcon }],
-  },
-  {
-    label: "Workflows",
-    items: [
-      { value: "schedules", label: "Schedules", icon: Calendar },
-      { value: "webhooks", label: "Webhooks", icon: Webhook },
-      { value: "approvals", label: "Approvals", icon: CheckSquare },
-    ],
-  },
-  {
-    label: "Connections",
-    items: [
-      { value: "integrations", label: "Integrations", icon: Plug },
-      { value: "mcp-server", label: "MCP server", icon: Server },
-    ],
-  },
-  {
-    label: "Security",
-    items: [
-      { value: "secrets", label: "Secrets", icon: LockIcon },
-      { value: "api-keys", label: "API keys", icon: Key },
-      { value: "capability-ceiling", label: "Capabilities", icon: Layers },
-      { value: "security", label: "Access and encryption", icon: Shield },
-    ],
-  },
-  {
-    label: "Organization",
-    items: [
-      { value: "organizations", label: "Organizations", icon: Building },
-      { value: "quotas", label: "Quotas", icon: BarChart },
-      { value: "audit", label: "Audit log and tracing", icon: FileSearch },
-      { value: "dlq", label: "Failed deliveries", icon: Inbox },
-    ],
-  },
-  {
-    label: "Operations",
-    items: [
-      {
-        value: "system-health",
-        label: "System health",
-        icon: Activity,
-        to: "/system-health",
-      },
-      { value: "alerts", label: "Alerts", icon: AlertTriangle, to: "/alerts" },
-      {
-        value: "models",
-        label: "Model review",
-        icon: BrainCircuit,
-        to: "/models",
-      },
-    ],
-  },
-];
-
 /** Hashes that used to name a section of their own; each is a card on Account. */
 const SECTION_ALIASES: Record<string, string> = {
   password: "account",
@@ -200,9 +108,9 @@ function resolveHash(
   return null;
 }
 
-const ALL_ITEMS: SidebarItem[] = SIDEBAR_CATEGORIES.flatMap((c) => c.items);
+const ALL_ITEMS: SettingsSection[] = SETTINGS_GROUPS.flatMap((c) => c.items);
 /** The sections this page renders itself (a hash may name one of these). */
-const SECTION_ITEMS: SidebarItem[] = ALL_ITEMS.filter((i) => !i.to);
+const SECTION_ITEMS: SettingsSection[] = ALL_ITEMS.filter((i) => !i.to);
 
 const sidebarItemClass = (isActive: boolean) =>
   cn(
@@ -228,7 +136,7 @@ function SettingsSidebar({
   return (
     <aside className="hidden sm:flex w-60 shrink-0 flex-col border-r border-white/5 bg-surface-2/40 overflow-y-auto custom-scrollbar">
       <nav className="flex-1 py-3 px-3 space-y-3" aria-label="Settings">
-        {SIDEBAR_CATEGORIES.map((category) => (
+        {SETTINGS_GROUPS.map((category) => (
           <div key={category.label}>
             <p className="px-3 mb-0.5 text-2xs font-semibold uppercase tracking-wider text-muted-foreground">
               {category.label}
@@ -361,7 +269,7 @@ export default function Settings() {
             else setActive(e.target.value);
           }}
         >
-          {SIDEBAR_CATEGORIES.map((category) => (
+          {SETTINGS_GROUPS.map((category) => (
             <optgroup key={category.label} label={category.label}>
               {category.items.map((item) => (
                 <option key={item.value} value={item.value}>
@@ -482,8 +390,8 @@ export default function Settings() {
                   className="bg-surface-3/40 border border-white/5 rounded-2xl p-10"
                 >
                   <div className="flex items-center gap-6">
-                    <div className="w-16 h-16 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shrink-0">
-                      <UserIcon className="w-8 h-8 text-primary" />
+                    <div className="w-14 h-14 bg-surface-4/60 border border-white/10 rounded-2xl flex items-center justify-center shrink-0">
+                      <UserIcon className="w-7 h-7 text-primary" />
                     </div>
                     <div className="min-w-0">
                       <span className="text-2xs font-semibold uppercase tracking-wider text-muted-foreground mb-1.5 block">

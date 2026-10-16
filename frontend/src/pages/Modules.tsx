@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 import { Input } from "@/components/ui/input";
 import { useNavigate } from "react-router";
 import { useWorkflowStore } from "@/store/workflowStore";
@@ -112,19 +113,14 @@ function ModuleCard({
             >
               {lang}
             </span>
-            <span
-              className={cn(
-                "inline-flex items-center gap-1.5 px-3 py-1 rounded-lg text-2xs font-semibold uppercase tracking-wider border shrink-0 transition-ui shadow-sm",
-                worldColor(mod.capabilityWorld),
-              )}
-            >
-              <Zap className="w-2.5 h-2.5 fill-current/20" />
-              {worldLabel(mod.capabilityWorld)}
-            </span>
+            <CapabilityBadge
+              world={mod.capabilityWorld ?? "unknown"}
+              className="shrink-0"
+            />
           </div>
 
           {mod.capabilityDescription && (
-            <p className="text-xs text-muted-foreground/60 font-bold leading-relaxed line-clamp-1 mb-3">
+            <p className="text-xs text-muted-foreground/60 font-medium leading-relaxed line-clamp-1 mb-3">
               {mod.capabilityDescription}
             </p>
           )}

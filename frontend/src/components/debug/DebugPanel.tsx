@@ -266,7 +266,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
 
             {metadata.error && (
               <div className="mt-3 p-3 rounded-lg bg-destructive/5 border border-destructive/10">
-                <p className="text-2xs font-bold text-destructive uppercase tracking-wider mb-1">
+                <p className="text-2xs font-medium text-destructive uppercase tracking-wider mb-1">
                   Error
                 </p>
                 <p className="text-xs text-destructive leading-relaxed font-mono break-words">

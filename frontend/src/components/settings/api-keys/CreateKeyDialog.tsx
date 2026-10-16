@@ -81,7 +81,7 @@ export function CreateKeyDialog({
               <h3 className="text-lg font-bold text-foreground tracking-tight">
                 Create API Key
               </h3>
-              <p className="text-xs text-muted-foreground font-bold leading-none mt-1">
+              <p className="text-xs text-muted-foreground font-medium leading-none mt-1">
                 New access credential
               </p>
             </div>

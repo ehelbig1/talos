@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { LoadingState } from "@/components/ui/spinner";
 import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
@@ -6,14 +7,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import {
-  Ghost,
   RotateCcw,
   AlertCircle,
   Bug,
   ExternalLink,
   Webhook,
   Database,
-  Search,
   Shield,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -203,55 +202,39 @@ export function DLQViewer() {
 
   return (
     <div className="space-y-8">
-      <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden group/header">
-        <div className="flex flex-col md:flex-row items-center justify-between gap-8 relative z-10">
-          <div className="flex items-center gap-6">
-            <div className="w-16 h-16 bg-destructive/10 border border-destructive/20 rounded-2xl flex items-center justify-center text-destructive transition-ui">
-              <Ghost size={32} />
-            </div>
-            <div className="space-y-1.5">
-              <h2 className="text-2xl md:text-3xl font-semibold text-white tracking-tight leading-tight">
-                Dead-letter queue
-              </h2>
-              <div className="flex items-center gap-3">
-                <div className="flex items-center gap-2 bg-destructive/10 border border-destructive/20 px-3 py-1 rounded-full">
-                  <div className="w-1.5 h-1.5 rounded-full bg-destructive" />
-                  <span className="text-2xs text-destructive font-semibold uppercase tracking-wider leading-none">
-                    Monitoring
-                  </span>
-                </div>
-                <div className="w-1 h-1 rounded-full bg-white/10" />
-                <span className="text-xs text-muted-foreground/70 font-medium leading-none">
-                  Failed node jobs and dropped webhook deliveries
-                </span>
-              </div>
-            </div>
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            Dead-letter queue
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            Failed node jobs and dropped webhook deliveries.
+          </p>
+        </div>
+        <div className="flex items-center gap-4">
+          <div className="flex flex-col items-end">
+            <span className="text-2xl font-semibold text-white tracking-tight leading-none tabular-nums">
+              {activeTab === "nodes"
+                ? pendingNodes.length
+                : pendingWebhooks.length}
+            </span>
+            <span className="text-xs text-muted-foreground mt-1">
+              {activeTab === "nodes" ? "failed jobs" : "dropped deliveries"}
+            </span>
           </div>
-
-          <div className="flex items-center gap-6">
-            <div className="flex flex-col items-end gap-1">
-              <span className="text-3xl font-semibold text-white tracking-tight leading-none">
-                {activeTab === "nodes"
-                  ? pendingNodes.length
-                  : pendingWebhooks.length}
-              </span>
-              <span className="text-xs text-muted-foreground/60 font-medium leading-none">
-                {activeTab === "nodes" ? "failed jobs" : "dropped deliveries"}
-              </span>
-            </div>
-            <button
-              onClick={() =>
-                activeTab === "nodes" ? refetchNodes() : refetchWebhooks()
-              }
-              aria-label="Refresh"
-              className="w-14 h-14 bg-white/5 border border-white/5 rounded-2xl flex items-center justify-center text-muted-foreground/70 hover:text-white hover:bg-white/10 transition-ui"
-            >
-              <RotateCcw
-                size={20}
-                className={isLoading ? "animate-spin" : ""}
-              />
-            </button>
-          </div>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() =>
+              activeTab === "nodes" ? refetchNodes() : refetchWebhooks()
+            }
+            aria-label="Refresh"
+          >
+            <RotateCcw className={cn("w-4 h-4", isLoading && "animate-spin")} />
+          </Button>
         </div>
       </div>
 
@@ -467,21 +450,6 @@ export function DLQViewer() {
             </div>
           ))
         )}
-      </div>
-
-      <div className="flex items-center justify-between px-10 py-8 bg-surface-3/20 border border-white/5 rounded-2xl relative overflow-hidden group/footer">
-        <div className="flex items-center gap-4 relative z-10">
-          <div className="w-2 h-2 rounded-full bg-primary" />
-          <span className="text-xs text-muted-foreground/70 font-semibold">
-            Fault Container online &bull; Automated Pruning after 30 Cycles
-          </span>
-        </div>
-        <div className="flex items-center gap-3 relative z-10 transition-ui">
-          <Search size={14} className="text-muted-foreground/50" />
-          <span className="text-xs text-muted-foreground/50 font-medium">
-            Search
-          </span>
-        </div>
       </div>
     </div>
   );

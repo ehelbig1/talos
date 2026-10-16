@@ -119,7 +119,7 @@ export function BudgetPanel({
       {/* Rate limit */}
       <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
         <h2 className="text-white font-medium text-sm mb-3">Rate Limit</h2>
-        <p className="text-2xl font-bold text-white tabular-nums">
+        <p className="text-2xl font-medium text-white tabular-nums">
           {actor.rateLimit != null ? `${actor.rateLimit}/min` : "Unlimited"}
         </p>
         <p className="text-muted-foreground/70 text-xs mt-2">
@@ -130,7 +130,7 @@ export function BudgetPanel({
       {/* Budget cap */}
       <div className="bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-5">
         <h2 className="text-white font-medium text-sm mb-3">Budget Cap</h2>
-        <p className="text-2xl font-bold text-white tabular-nums">
+        <p className="text-2xl font-medium text-white tabular-nums">
           {actor.totalBudgetUsd != null
             ? `$${actor.totalBudgetUsd.toFixed(2)}`
             : "Unlimited"}

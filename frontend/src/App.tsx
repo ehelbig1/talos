@@ -17,12 +17,17 @@ import { useTokenRefresh } from "@/hooks/useTokenRefresh";
 import { useGetApprovalsQuery } from "@/generated/graphql";
 import { NavAlertBadge } from "@/components/NavAlertBadge";
 import {
+  CommandPalette,
+  openCommandPalette,
+} from "@/components/CommandPalette";
+import {
   Zap,
   Workflow,
   Newspaper,
   Bot,
   BookOpen,
   Settings as SettingsIcon,
+  Search as SearchIcon,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -74,7 +79,7 @@ function LoadingScreen() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-background">
       <div className="flex flex-col items-center gap-5">
-        <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
+        <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center">
           <Zap size={28} className="text-primary" fill="currentColor" />
         </div>
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -170,6 +175,18 @@ function AuthenticatedApp() {
           </div>
 
           <div className="ml-auto flex items-center gap-3 md:gap-4">
+            <button
+              type="button"
+              onClick={openCommandPalette}
+              aria-label="Jump to a page, workflow or actor (⌘K)"
+              title="Jump to… (⌘K)"
+              className="inline-flex items-center gap-2 h-8 px-2.5 text-xs text-muted-foreground hover:text-white hover:bg-white/5 rounded-lg transition-ui"
+            >
+              <SearchIcon className="w-4 h-4" aria-hidden />
+              <kbd className="hidden md:inline font-mono text-2xs px-1 py-0.5 bg-white/5 border border-white/10 rounded">
+                ⌘K
+              </kbd>
+            </button>
             <NavAlertBadge />
             <div className="hidden lg:block h-6 w-px bg-white/10" />
 
@@ -195,6 +212,8 @@ function AuthenticatedApp() {
             </button>
           </div>
         </nav>
+
+        <CommandPalette />
 
         {/* Page content */}
         <main

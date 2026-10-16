@@ -10,7 +10,7 @@ import { StepIndicator } from "@/components/ui";
 import { getMyCapabilityCeiling } from "@/lib/graphqlApi";
 import { getCapabilityConfig, ceilingOptions } from "@/lib/capabilityConfig";
 import { useGetCapabilityWorldHierarchyQuery } from "@/generated/graphql";
-import { CapabilityBadge } from "./ActorCard";
+import { CapabilityBadge } from "@/components/CapabilityBadge";
 
 // ── Actor persona templates ───────────────────────────────────────────────────
 

@@ -106,8 +106,8 @@ export default function ActorDetail() {
   if (error || !actor) {
     return (
       <div className="flex flex-col items-center justify-center h-full gap-6 bg-background">
-        <div className="w-16 h-16 rounded-2xl bg-destructive/10 flex items-center justify-center text-destructive mb-4">
-          <X className="w-8 h-8" />
+        <div className="w-14 h-14 rounded-2xl bg-destructive/10 flex items-center justify-center text-destructive mb-4">
+          <X className="w-7 h-7" />
         </div>
         <p className="text-xl font-semibold text-white tracking-tight">
           Actor not found

@@ -12,7 +12,6 @@ import {
   useUpdateAuditSettingsMutation,
 } from "@/generated/graphql";
 import {
-  Shield,
   Database,
   Lock,
   Settings2,
@@ -90,26 +89,16 @@ export default function AuditSettings() {
   return (
     <div className="space-y-8">
       {/* Header */}
-      <div className="flex items-center gap-6">
-        <div className="w-16 h-16 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center group">
-          <Shield className="w-8 h-8 text-primary transition-ui" />
-        </div>
-        <div>
-          <SectionHeader
-            level="h2"
-            className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit mb-1"
-          >
-            Audit streaming
-          </SectionHeader>
-          <div className="flex items-center gap-3">
-            <span className="text-xs font-semibold text-primary bg-primary/5 px-3 py-1 rounded-full border border-primary/20">
-              OpenTelemetry
-            </span>
-            <span className="text-xs font-semibold text-muted-foreground/70">
-              Export to your SIEM
-            </span>
-          </div>
-        </div>
+      <div>
+        <SectionHeader
+          level="h2"
+          className="text-2xl font-semibold text-white tracking-tight"
+        >
+          Audit streaming
+        </SectionHeader>
+        <p className="text-sm text-muted-foreground mt-2">
+          Export audit events to your SIEM over OpenTelemetry.
+        </p>
       </div>
 
       <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
@@ -134,10 +123,10 @@ export default function AuditSettings() {
                 </div>
                 <div>
                   <h4 className="text-xl font-semibold text-white tracking-tight font-outfit">
-                    Real-time Propagation
+                    Stream audit events
                   </h4>
                   <p className="text-xs text-muted-foreground/70 font-semibold mt-1">
-                    Toggle audit log streaming via OTLP
+                    Send each audit event to the collector as it happens
                   </p>
                 </div>
               </div>
