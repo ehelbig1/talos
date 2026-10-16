@@ -39,7 +39,7 @@ export function KeysTable({
     <div className="relative">
       <Card className="relative bg-surface-3/80 border-white/10 overflow-hidden rounded-[20px] border">
         {isLoading ? (
-          <div className="p-10 flex flex-col items-center justify-center gap-4">
+          <div className="p-6 flex flex-col items-center justify-center gap-4">
             <Spinner className="w-8 h-8 text-primary" />
             <p className="text-xs text-muted-foreground font-medium">
               Loading Keys...
@@ -159,7 +159,7 @@ export function KeysTable({
                   })
                 ) : (
                   <tr>
-                    <td colSpan={5} className="px-8 py-12 text-center">
+                    <td colSpan={5} className="px-8 py-8 text-center">
                       <div className="flex flex-col items-center gap-4">
                         <div className="w-14 h-14 rounded-full bg-surface-3/60 border border-white/5 flex items-center justify-center text-muted-foreground/70">
                           <Terminal size={28} />

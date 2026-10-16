@@ -115,7 +115,7 @@ function AddScheduleDialog({
         </div>
 
         {/* Body */}
-        <div className="p-10 space-y-8 relative z-10">
+        <div className="p-6 space-y-8 relative z-10">
           {/* Workflow picker */}
           <div className="space-y-3">
             <label className="text-xs font-semibold text-muted-foreground/70 ml-1">
@@ -519,7 +519,7 @@ export default function SchedulesManager() {
   }, [workflows]);
 
   return (
-    <div className="max-w-6xl mx-auto py-4 space-y-10">
+    <div className="max-w-6xl mx-auto py-4 space-y-8">
       {/* Page header */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-6">
         <div>
@@ -543,7 +543,7 @@ export default function SchedulesManager() {
       {schedulesLoading ? (
         <LoadingState label="Loading schedules…" />
       ) : schedules.length === 0 ? (
-        <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 text-center flex flex-col items-center">
+        <div className="bg-surface-3 border border-white/10 rounded-2xl p-6 text-center flex flex-col items-center">
           <div className="w-14 h-14 rounded-2xl bg-white/[0.02] border border-white/5 flex items-center justify-center text-muted-foreground/30 mb-8">
             <Calendar size={48} />
           </div>

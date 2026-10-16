@@ -223,15 +223,15 @@ export default function WorkflowVersionsPanel({
           {activeTab === "diff" && (
             <div className="p-8">
               {diffLoading ? (
-                <div className="flex items-center justify-center py-12">
+                <div className="flex items-center justify-center py-8">
                   <Spinner className="w-6 h-6 text-primary" />
                 </div>
               ) : !diff ? (
-                <p className="text-xs font-semibold text-muted-foreground/60 text-center py-12">
+                <p className="text-xs font-semibold text-muted-foreground/60 text-center py-8">
                   No changes to show.
                 </p>
               ) : !diff.hasPublishedVersion ? (
-                <div className="text-center py-12 opacity-30">
+                <div className="text-center py-8 opacity-30">
                   <Diff className="w-10 h-10 text-muted-foreground mx-auto mb-6" />
                   <p className="text-xs font-semibold">
                     No published version to diff against.
@@ -306,11 +306,11 @@ export default function WorkflowVersionsPanel({
           {activeTab === "changelog" && (
             <div className="p-8">
               {changelogLoading ? (
-                <div className="flex items-center justify-center py-12">
+                <div className="flex items-center justify-center py-8">
                   <Spinner className="w-6 h-6 text-primary" />
                 </div>
               ) : changelog.length === 0 ? (
-                <div className="text-center py-12 opacity-30">
+                <div className="text-center py-8 opacity-30">
                   <GitCommit className="w-10 h-10 text-muted-foreground mx-auto mb-6" />
                   <p className="text-xs font-semibold">
                     No changelog entries yet.

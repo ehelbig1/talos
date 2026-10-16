@@ -136,7 +136,7 @@ export default function McpServerSettings() {
   };
 
   return (
-    <div className="space-y-10 max-w-7xl mx-auto">
+    <div className="space-y-8 max-w-7xl mx-auto">
       <ConfirmDialog
         open={revokeConfirmId !== null}
         title="Revoke agent access"
@@ -316,7 +316,7 @@ export default function McpServerSettings() {
         {/* Right Column: Agents & Instructions */}
         <div className="lg:col-span-2 space-y-8">
           {/* Active Agents */}
-          <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-10 relative overflow-hidden min-h-[400px]">
+          <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6 relative overflow-hidden min-h-[400px]">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center gap-4">
                 <div className="w-12 h-12 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center text-primary">
@@ -489,7 +489,7 @@ export default function McpServerSettings() {
         </div>
       </div>
 
-      <div className="bg-surface-3/20 border border-white/5 rounded-2xl p-10 bg-surface-3 border border-white/10 relative overflow-hidden group/info">
+      <div className="bg-surface-3 border border-white/10 rounded-2xl p-6 relative overflow-hidden group/info">
         <div className="flex flex-col md:flex-row items-center gap-6 relative z-10">
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-6 flex-1">
             {[

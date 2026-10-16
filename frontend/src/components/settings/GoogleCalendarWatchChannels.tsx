@@ -101,7 +101,7 @@ export function GoogleCalendarWatchChannels(): React.ReactElement | null {
   }
 
   return (
-    <div className="mt-10">
+    <div className="mt-8">
       <WatchPanelHeader
         icon={<CalendarIcon size={16} />}
         title="Google Calendar Watch Channels"

@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { SectionHeader } from "@/components/ui/SectionHeader";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
@@ -151,7 +152,7 @@ export function ResourceQuotas() {
 
   if (isLoading) {
     return (
-      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 animate-pulse">
+      <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 animate-pulse">
         <div className="h-4 w-48 bg-white/5 rounded-full mb-6" />
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
           {[1, 2, 3, 4].map((i) => (
@@ -166,22 +167,20 @@ export function ResourceQuotas() {
   }
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
-      <div className="flex items-center justify-between mb-6 relative z-10">
-        <div className="flex items-center gap-5">
-          <div className="w-14 h-14 bg-primary/10 border border-primary/20 rounded-2xl flex items-center justify-center transition-ui">
-            <Gauge className="w-7 h-7 text-primary" />
-          </div>
-          <div>
-            <h3 className="text-2xl md:text-3xl font-semibold text-white tracking-tight font-outfit leading-tight">
-              Resource quotas
-            </h3>
-            <p className="text-xs text-muted-foreground/70 font-semibold mt-2 leading-none">
-              {isEditing
-                ? "Editing limits"
-                : "Current usage against your limits"}
-            </p>
-          </div>
+    <div className="space-y-8">
+      <div className="flex items-center justify-between gap-6">
+        <div>
+          <SectionHeader
+            level="h2"
+            className="text-2xl font-semibold text-white tracking-tight"
+          >
+            Resource quotas
+          </SectionHeader>
+          <p className="text-sm text-muted-foreground mt-2">
+            {isEditing
+              ? "Editing limits."
+              : "Current usage against your limits."}
+          </p>
         </div>
 
         <div className="flex items-center gap-4">
@@ -209,130 +208,132 @@ export function ResourceQuotas() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-8 relative z-10">
-        {quotaList.map((item) => {
-          const Icon = getMetricIcon(item.metric);
-          const pct = usagePercent(item.used, item.limit);
-          return (
-            <div
-              key={item.metric}
-              className={cn(
-                "bg-black/40 border rounded-2xl p-8 transition-ui group/item relative overflow-hidden",
-                isEditing
-                  ? "border-primary/40"
-                  : "border-white/5 hover:border-white/10",
-              )}
-            >
-              <div className="flex items-center justify-between mb-8 relative z-10">
-                <div className="flex items-center gap-5">
-                  <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-ui">
-                    <Icon
-                      className={cn(
-                        "w-6 h-6",
-                        isEditing ? "text-primary" : "text-white/70",
-                      )}
-                    />
+      <div className="bg-surface-3/30 border border-white/5 rounded-2xl p-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-8 relative z-10">
+          {quotaList.map((item) => {
+            const Icon = getMetricIcon(item.metric);
+            const pct = usagePercent(item.used, item.limit);
+            return (
+              <div
+                key={item.metric}
+                className={cn(
+                  "bg-black/40 border rounded-2xl p-8 transition-ui group/item relative overflow-hidden",
+                  isEditing
+                    ? "border-primary/40"
+                    : "border-white/5 hover:border-white/10",
+                )}
+              >
+                <div className="flex items-center justify-between mb-8 relative z-10">
+                  <div className="flex items-center gap-5">
+                    <div className="w-12 h-12 bg-white/5 border border-white/10 rounded-xl flex items-center justify-center transition-ui">
+                      <Icon
+                        className={cn(
+                          "w-6 h-6",
+                          isEditing ? "text-primary" : "text-white/70",
+                        )}
+                      />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <h4 className="text-sm font-semibold text-white leading-none truncate">
+                        {item.metric}
+                      </h4>
+                      <p className="text-xs text-muted-foreground/60 font-medium mt-1.5 leading-none">
+                        {isEditing ? "New limit" : "In use"}
+                      </p>
+                    </div>
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <h4 className="text-sm font-semibold text-white leading-none truncate">
-                      {item.metric}
-                    </h4>
-                    <p className="text-xs text-muted-foreground/60 font-medium mt-1.5 leading-none">
-                      {isEditing ? "New limit" : "In use"}
-                    </p>
-                  </div>
+                  {!isEditing && (
+                    <div className="shrink-0 ml-4">
+                      <span
+                        className={cn(
+                          "text-2xl md:text-3xl font-semibold tabular-nums tracking-tight leading-none",
+                          usageText(pct),
+                        )}
+                      >
+                        {pct}%
+                      </span>
+                    </div>
+                  )}
                 </div>
-                {!isEditing && (
-                  <div className="shrink-0 ml-4">
-                    <span
-                      className={cn(
-                        "text-2xl md:text-3xl font-semibold tabular-nums tracking-tight leading-none",
-                        usageText(pct),
+
+                {isEditing ? (
+                  <div className="space-y-4 relative z-10">
+                    <div className="relative group/input">
+                      <Input
+                        type="number"
+                        value={item.editedValue}
+                        onChange={(e) =>
+                          setEditedLimits((prev) => ({
+                            ...prev,
+                            [item.key]: e.target.value,
+                          }))
+                        }
+                        className="text-xl font-mono pr-24"
+                        min="0"
+                      />
+                      <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground/70 pointer-events-none">
+                        {item.unit}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3 px-1">
+                      <Activity className="w-3.5 h-3.5 text-success/40" />
+                      <p className="text-xs text-muted-foreground/50 font-semibold">
+                        Currently using {item.used} {item.unit}
+                      </p>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-5 relative z-10">
+                    <div className="h-3 w-full bg-white/5 rounded-full overflow-hidden border border-white/5 p-0.5">
+                      <div
+                        className={cn(
+                          "h-full rounded-full transition-ui ease-out",
+                          usageColor(pct),
+                        )}
+                        style={{ width: `${pct}%` }}
+                      />
+                    </div>
+                    <div className="flex justify-between items-center text-xs font-semibold">
+                      <div className="flex items-center gap-3 text-muted-foreground/70">
+                        <span className="text-white">{item.used}</span>
+                        <span className="opacity-20 text-2xs">of</span>
+                        <span className="text-white/60">
+                          {item.limit} {item.unit}
+                        </span>
+                      </div>
+                      {pct > 80 && (
+                        <div className="flex items-center gap-2 text-destructive bg-destructive/10 px-3 py-1 rounded-full border border-destructive/20">
+                          <AlertTriangle className="w-3 h-3" />
+                          <span>Near limit</span>
+                        </div>
                       )}
-                    >
-                      {pct}%
-                    </span>
+                    </div>
                   </div>
                 )}
               </div>
-
-              {isEditing ? (
-                <div className="space-y-4 relative z-10">
-                  <div className="relative group/input">
-                    <Input
-                      type="number"
-                      value={item.editedValue}
-                      onChange={(e) =>
-                        setEditedLimits((prev) => ({
-                          ...prev,
-                          [item.key]: e.target.value,
-                        }))
-                      }
-                      className="text-xl font-mono pr-24"
-                      min="0"
-                    />
-                    <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground/70 pointer-events-none">
-                      {item.unit}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-3 px-1">
-                    <Activity className="w-3.5 h-3.5 text-success/40" />
-                    <p className="text-xs text-muted-foreground/50 font-semibold">
-                      Currently using {item.used} {item.unit}
-                    </p>
-                  </div>
-                </div>
-              ) : (
-                <div className="space-y-5 relative z-10">
-                  <div className="h-3 w-full bg-white/5 rounded-full overflow-hidden border border-white/5 p-0.5">
-                    <div
-                      className={cn(
-                        "h-full rounded-full transition-ui ease-out",
-                        usageColor(pct),
-                      )}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                  <div className="flex justify-between items-center text-xs font-semibold">
-                    <div className="flex items-center gap-3 text-muted-foreground/70">
-                      <span className="text-white">{item.used}</span>
-                      <span className="opacity-20 text-2xs">of</span>
-                      <span className="text-white/60">
-                        {item.limit} {item.unit}
-                      </span>
-                    </div>
-                    {pct > 80 && (
-                      <div className="flex items-center gap-2 text-destructive bg-destructive/10 px-3 py-1 rounded-full border border-destructive/20">
-                        <AlertTriangle className="w-3 h-3" />
-                        <span>Near limit</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="mt-12 pt-8 border-t border-white/5 flex items-center justify-between relative z-10">
-        <div className="flex items-center gap-4">
-          <div className="w-2 h-2 rounded-full bg-success" />
-          <p className="text-xs text-muted-foreground/50 font-semibold flex items-center gap-3">
-            Updated {new Date().toLocaleTimeString()}
-          </p>
+            );
+          })}
         </div>
-        {!isEditing && (
-          <button
-            type="button"
-            className="text-xs font-semibold text-primary hover:text-white transition-ui flex items-center gap-3 group/btn"
-          >
-            Usage report
-            <div className="w-5 h-5 rounded-lg bg-primary/10 flex items-center justify-center group-hover/btn:bg-primary group-hover/btn:text-black transition-ui">
-              <BarChart3 className="w-3 h-3" />
-            </div>
-          </button>
-        )}
+
+        <div className="mt-8 pt-8 border-t border-white/5 flex items-center justify-between relative z-10">
+          <div className="flex items-center gap-4">
+            <div className="w-2 h-2 rounded-full bg-success" />
+            <p className="text-xs text-muted-foreground/50 font-semibold flex items-center gap-3">
+              Updated {new Date().toLocaleTimeString()}
+            </p>
+          </div>
+          {!isEditing && (
+            <button
+              type="button"
+              className="text-xs font-semibold text-primary hover:text-white transition-ui flex items-center gap-3 group/btn"
+            >
+              Usage report
+              <div className="w-5 h-5 rounded-lg bg-primary/10 flex items-center justify-center group-hover/btn:bg-primary group-hover/btn:text-black transition-ui">
+                <BarChart3 className="w-3 h-3" />
+              </div>
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

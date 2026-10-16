@@ -18,7 +18,7 @@ export function WatchPanelLoading({
   message: string;
 }): React.ReactElement {
   return (
-    <div className="mt-10 p-6 bg-muted/10 border border-border/30 rounded-2xl text-sm text-muted-foreground">
+    <div className="mt-8 p-6 bg-muted/10 border border-border/30 rounded-2xl text-sm text-muted-foreground">
       {message}
     </div>
   );
@@ -34,7 +34,7 @@ export function WatchPanelError({
   onRetry: () => void;
 }): React.ReactElement {
   return (
-    <div className="mt-10 p-6 bg-destructive/5 border border-destructive/20 rounded-2xl">
+    <div className="mt-8 p-6 bg-destructive/5 border border-destructive/20 rounded-2xl">
       <p className="text-sm font-semibold text-foreground mb-1">{title}</p>
       <p className="text-xs text-muted-foreground mb-3">{description}</p>
       <Button

@@ -511,7 +511,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
 
   if (integrationsQuery.isLoading || watchesQuery.isLoading) {
     return (
-      <div className="mt-10 p-6 bg-muted/10 border border-border/30 rounded-2xl text-sm text-muted-foreground">
+      <div className="mt-8 p-6 bg-muted/10 border border-border/30 rounded-2xl text-sm text-muted-foreground">
         Loading Gmail watch channels…
       </div>
     );
@@ -520,7 +520,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
 
   if (watchesQuery.isError) {
     return (
-      <div className="mt-10 p-6 bg-destructive/5 border border-destructive/20 rounded-2xl">
+      <div className="mt-8 p-6 bg-destructive/5 border border-destructive/20 rounded-2xl">
         <p className="text-sm font-semibold text-foreground mb-1">
           Could not load Gmail watches
         </p>
@@ -588,7 +588,7 @@ export function GmailWatchChannels(): React.ReactElement | null {
   );
 
   return (
-    <div className="mt-10">
+    <div className="mt-8">
       {header}
 
       {hasAnyOauthFailure && (

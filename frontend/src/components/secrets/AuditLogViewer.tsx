@@ -98,7 +98,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
           {isLoading ? (
             <LoadingState label="Loading audit log…" />
           ) : error ? (
-            <div className="py-12 px-6 text-center text-destructive bg-destructive/5 rounded-2xl border border-destructive/10">
+            <div className="py-8 px-6 text-center text-destructive bg-destructive/5 rounded-2xl border border-destructive/10">
               <AlertCircle className="w-10 h-10 mx-auto mb-3 opacity-50" />
               <p className="text-sm font-medium">Failed to load audit logs</p>
               <p className="text-xs opacity-70 mt-1">
@@ -106,7 +106,7 @@ export function AuditLogViewer({ open, secret, onClose }: AuditLogViewerProps) {
               </p>
             </div>
           ) : logs?.length === 0 ? (
-            <div className="py-12 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
+            <div className="py-8 text-center text-muted-foreground bg-muted/40 rounded-2xl border border-dashed border-border">
               <Clock className="w-10 h-10 mx-auto mb-3 opacity-20" />
               <p className="text-sm font-medium">No activity recorded yet</p>
               <p className="text-xs opacity-60">

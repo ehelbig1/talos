@@ -124,7 +124,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
   };
 
   return (
-    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-10 relative overflow-hidden group">
+    <div className="bg-surface-3/40 border border-white/5 rounded-2xl p-6 relative overflow-hidden group">
       <div className="relative z-10">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-8 mb-8">
           <div className="flex items-center gap-6">
@@ -193,7 +193,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             />
           </div>
         ) : step === "initial" ? (
-          <div className="space-y-10">
+          <div className="space-y-8">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
               <div className="group p-8 bg-black/40 rounded-2xl border border-white/5 hover:border-primary/30 transition-ui relative overflow-hidden">
                 <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-primary mb-6 transition-ui relative z-10">
@@ -238,7 +238,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             </Button>
           </div>
         ) : step === "setup" && setupData ? (
-          <div className="space-y-10">
+          <div className="space-y-8">
             <div className="flex flex-col lg:flex-row items-stretch gap-6">
               <div className="bg-white p-6 rounded-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
                 <img
@@ -317,7 +317,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             </div>
           </div>
         ) : step === "verify" ? (
-          <div className="space-y-10 max-w-md mx-auto py-4">
+          <div className="space-y-8 max-w-md mx-auto py-4">
             <div className="text-center space-y-6">
               <div className="w-14 h-14 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-8 border border-primary/20 relative group">
                 <QrCode className="w-12 h-12 text-primary relative z-10" />
@@ -374,7 +374,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
               </div>
             </div>
 
-            <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl mt-10 relative overflow-hidden group">
+            <div className="p-6 bg-warning/5 border border-warning/10 rounded-2xl mt-8 relative overflow-hidden group">
               <div className="flex items-center gap-3 text-warning font-semibold text-xs mb-3 relative z-10">
                 <AlertTriangle className="w-4 h-4" />
                 Keep your backup codes safe

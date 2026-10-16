@@ -75,7 +75,7 @@ export function GoogleCloudWatchChannels(): React.ReactElement | null {
   }
 
   return (
-    <div className="mt-10">
+    <div className="mt-8">
       <WatchPanelHeader
         icon={<Cloud size={16} />}
         title="Google Cloud Watch Channels"
