@@ -439,15 +439,6 @@ pub fn standalone_run_paths(granted: &[String], wanted: &[String]) -> Vec<String
         .collect()
 }
 
-/// A resolved map handed to the in-process runtime, whose secret provider
-/// holds plain `String`s: the ONE place a standalone run's values leave the
-/// zeroizing [`talos_workflow_engine_core::SecretMap`] (security review
-/// 2026-10-14, C-10). A dispatch never does this — its map is sealed.
-#[must_use]
-pub fn into_runtime_secrets(map: talos_workflow_engine_core::SecretMap) -> HashMap<String, String> {
-    map.into_iter().map(|(k, v)| (k, v.to_string())).collect()
-}
-
 /// Resolve the secrets of a module run outside a workflow, the way a
 /// dispatch resolves them: stored paths from the vault, mint paths minted.
 ///

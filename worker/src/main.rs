@@ -1621,7 +1621,7 @@ async fn execute_job(
     //   (2026-05-22): AAD = workflow_execution_id binds the AES-GCM tag to this
     //   execution (already HMAC-bound in the signing payload), so a transposed
     //   ciphertext fails the tag check here.
-    let secrets: HashMap<String, String> = if req.sealing
+    let secrets: talos_workflow_job_protocol::SecretMap = if req.sealing
         == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
     {
         let Some(signing_key) = worker_result_signing_key() else {
@@ -2166,7 +2166,7 @@ async fn execute_pipeline_job(
     // returns the per-step secrets vector (aligned index-for-index with
     // `req.steps`). Fail-closed on any claim / verify / open / shape error — a
     // pipeline whose secrets can't be obtained must not run secretless.
-    let mut claimed_secrets: Option<secret_claim::ZeroizingSecretMaps> = if req.sealing
+    let mut claimed_secrets: Option<Vec<talos_workflow_job_protocol::SecretMap>> = if req.sealing
         == talos_workflow_job_protocol::SEALING_CLAIM_ECIES
     {
         let Some(signing_key) = worker_result_signing_key() else {
@@ -2189,10 +2189,10 @@ async fn execute_pipeline_job(
         .await
         {
             Ok(raw) => {
-                match serde_json::from_slice::<Vec<std::collections::HashMap<String, String>>>(
+                match serde_json::from_slice::<Vec<talos_workflow_job_protocol::SecretMap>>(
                     raw.as_slice(),
                 ) {
-                    Ok(v) => Some(secret_claim::ZeroizingSecretMaps::new(v)),
+                    Ok(v) => Some(v),
                     Err(e) => {
                         ::tracing::error!(target: "talos_security", job_id = %req.job_id, error = %e, "malformed pipeline claim payload");
                         _span.end_error("malformed pipeline claim payload");
@@ -2218,7 +2218,7 @@ async fn execute_pipeline_job(
     for (i, step) in req.steps.iter().enumerate() {
         let secrets = if let Some(ref mut per_step) = claimed_secrets {
             // Moved out, not cloned: no second plaintext copy per step.
-            per_step.take(i)
+            secret_claim::take_step_secrets(per_step, i)
         } else if step.encrypted_secrets.is_empty() {
             std::collections::HashMap::new()
         } else {
@@ -2378,6 +2378,10 @@ async fn main() -> anyhow::Result<()> {
     // reqwest. install_default is idempotent — Err means another caller
     // already installed one, which is fine.
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // Before the fleet key or any job's secrets are in memory: no core dump,
+    // no same-UID ptrace, root-owned /proc entries. Logged once tracing is up.
+    let non_dumpable = talos_config::process_posture::make_process_non_dumpable();
 
     println!("=== Talos Worker Starting ===\n");
 
@@ -2825,6 +2829,7 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("    Continuing without tracing...");
         }
     }
+    talos_config::process_posture::log_non_dumpable_outcome(&non_dumpable);
 
     // Install the tracing subscriber. The fmt layer keeps host_impl.rs
     // `tracing::warn!`/`info!` (security checks, vault allowlist, SSRF blocks,

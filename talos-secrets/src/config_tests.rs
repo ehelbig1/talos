@@ -9,7 +9,10 @@ mod tests {
     #[tokio::test]
     async fn build_provider_creates_talos_vault() {
         let mut secrets = HashMap::new();
-        secrets.insert("test/key".to_string(), "test-value".to_string());
+        secrets.insert(
+            "test/key".to_string(),
+            zeroize::Zeroizing::new("test-value".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 
@@ -25,7 +28,10 @@ mod tests {
     #[tokio::test]
     async fn build_provider_with_audit() {
         let mut secrets = HashMap::new();
-        secrets.insert("test/key".to_string(), "test-value".to_string());
+        secrets.insert(
+            "test/key".to_string(),
+            zeroize::Zeroizing::new("test-value".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, true);
 
@@ -56,8 +62,14 @@ mod tests {
     #[tokio::test]
     async fn provider_multiple_secrets() {
         let mut secrets = HashMap::new();
-        secrets.insert("key1".to_string(), "value1".to_string());
-        secrets.insert("key2".to_string(), "value2".to_string());
+        secrets.insert(
+            "key1".to_string(),
+            zeroize::Zeroizing::new("value1".to_string()),
+        );
+        secrets.insert(
+            "key2".to_string(),
+            zeroize::Zeroizing::new("value2".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 
@@ -80,7 +92,10 @@ mod tests {
     #[tokio::test]
     async fn provider_releases_all_handles() {
         let mut secrets = HashMap::new();
-        secrets.insert("test/key".to_string(), "secret".to_string());
+        secrets.insert(
+            "test/key".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 
@@ -96,7 +111,10 @@ mod tests {
     #[tokio::test]
     async fn provider_sign_produces_hmac() {
         let mut secrets = HashMap::new();
-        secrets.insert("signing/key".to_string(), "my-hmac-key".to_string());
+        secrets.insert(
+            "signing/key".to_string(),
+            zeroize::Zeroizing::new("my-hmac-key".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 
@@ -111,7 +129,10 @@ mod tests {
     #[tokio::test]
     async fn provider_decrypt_not_supported() {
         let mut secrets = HashMap::new();
-        secrets.insert("test/key".to_string(), "secret".to_string());
+        secrets.insert(
+            "test/key".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 
@@ -135,7 +156,10 @@ mod tests {
     #[tokio::test]
     async fn provider_independent_handles_for_same_path() {
         let mut secrets = HashMap::new();
-        secrets.insert("shared/key".to_string(), "shared-secret".to_string());
+        secrets.insert(
+            "shared/key".to_string(),
+            zeroize::Zeroizing::new("shared-secret".to_string()),
+        );
 
         let provider = build_provider(&ProviderConfig::TalosVault, secrets, false);
 

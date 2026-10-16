@@ -1,4 +1,5 @@
 pub mod fleet_identity;
+pub mod process_posture;
 
 use std::env;
 use std::sync::LazyLock;

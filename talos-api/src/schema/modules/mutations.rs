@@ -682,7 +682,7 @@ impl ModulesMutations {
             module.allowed_secrets.clone(),
             &vault_refs,
         );
-        let secrets: std::collections::HashMap<String, String> = if wanted.is_empty() {
+        let secrets: talos_workflow_job_protocol::SecretMap = if wanted.is_empty() {
             std::collections::HashMap::new()
         } else {
             let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
@@ -693,7 +693,6 @@ impl ModulesMutations {
                 Some(user_id),
             )
             .await
-            .map(talos_oauth::resolver::into_runtime_secrets)
             .unwrap_or_default()
         };
         if let Err(msg) = talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(

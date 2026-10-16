@@ -2818,8 +2818,13 @@ pub struct PipelineStepSpec {
     pub config: JsonValue,
     pub allowed_hosts: Vec<String>,
     pub allowed_methods: Vec<String>,
-    /// Pre-decrypted secret values for this step.
-    pub secrets: HashMap<String, String>,
+    /// This step's opened secret values — a [`SecretMap`], so every value is
+    /// wiped on drop. Until 2026-10-15 this was a `HashMap<String, String>`:
+    /// the one plaintext copy in the worker that nothing zeroized, cloned
+    /// again for every attempt (security review 2026-10-15, C-10).
+    ///
+    /// [`SecretMap`]: talos_workflow_job_protocol::SecretMap
+    pub secrets: talos_workflow_job_protocol::SecretMap,
     /// Maximum fuel (WASM instructions) for this step.
     pub max_fuel: u64,
     pub max_memory_mb: usize,
@@ -4051,7 +4056,7 @@ impl TalosRuntime {
         input: JsonValue,
         _execution_fs_dir: Option<Arc<cap_std::fs::Dir>>,
         execution_context: Option<(String, String, String)>, // (workflow_id, execution_id, module_id)
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
     ) -> Result<JsonValue> {
         self.execute_job_with_full_features(
             wasm_bytes,
@@ -4107,7 +4112,7 @@ impl TalosRuntime {
         input: JsonValue,
         _execution_fs_dir: Option<Arc<cap_std::fs::Dir>>,
         execution_context: Option<(String, String, String)>, // (workflow_id, execution_id, module_id)
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         timeout: Duration,
         retry_policy: RetryPolicy,
@@ -4661,7 +4666,7 @@ impl TalosRuntime {
         max_memory_mb: usize,
         input: JsonValue,
         execution_context: Option<(String, String, String)>, // (workflow_id, execution_id, module_id)
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
         token_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
         // Pre-computed SHA256 hash — avoids triple-computing it per attempt.
         module_hash_bytes: [u8; 32],
@@ -5422,7 +5427,7 @@ impl TalosRuntime {
         input: &str,
         execution_context: Option<(String, String, String)>, // (workflow_id, execution_id, module_id)
         timeout: std::time::Duration,
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
         stdout_sender: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
     ) -> Result<String> {
         // Inspect capability world so we use the correct tiered linker + cache.
@@ -5943,6 +5948,9 @@ impl TalosRuntime {
                 step.allowed_hosts.clone(),
                 step.allowed_methods.clone(),
                 step.max_memory_mb,
+                // Each attempt gets its own copy: a retry re-runs the step in a
+                // fresh context, so the step keeps its map. The values are
+                // `Zeroizing`, so the copy is wiped with the context.
                 step.secrets.clone(),
                 self.redis_client.clone(),
                 self.nats_client.clone(),
@@ -6686,7 +6694,7 @@ impl TalosRuntime {
         input: JsonValue,
         _execution_fs_dir: Option<Arc<cap_std::fs::Dir>>,
         execution_context: Option<(String, String, String)>,
-        secrets: HashMap<String, String>,
+        secrets: talos_workflow_job_protocol::SecretMap,
         timeout: Duration,
         allow_wasi_network: bool,
     ) -> Result<JsonValue> {

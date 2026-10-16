@@ -9960,6 +9960,69 @@ fi
 
 echo
 
+bold "▶ check 107: a secret map is a SecretMap of Zeroizing values, never HashMap<String, String>"
+
+# Security review 2026-10-15 (C-10 carried, round 2 "one undocumented hop"):
+# the controller resolved secrets into a `SecretMap` (`HashMap<String,
+# Zeroizing<String>>`, 2026-10-14) and sealed them from it, but the worker
+# opened every envelope and every sealed claim into a plain
+# `HashMap<String, String>`, carried it through `TalosContext::new` and every
+# `execute_*` entry point, kept a plain copy on `PipelineStepSpec` for the
+# pipeline's whole run and cloned it per attempt, and wrapped each value in
+# `Zeroizing` only inside `TalosVaultProvider::from_resolved` — the one line
+# that did not matter, because the plain map it consumed had already lived
+# as long as the job. A standalone run had a declared plaintext exit
+# (`into_runtime_secrets`) for the same reason: the runtime's parameter was
+# plain. The type is now one end to end, and this check keeps it so.
+#
+# Rule: in production Rust (`src/`, test code skipped as the script states),
+# a line that names a secret — the word `secret` in any case — and the type
+# `HashMap<String, String>` (any spacing, with or without
+# `std::collections::`) fails. The type a secret map has is
+# `talos_workflow_job_protocol::SecretMap` (the re-export of
+# `talos_workflow_engine_core::SecretMap`); a function that only reads keys
+# is generic over the value (`check_vault_refs_resolvable`).
+# Scope: the crates a secret value passes through after it is read —
+# talos-workflow-job-protocol, talos-envelope-seal, talos-secrets,
+# talos-worker-runtime, worker, talos-oauth, talos-replay-service,
+# talos-mcp-handlers, talos-api, talos-workflow-engine, talos-engine,
+# talos-execution-orchestration, talos-webhooks, talos-integration-helpers,
+# talos-secrets-manager — named in the script's ROOTS; a new crate that
+# handles secret values is added there.
+# Opt-out: `// plain-secret-map: <reason>` on the line or one of the three
+# above it. None today.
+# Measured on main @ 4424103c (before this package): 16 lines in 10 files,
+# every one a defect of the class (the worker's single-path `let`, the
+# claim client's newtype, the runtime's six signatures, the provider's two
+# constructors, the resolver's exit, the replay / sandbox / GraphQL
+# rehearsal maps); 0 false positives — a comment is dropped before matching,
+# and a `HashMap<String, String>` of headers, config or labels has no
+# `secret` on its line. After: 0 (313 files read).
+# Limit: textual and per-line. On main the same defect also sat on three
+# lines the check does NOT see — `) -> Result<HashMap<String, String>,
+# ClaimClientError>` twice and `) -> HashMap<String, String> {` once — because
+# the word `secret` is on the `fn` line above, not the return line. Those
+# were fixed by the type change; the compile-time types pin them (a
+# `SecretMap` cannot be assigned from a plain map), and a worker test pins
+# the parsed reply's value type. A secret map declared through an alias that
+# is not `SecretMap` is not seen either.
+if ps_out=$(python3 scripts/lint-plain-secret-map.py --self-test 2>&1); then :; else
+    printf '%s\n' "$ps_out"
+    red "✗ check 107 self-test failed (python3 scripts/lint-plain-secret-map.py --self-test)"
+    EXIT_CODE=1
+fi
+if ps_out=$(cd "$ROOT" && python3 scripts/lint-plain-secret-map.py . 2>&1); then
+    green "✓ no plain HashMap<String, String> of secrets in the secret-handling crates (${ps_out##*$'\n'})"
+else
+    printf '%s\n' "$ps_out"
+    red "✗ a secret map is typed HashMap<String, String> (check 107)"
+    yellow "  → use talos_workflow_job_protocol::SecretMap (Zeroizing values) end to end; a reader"
+    yellow "    that only needs the keys is generic over the value type."
+    EXIT_CODE=1
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

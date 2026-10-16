@@ -1,6 +1,6 @@
 //! RFC 0010 P3 (D3b) — controller-side per-execution secret-envelope sealing.
 //!
-//! This crate owns the controller half of the claim/lease protocol that removes
+//! This crate owns the controller half of the claim protocol that removes
 //! `WORKER_SHARED_KEY` as a secret-decryption root on the worker (see
 //! `docs/rfcs/0010-asymmetric-worker-trust-boundary.md`, "P3 detailed design").
 //! It does NOT touch NATS — the transport wiring (the claim responder
@@ -18,11 +18,18 @@
 //! * [`handle_secret_claim`] — verify the claim's Ed25519 signature against the
 //!   worker's registered key(s), atomically take the context, seal the secrets
 //!   to the worker's ephemeral key, and return a signed [`SealedSecrets`].
-//! * [`RedisLease`] — the durability / crash-recovery layer: a per-`exec_id`
-//!   Redis key with a CAS (`dispatched → claimed_by`) so a dead replica's job is
-//!   re-dispatchable after the lease expires. In-memory `take` is authoritative
-//!   for single-claim; Redis is the cross-replica / crash-recovery backstop
-//!   (same fail-open posture as `talos-replay-guard`).
+//!
+//! Single-claim is in-process ONLY, and that is sufficient: a dispatch's
+//! `claim_inbox` is a NATS inbox of the dispatching replica's connection
+//! (`nc.new_inbox()`), so a claim can only reach the replica that holds the
+//! context, and `take` is atomic there. A `RedisLease` (Lua-CAS
+//! `dispatched → claimed:<worker>`) was written for cross-replica
+//! defence-in-depth and crash recovery, but nothing ever called it — no
+//! `record_dispatch` at registration, no `try_claim` in the responder, no
+//! re-dispatch on expiry — and its `Unavailable` arm documented a fail-open
+//! posture for a check that never ran. It was deleted on 2026-10-15 rather than
+//! wired: a lease that gates nothing is a claim about the system that is not
+//! true (`docs/engineering-log/packages/2026-10-15-worker-secret-map-zeroizing.md`).
 
 use std::collections::HashMap;
 
@@ -35,9 +42,7 @@ use talos_workflow_job_protocol::{
     SecretClaim,
 };
 
-pub mod lease;
 pub mod responder;
-pub use lease::{ClaimLeaseOutcome, RedisLease};
 pub use responder::run_claim_responder;
 
 // The worker-verifying-key registry (`set_dynamic_worker_public_keys`) is a
@@ -95,7 +100,7 @@ impl EnvelopeSealingMode {
 /// long enough to seal them to the claiming worker's ephemeral key. The JSON is
 /// zeroized on drop and never rendered in `Debug` (lint check 37).
 pub struct SealContext {
-    /// Serialized `HashMap<String,String>` of secret name → value.
+    /// Serialized secret map (name → value) as the worker will open it.
     secrets_json: Zeroizing<Vec<u8>>,
 }
 
@@ -279,7 +284,7 @@ impl std::error::Error for ClaimError {}
 /// Ed25519 key(s), atomically take the in-flight seal context (single-claim),
 /// seal the secrets to the worker's ephemeral key, and return a controller-
 /// signed [`SealedSecrets`]. Pure and synchronous — the NATS receive/reply and
-/// the Redis lease CAS are layered by the controller responder around this.
+/// the reply publish are layered by the controller responder around this.
 ///
 /// Verification uses the P2 registry (`worker_public_keys`) so key rotation
 /// (multiple registered keys) is handled by trying each candidate — identical

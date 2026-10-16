@@ -36,7 +36,7 @@ const PLAINTEXT: &str = "s3cr3t-plaintext-value";
 /// Syntactically fine, deliberately NOT granted — the resolver must refuse.
 const UNGRANTED_MARKER: &str = "vault://denied/token";
 
-fn ctx(secrets: HashMap<String, String>, allowed_secrets: &[&str]) -> TalosContext {
+fn ctx(secrets: talos_workflow_job_protocol::SecretMap, allowed_secrets: &[&str]) -> TalosContext {
     let mut c = TalosContext::new(
         CapabilityWorld::Http,
         vec![HOST.to_string()],
@@ -63,7 +63,10 @@ fn bare() -> TalosContext {
 
 fn granted() -> TalosContext {
     let mut m = HashMap::new();
-    m.insert(GRANTED_PATH.to_string(), PLAINTEXT.to_string());
+    m.insert(
+        GRANTED_PATH.to_string(),
+        zeroize::Zeroizing::new(PLAINTEXT.to_string()),
+    );
     ctx(m, &[GRANTED_PATH])
 }
 

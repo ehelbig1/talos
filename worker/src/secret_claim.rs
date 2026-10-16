@@ -7,18 +7,22 @@
 //!      binding the ephemeral public key) to the dispatch's `claim_inbox`,
 //!   3. verifies the controller-signed `SealedSecrets` reply and opens it with
 //!      the ephemeral secret (consumed → forward secrecy),
-//!   4. loads the resulting plaintext secrets map into the `SecretProvider`.
+//!   4. loads the resulting [`SecretMap`] into the `SecretProvider`.
+//!
+//! Every map this module returns is a [`SecretMap`]: `Zeroizing` values from
+//! the moment the JSON parses, so no plain copy of a value exists in the
+//! worker after the box opens (security review 2026-10-15, C-10).
 //!
 //! The crypto handshake is split into pure `build_claim` / `process_reply`
 //! functions (unit-testable without a broker) and a thin `claim_secrets` NATS
 //! wrapper.
 
-use std::collections::HashMap;
 use std::time::Duration;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use talos_workflow_job_protocol::{
-    ClaimResponse, DispatchSigningKey, DispatchVerifyingKey, SecretClaim, WorkerEphemeral,
+    ClaimResponse, DispatchSigningKey, DispatchVerifyingKey, SecretClaim, SecretMap,
+    WorkerEphemeral,
 };
 use uuid::Uuid;
 
@@ -92,9 +96,8 @@ pub fn build_claim(
 
 /// Verify + open the controller's reply, returning the RAW opened plaintext
 /// bytes. Consumes the ephemeral (single-use → forward secrecy). The caller
-/// deserializes the bytes into whatever shape it sealed — a flat
-/// `HashMap<String,String>` (single-node) or a per-step
-/// `Vec<HashMap<String,String>>` (pipeline). Pure and testable.
+/// deserializes the bytes into whatever shape it sealed — a flat [`SecretMap`]
+/// (single-node) or a per-step `Vec<SecretMap>` (pipeline). Pure and testable.
 pub fn process_reply_raw(
     we: WorkerEphemeral,
     exec_id: Uuid,
@@ -129,29 +132,13 @@ pub fn process_reply_raw(
     .map_err(ClaimClientError::OpenFailed)
 }
 
-/// Per-step secret maps that wipe every value still held when dropped —
-/// the pipeline path moves each step's map out with [`Self::take`], and
-/// anything left over (or everything, on an early return) is zeroized.
-pub struct ZeroizingSecretMaps(Vec<HashMap<String, String>>);
-
-impl ZeroizingSecretMaps {
-    pub fn new(maps: Vec<HashMap<String, String>>) -> Self {
-        Self(maps)
-    }
-    /// Move step `i`'s map out (empty when absent), leaving nothing behind.
-    pub fn take(&mut self, i: usize) -> HashMap<String, String> {
-        self.0.get_mut(i).map(std::mem::take).unwrap_or_default()
-    }
-}
-
-impl Drop for ZeroizingSecretMaps {
-    fn drop(&mut self) {
-        for map in &mut self.0 {
-            for v in map.values_mut() {
-                v.zeroize();
-            }
-        }
-    }
+/// Move step `i`'s map out of the claimed per-step vector (empty when absent),
+/// leaving nothing behind. What is not taken — or everything, on an early
+/// return — is wiped when the vector drops, because every value is `Zeroizing`.
+/// (Until 2026-10-15 a `ZeroizingSecretMaps` newtype carried a `Drop` that did
+/// this by hand over plain `String`s; the type now does it.)
+pub fn take_step_secrets(per_step: &mut [SecretMap], i: usize) -> SecretMap {
+    per_step.get_mut(i).map(std::mem::take).unwrap_or_default()
 }
 
 /// Verify + open the controller's reply into a flat secrets map (single-node
@@ -162,7 +149,7 @@ pub fn process_reply(
     worker_id: &str,
     controller_keys: &[DispatchVerifyingKey],
     reply_bytes: &[u8],
-) -> Result<HashMap<String, String>, ClaimClientError> {
+) -> Result<SecretMap, ClaimClientError> {
     let plaintext = process_reply_raw(we, exec_id, worker_id, controller_keys, reply_bytes)?;
     serde_json::from_slice(plaintext.as_slice()).map_err(|e| ClaimClientError::Serde(e.to_string()))
 }
@@ -206,7 +193,7 @@ pub async fn claim_secrets(
     worker_id: &str,
     worker_signing_key: &DispatchSigningKey,
     controller_keys: &[DispatchVerifyingKey],
-) -> Result<HashMap<String, String>, ClaimClientError> {
+) -> Result<SecretMap, ClaimClientError> {
     let plaintext = claim_secrets_raw(
         nc,
         exec_id,
@@ -225,15 +212,39 @@ mod tests {
     use talos_workflow_job_protocol::{seal_secrets, SealedSecrets};
 
     #[test]
-    fn leftover_step_maps_are_wiped_and_taken_maps_leave_nothing() {
-        let map = |v: &str| -> HashMap<String, String> {
-            [("k".to_string(), v.to_string())].into_iter().collect()
+    fn a_taken_step_map_leaves_nothing_behind() {
+        let map = |v: &str| -> SecretMap {
+            [("k".to_string(), Zeroizing::new(v.to_string()))]
+                .into_iter()
+                .collect()
         };
-        let mut maps = ZeroizingSecretMaps::new(vec![map("s0"), map("s1")]);
-        assert_eq!(maps.take(0).get("k").unwrap(), "s0");
-        assert!(maps.take(0).is_empty(), "a taken map is moved, not copied");
-        assert!(maps.take(9).is_empty());
-        assert_eq!(maps.take(1).get("k").unwrap(), "s1");
+        let mut maps = vec![map("s0"), map("s1")];
+        assert_eq!(
+            take_step_secrets(&mut maps, 0).get("k").unwrap().as_str(),
+            "s0"
+        );
+        assert!(
+            take_step_secrets(&mut maps, 0).is_empty(),
+            "a taken map is moved, not copied"
+        );
+        assert!(take_step_secrets(&mut maps, 9).is_empty());
+        assert_eq!(
+            take_step_secrets(&mut maps, 1).get("k").unwrap().as_str(),
+            "s1"
+        );
+    }
+
+    /// The claim client's maps are `SecretMap`s: a value is `Zeroizing`, which
+    /// is what wipes it on drop. This pins the type at the one place a sealed
+    /// reply is parsed, so a plain `HashMap<String, String>` cannot come back
+    /// without this test changing (structural lint check 107 holds the rest).
+    #[test]
+    fn a_parsed_reply_holds_zeroizing_values() {
+        fn is_zeroizing(_: &Zeroizing<String>) {}
+        let map: SecretMap = serde_json::from_str(r#"{"k":"v"}"#).unwrap();
+        is_zeroizing(map.get("k").unwrap());
+        let steps: Vec<SecretMap> = serde_json::from_str(r#"[{"k":"v"},{}]"#).unwrap();
+        is_zeroizing(steps[0].get("k").unwrap());
     }
 
     #[test]
@@ -249,10 +260,12 @@ mod tests {
         assert_eq!(claim.exec_id, job_id);
 
         // Simulate the controller: seal the secrets to the claim's epk_w.
-        let secrets: HashMap<String, String> =
-            [("anthropic/api_key".to_string(), "sk-ant-x".to_string())]
-                .into_iter()
-                .collect();
+        let secrets: SecretMap = [(
+            "anthropic/api_key".to_string(),
+            Zeroizing::new("sk-ant-x".to_string()),
+        )]
+        .into_iter()
+        .collect();
         let secrets_json = serde_json::to_vec(&secrets).unwrap();
         let out =
             seal_secrets(&claim.epk_w, claim.exec_id, &claim.worker_id, &secrets_json).unwrap();
@@ -261,7 +274,7 @@ mod tests {
 
         // Worker opens the reply.
         let map = process_reply(we, job_id, "worker-7", &[controller_vk], &reply).unwrap();
-        assert_eq!(map.get("anthropic/api_key").unwrap(), "sk-ant-x");
+        assert_eq!(map.get("anthropic/api_key").unwrap().as_str(), "sk-ant-x");
     }
 
     #[test]

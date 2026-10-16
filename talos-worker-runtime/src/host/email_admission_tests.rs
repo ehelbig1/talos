@@ -19,7 +19,10 @@ use crate::wit_inspector::CapabilityWorld;
 
 const PUBLIC: &str = "203.0.113.10";
 
-fn ctx(hosts: &[&str], secrets: HashMap<String, String>) -> (TalosContext, HostDiagSink) {
+fn ctx(
+    hosts: &[&str],
+    secrets: talos_workflow_job_protocol::SecretMap,
+) -> (TalosContext, HostDiagSink) {
     let mut c = TalosContext::new(
         CapabilityWorld::Http,
         hosts.iter().map(|h| h.to_string()).collect(),
@@ -156,9 +159,12 @@ async fn send_records_a_refusal_from_the_gate_before_any_post() {
     let mut secrets = HashMap::new();
     secrets.insert(
         "EMAIL_API_URL".to_string(),
-        "https://127.0.0.1:1/".to_string(),
+        zeroize::Zeroizing::new("https://127.0.0.1:1/".to_string()),
     );
-    secrets.insert("EMAIL_API_KEY".to_string(), "test-key".to_string());
+    secrets.insert(
+        "EMAIL_API_KEY".to_string(),
+        zeroize::Zeroizing::new("test-key".to_string()),
+    );
     let (mut c, sink) = ctx(&["*"], secrets);
     let r = <TalosContext as wit_email::Host>::send(&mut c, message()).await;
     assert!(matches!(r, Err(wit_email::Error::Sendfailed)), "{r:?}");

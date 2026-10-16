@@ -541,6 +541,20 @@ claim even by a party who captured it.
 
 ### Lease / single-claim state machine
 
+> **Status, 2026-10-15: the Redis lease was never wired and has been deleted.**
+> `RedisLease` shipped with its CAS script and a live-Redis test, but no
+> dispatch path called `record_dispatch`, the responder never called
+> `try_claim`, and nothing re-dispatched on expiry; single-claim has always
+> been the in-memory atomic `take` on the dispatching replica, which the
+> connection-scoped `claim_inbox` below makes sufficient. A lease that gates
+> nothing and documents a fail-open `Unavailable` arm overstates the system,
+> so it was removed rather than wired
+> (`docs/engineering-log/packages/2026-10-15-worker-secret-map-zeroizing.md`).
+> The design below is kept as the record of what was proposed. If crash
+> recovery of a dispatched-but-unclaimed job is ever needed, the existing
+> `resuming` path (a NEW dispatch, new ephemeral) is the shape to extend, not
+> this lease.
+
 State lives in **Redis** (already present for the replay guard), keyed
 `seal:lease:{exec_id}`, value `{state, worker_id?, dispatched_at}`, `PX =
 lease_ms` (default 30 s, ≥ the dispatch-to-claim budget). Because a NATS reply

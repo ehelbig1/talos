@@ -409,7 +409,10 @@ async fn test_json_path_query() {
 async fn test_logging_redaction() {
     use crate::bindings::talos::core::logging::{self as wit_logging};
     let mut secrets = HashMap::new();
-    secrets.insert("API_KEY".to_string(), "secret-token-123".to_string());
+    secrets.insert(
+        "API_KEY".to_string(),
+        zeroize::Zeroizing::new("secret-token-123".to_string()),
+    );
 
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
@@ -613,7 +616,10 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
     let (port, server) = spawn_loopback_capture_server().await;
 
     let mut secrets = HashMap::new();
-    secrets.insert("test/token".to_string(), "ghs_testtoken12345".to_string());
+    secrets.insert(
+        "test/token".to_string(),
+        zeroize::Zeroizing::new("ghs_testtoken12345".to_string()),
+    );
 
     let mut ctx = TalosContext::new(
         CapabilityWorld::Secrets,

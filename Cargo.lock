@@ -8317,10 +8317,8 @@ dependencies = [
  "async-nats",
  "dashmap",
  "futures",
- "redis",
  "serde_json",
  "talos-metrics",
- "talos-redis",
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",
@@ -10319,6 +10317,7 @@ dependencies = [
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "zeroize",
 ]
 
 [[package]]
@@ -12823,6 +12822,7 @@ version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

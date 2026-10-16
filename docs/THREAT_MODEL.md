@@ -29,7 +29,7 @@ Talos is a workflow automation platform with user-submitted WASM module executio
 | Controller | Rust/Axum API server (GraphQL, REST, MCP JSON-RPC, webhooks). Holds the Postgres, Neo4j and KEK-provider credentials and serves the worker's data-plane RPCs. | `controller/` |
 | Worker | Rust WASM runtime (wasmtime, sandboxed execution). Credential-free: no Postgres connection; data access goes through signed NATS-RPC to the controller. | `worker/` |
 | PostgreSQL | Primary data store (workflows, secrets, sessions, audit tables, executions) | `migrations/` |
-| Redis | Distributed auth rate limiting, TOTP replay prevention, webhook / push deduplication and idempotency keys, WASM module-bytes cache, envelope-sealing claim leases, the pending approval's reply-topic key. Not a session store (sessions and refresh tokens live in PostgreSQL `user_sessions`). Approval responses are published over NATS, not Redis pub/sub. | Controller and worker connect via `REDIS_URL` |
+| Redis | Distributed auth rate limiting, TOTP replay prevention, webhook / push deduplication and idempotency keys, WASM module-bytes cache, the pending approval's reply-topic key. Not a session store (sessions and refresh tokens live in PostgreSQL `user_sessions`). Approval responses are published over NATS, not Redis pub/sub. | Controller and worker connect via `REDIS_URL` |
 | NATS | Job dispatch is **core-NATS signed request/reply** (controller pre-allocates a reply inbox; queue-group workers reply; the controller retries on timeout — controller-driven redelivery, NOT a durable JetStream work queue). **JetStream** backs the tamper-evident audit-event ledger. The worker's data-plane calls (memory, graph, database, state, ML) are signed NATS-RPC to the controller. | `talos-workflow-job-protocol` (in-workspace) |
 | Frontend | React/TypeScript visual workflow editor (untrusted client) | `frontend/` |
 
@@ -390,7 +390,7 @@ deduplication keys, caches and leases (§1).
 | TOTP replay | Spoofing | One-time use enforced with `SET NX`; key TTL (90 s) covers the ±1 step window | Redis unavailability in production makes 2FA login fail closed |
 | Redis unavailable | DoS | Auth limiter and 2FA fail closed in production; GitHub-format webhooks are refused without deduplication | Availability impact by design |
 
-**File:** `talos-totp-2fa/src/lib.rs`, `talos-rate-limit/src/middleware.rs`, `talos-webhooks/src/approval.rs`, `talos-worker-runtime/src/host/governance.rs`, `talos-envelope-seal/src/lease.rs`, `worker/src/main.rs`
+**File:** `talos-totp-2fa/src/lib.rs`, `talos-rate-limit/src/middleware.rs`, `talos-webhooks/src/approval.rs`, `talos-worker-runtime/src/host/governance.rs`, `worker/src/main.rs`
 
 ---
 
