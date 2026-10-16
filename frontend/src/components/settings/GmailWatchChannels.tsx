@@ -9,6 +9,8 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import type { QueryKey } from "@tanstack/react-query";
 import {
   useQuery,
@@ -199,18 +201,17 @@ function CreateGmailWatchDialog({
           <label className="block text-xs font-semibold text-muted-foreground mb-2">
             Gmail account
           </label>
-          <select
+          <Select
             value={integrationId}
             onChange={(e) => setIntegrationId(e.target.value)}
             disabled={submitting || integrations.length === 0}
-            className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
             {integrations.map((i) => (
               <option key={i.id} value={i.id}>
                 {i.email_address}
               </option>
             ))}
-          </select>
+          </Select>
           {integrationAlreadyWatched && (
             <p className="text-xs text-warning mt-2">
               This account already has an active watch. Stop the existing one
@@ -223,13 +224,12 @@ function CreateGmailWatchDialog({
           <label className="block text-xs font-semibold text-muted-foreground mb-2">
             Label IDs (comma-separated)
           </label>
-          <input
+          <Input
             type="text"
             value={labels}
             onChange={(e) => setLabels(e.target.value)}
             disabled={submitting}
             placeholder="INBOX, IMPORTANT"
-            className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
           />
           <p className="text-xs text-muted-foreground mt-1.5">
             Gmail only publishes pushes for messages matching these labels.

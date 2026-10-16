@@ -7,6 +7,8 @@
  */
 
 import React, { useEffect, useState } from "react";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Check, Copy } from "lucide-react";
@@ -162,31 +164,29 @@ export function CreateGcpWatchDialog({
             <label className="block text-xs font-semibold text-muted-foreground mb-2">
               Google Cloud account
             </label>
-            <select
+            <Select
               value={integrationId}
               onChange={(e) => setIntegrationId(e.target.value)}
               disabled={submitting || integrations.length === 0}
-              className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
             >
               {integrations.map((i) => (
                 <option key={i.id} value={i.id}>
                   {i.account_email ?? i.id}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
 
           <div>
             <label className="block text-xs font-semibold text-muted-foreground mb-2">
               Push service-account email
             </label>
-            <input
+            <Input
               type="text"
               value={saEmail}
               onChange={(e) => setSaEmail(e.target.value)}
               disabled={submitting}
               placeholder="talos-gcp-pusher@my-project.iam.gserviceaccount.com"
-              className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
             />
             <p className="text-xs text-muted-foreground mt-1.5">
               The service account your Pub/Sub subscription signs pushes with (
@@ -199,13 +199,12 @@ export function CreateGcpWatchDialog({
             <label className="block text-xs font-semibold text-muted-foreground mb-2">
               Display name (optional)
             </label>
-            <input
+            <Input
               type="text"
               value={displayName}
               onChange={(e) => setDisplayName(e.target.value)}
               disabled={submitting}
               placeholder="Prod alerting"
-              className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
             />
           </div>
 
@@ -214,11 +213,10 @@ export function CreateGcpWatchDialog({
               Module ID (optional)
             </label>
             {moduleOptions.length > 0 ? (
-              <select
+              <Select
                 value={moduleId}
                 onChange={(e) => setModuleId(e.target.value)}
                 disabled={submitting}
-                className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
               >
                 <option value="">(none — bind later)</option>
                 {moduleOptions.map((m) => (
@@ -226,15 +224,14 @@ export function CreateGcpWatchDialog({
                     {m.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             ) : (
-              <input
+              <Input
                 type="text"
                 value={moduleId}
                 onChange={(e) => setModuleId(e.target.value)}
                 disabled={submitting}
                 placeholder="UUID of the module to run on each incident"
-                className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
               />
             )}
             <p className="text-xs text-muted-foreground mt-1.5">

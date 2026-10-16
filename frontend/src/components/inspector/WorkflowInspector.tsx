@@ -1,4 +1,7 @@
 import React from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { useNavigate } from "react-router";
 import {
   Layout,
@@ -323,7 +326,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   Concurrency Limit
                 </label>
                 <div className="flex items-center gap-5">
-                  <input
+                  <Input
                     type="number"
                     min={1}
                     max={100}
@@ -331,7 +334,7 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     onChange={(e) =>
                       setMaxConcurrentExecutions(parseInt(e.target.value) || 1)
                     }
-                    className="w-24 bg-black/40 border border-white/5 rounded-2xl px-6 py-3 text-sm focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui font-semibold text-white"
+                    className="w-24"
                   />
                   <div className="text-xs text-muted-foreground/50 font-bold italic">
                     Default: 1
@@ -344,17 +347,16 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                   Runtime Priority
                 </label>
                 <div className="relative">
-                  <select
+                  <Select
                     value={priority}
                     onChange={(e) =>
                       setPriority(e.target.value as "high" | "normal" | "low")
                     }
-                    className="w-full bg-black/40 border border-white/5 rounded-2xl px-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer hover:bg-black/60 text-white"
                   >
                     <option value="low">Low</option>
                     <option value="normal">Normal</option>
                     <option value="high">High</option>
-                  </select>
+                  </Select>
                   <ChevronDown className="absolute right-6 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 pointer-events-none" />
                 </div>
               </div>
@@ -370,15 +372,14 @@ export const WorkflowInspector: React.FC<WorkflowInspectorProps> = ({
                     </span>
                   )}
                 </div>
-                <textarea
+                <Textarea
                   value={jsonText}
                   onChange={handleJsonChange}
                   rows={6}
                   className={cn(
-                    "w-full bg-black/40 border transition-ui rounded-2xl p-6 text-xs font-mono focus:outline-none focus:ring-4 resize-none leading-relaxed selection:bg-primary/30 custom-scrollbar",
-                    jsonError
-                      ? "border-destructive/40 focus:ring-destructive/10"
-                      : "border-white/5 focus:border-primary/40 focus:ring-primary/10",
+                    "text-xs font-mono resize-none custom-scrollbar",
+                    jsonError &&
+                      "border-destructive/40 focus:ring-destructive/10",
                   )}
                   placeholder='{ "key": "value" }'
                   spellCheck={false}

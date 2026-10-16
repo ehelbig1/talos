@@ -1,5 +1,6 @@
 import React from "react";
-import { Button, DarkSelect } from "@/components/ui";
+import { Select } from "@/components/ui/select";
+import { Button } from "@/components/ui";
 import { Play, RefreshCw, Loader2, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ActorSummary } from "@/lib/graphqlApi";
@@ -58,7 +59,7 @@ export function ExecutionHeader({
         <label htmlFor="workflow-select" className="sr-only">
           Workflow
         </label>
-        <DarkSelect
+        <Select
           id="workflow-select"
           value={workflowId || "new"}
           onChange={(e) => onWorkflowSelect(e.target.value)}
@@ -79,7 +80,7 @@ export function ExecutionHeader({
               ))}
             </>
           )}
-        </DarkSelect>
+        </Select>
         <Button
           variant="ghost"
           size="icon"
@@ -107,7 +108,7 @@ export function ExecutionHeader({
             <label htmlFor="actor-select" className="sr-only">
               Run as actor
             </label>
-            <DarkSelect
+            <Select
               id="actor-select"
               value={selectedActorId}
               onChange={(e) => onActorSelect(e.target.value)}
@@ -120,7 +121,7 @@ export function ExecutionHeader({
                   Run as {a.name}
                 </option>
               ))}
-            </DarkSelect>
+            </Select>
           </>
         )}
 

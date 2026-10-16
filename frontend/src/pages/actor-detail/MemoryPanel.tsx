@@ -1,4 +1,6 @@
 import React, { useState, useMemo } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -289,12 +291,12 @@ function MemoryForm({
 
       <div className="space-y-1">
         <label className="text-xs text-muted-foreground font-medium">Key</label>
-        <input
+        <Input
           value={key}
           onChange={(e) => setKey(e.target.value)}
           disabled={isEditing}
           placeholder="e.g. persona"
-          className="w-full bg-background border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/50 disabled:opacity-50 font-mono"
+          className="font-mono"
         />
       </div>
 
@@ -335,16 +337,14 @@ function MemoryForm({
           Value{" "}
           <span className="text-muted-foreground/70 font-normal">(JSON)</span>
         </label>
-        <textarea
+        <Textarea
           value={value}
           onChange={(e) => handleValueChange(e.target.value)}
           rows={5}
           placeholder='{"role": "AppSec Engineer", "expertise": ["OWASP", "threat modeling"]}'
           className={cn(
-            "w-full bg-background border rounded-lg px-3 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none font-mono resize-y",
-            jsonError
-              ? "border-destructive/50 focus:border-destructive/70"
-              : "border-white/10 focus:border-primary/50",
+            "font-mono resize-y",
+            jsonError && "border-destructive/50 focus:border-destructive/70",
           )}
         />
         {jsonError && <p className="text-xs text-destructive">{jsonError}</p>}
@@ -535,11 +535,11 @@ export function MemoryPanel({ actorId }: { actorId: string }) {
       {memories.length > 3 && (
         <div className="relative">
           <Filter className="w-3.5 h-3.5 text-muted-foreground/70 absolute left-3 top-1/2 -translate-y-1/2" />
-          <input
+          <Input
             value={memSearch}
             onChange={(e) => setMemSearch(e.target.value)}
             placeholder="Search key or value…"
-            className="w-full bg-surface-3/60 border border-white/5 rounded-xl pl-8 pr-8 py-2 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 transition-ui"
+            className="pl-8 pr-8"
           />
           {memSearch && (
             <button

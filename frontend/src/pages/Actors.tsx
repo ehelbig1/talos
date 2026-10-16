@@ -1,4 +1,5 @@
 import React, { useState, useMemo, Suspense } from "react";
+import { Input } from "@/components/ui/input";
 import { useNavigate } from "react-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
@@ -279,12 +280,12 @@ export default function Actors() {
             <div className="flex flex-col xl:flex-row items-center gap-8 p-3 bg-surface-3/40 border border-white/5 rounded-2xl">
               <div className="relative flex-1 w-full group/search">
                 <Search className="absolute left-6 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground/60 group-focus-within/search:text-primary transition-ui z-10" />
-                <input
+                <Input
                   type="text"
                   placeholder="Search actors…"
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  className="w-full bg-surface-4/40 border border-white/5 text-white rounded-2xl pl-16 pr-6 py-4 text-sm font-semibold focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui placeholder:text-muted-foreground/50 relative z-0"
+                  className="pl-16 pr-6 relative z-0"
                 />
               </div>
 

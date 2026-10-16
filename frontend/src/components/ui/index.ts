@@ -18,6 +18,7 @@ export { Drawer, DrawerHeader, DrawerContent } from "./drawer";
 export { Input } from "./input";
 export { Label } from "./label";
 export { RadioGroup, RadioGroupItem } from "./radio-group";
+export { Select } from "./select";
 export { Tabs, TabsList, TabsTrigger, TabsContent } from "./tabs";
 export { Textarea } from "./textarea";
 export {
@@ -30,8 +31,6 @@ export {
 // Standardized custom UI components
 export { ConfirmDialog } from "./ConfirmDialog";
 export { CopyField } from "./CopyField";
-export { DarkInput } from "./DarkInput";
-export { DarkSelect } from "./DarkSelect";
 export { DarkSurfaceDiv } from "./DarkSurfaceDiv";
 export { DialogWrapper } from "./DialogWrapper";
 export { ErrorBanner } from "./ErrorBanner";

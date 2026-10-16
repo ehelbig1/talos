@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from "react";
+import { Textarea } from "@/components/ui/textarea";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
@@ -116,9 +117,7 @@ function NodeTraceCard({
     <div
       className={cn(
         "rounded-2xl border overflow-hidden transition-ui",
-        trace.status === "failed"
-          ? "border-destructive/30 bg-destructive/5"
-          : "border-white/5 bg-white/[0.02]",
+        trace.status === "failed" && "border-destructive/30 bg-destructive/5",
       )}
     >
       <button
@@ -399,16 +398,15 @@ export function TestWorkflowModal({
               </span>
             )}
           </div>
-          <textarea
+          <Textarea
             value={mockInputs}
             onChange={(e) => handleMockInputChange(e.target.value)}
             rows={4}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-3/40 border focus:outline-none focus:ring-1 rounded-2xl px-6 py-5 text-sm font-mono text-foreground placeholder:text-muted-foreground/50 resize-none transition-ui",
-              jsonError
-                ? "border-destructive/40 focus:border-destructive focus:ring-destructive/20"
-                : "border-white/5 focus:border-primary/40 focus:ring-primary/20",
+              "font-mono resize-none",
+              jsonError &&
+                "border-destructive/40 focus:border-destructive focus:ring-destructive/20",
             )}
           />
           <div className="flex items-center justify-between gap-6">

@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useQuery } from "@tanstack/react-query";
 import { X, ChevronRight, Info, Zap, Shield, Gauge } from "lucide-react";
@@ -366,13 +368,13 @@ export function CreateActorPanel({
                       Name <span className="text-primary">*</span>
                     </label>
                     <div className="relative group/input">
-                      <input
+                      <Input
                         value={name}
                         onChange={(e) => setName(e.target.value)}
                         placeholder="e.g. inbox-assistant"
                         maxLength={64}
                         autoFocus
-                        className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui relative z-10 font-medium"
+                        className="relative z-10"
                       />
                     </div>
                     <p className="text-xs text-muted-foreground/50 font-medium ml-1">
@@ -384,12 +386,12 @@ export function CreateActorPanel({
                       Description
                     </label>
                     <div className="relative group/textarea">
-                      <textarea
+                      <Textarea
                         value={description}
                         onChange={(e) => setDesc(e.target.value)}
                         placeholder="What is this actor for?"
                         rows={3}
-                        className="w-full bg-surface-4/40 border border-white/10 rounded-2xl px-6 py-4 text-sm text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-1 focus:ring-primary/40 transition-ui resize-none relative z-10 font-medium"
+                        className="resize-none relative z-10"
                       />
                     </div>
                   </div>

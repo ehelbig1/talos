@@ -5,6 +5,7 @@
  */
 
 import React from "react";
+import { Select } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import { CheckCircle2, Clock, Loader2, Bot } from "lucide-react";
 import type { ActorSummary } from "@/lib/graphqlApi";
@@ -53,10 +54,10 @@ export function SetupPanel({
           </p>
         ) : (
           <div className="relative group">
-            <select
+            <Select
               value={selectedWorkflowId}
               onChange={(e) => onSelectWorkflow(e.target.value)}
-              className="w-full bg-surface-3/60 border border-white/5 rounded-2xl px-6 py-4 text-sm font-bold text-white focus:outline-none focus:ring-2 focus:ring-primary/40 transition-ui appearance-none cursor-pointer relative z-10"
+              className="relative z-10"
             >
               <option value="" className="bg-surface-4">
                 Select a workflow…
@@ -66,7 +67,7 @@ export function SetupPanel({
                   {w.name}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         )}
         <p className="text-xs text-muted-foreground/50 leading-relaxed">

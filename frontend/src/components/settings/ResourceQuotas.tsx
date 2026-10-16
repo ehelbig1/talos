@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   useGetResourceQuotasQuery,
@@ -258,7 +259,7 @@ export function ResourceQuotas() {
               {isEditing ? (
                 <div className="space-y-4 relative z-10">
                   <div className="relative group/input">
-                    <input
+                    <Input
                       type="number"
                       value={item.editedValue}
                       onChange={(e) =>
@@ -267,7 +268,7 @@ export function ResourceQuotas() {
                           [item.key]: e.target.value,
                         }))
                       }
-                      className="w-full h-14 px-6 bg-black/60 border border-white/5 rounded-2xl text-xl font-semibold text-white focus:outline-none focus:ring-4 focus:ring-primary/10 transition-ui font-mono pr-24"
+                      className="text-xl font-mono pr-24"
                       min="0"
                     />
                     <div className="absolute right-6 top-1/2 -translate-y-1/2 text-xs font-semibold text-muted-foreground/70 pointer-events-none">

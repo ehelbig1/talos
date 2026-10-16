@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Textarea } from "@/components/ui/textarea";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
 import { getNodeTemplates, type NodeTemplate } from "@/lib/graphqlApi";
@@ -21,7 +22,6 @@ import {
   Zap,
 } from "lucide-react";
 import { Button, Input } from "@/components/ui";
-import { DarkInput } from "@/components/ui/DarkInput";
 
 // ---------------------------------------------------------------------------
 // Category config — icon + color for each template category
@@ -313,16 +313,15 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           <label className="text-xs font-semibold text-muted-foreground/60 block">
             Configuration (JSON)
           </label>
-          <textarea
+          <Textarea
             value={config}
             onChange={(e) => handleConfigChange(e.target.value)}
             rows={6}
             spellCheck={false}
             className={cn(
-              "w-full bg-surface-4/40 border focus:outline-none rounded-2xl px-6 py-5 text-sm font-semibold font-mono text-white resize-none transition-ui",
-              configError
-                ? "border-destructive/40 focus:border-destructive/60 focus:ring-4 focus:ring-destructive/10 text-destructive"
-                : "border-white/5 focus:border-primary/40 focus:ring-4 focus:ring-primary/10",
+              "font-mono resize-none",
+              configError &&
+                "border-destructive/40 focus:border-destructive/60 focus:ring-destructive/10 text-destructive",
             )}
           />
           {configError && (
@@ -483,7 +482,7 @@ export default function Catalog() {
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">
             <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 pointer-events-none group-focus-within/search:text-primary transition-ui z-10" />
-            <DarkInput
+            <Input
               type="text"
               placeholder="Search templates…"
               value={search}

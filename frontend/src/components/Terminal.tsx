@@ -1,4 +1,5 @@
 import React, { useMemo, useState, useEffect, useRef } from "react";
+import { Input } from "@/components/ui/input";
 import { useUIStore } from "@/store/uiStore";
 import {
   useEphemeralExecutionStore,
@@ -309,12 +310,12 @@ const Terminal = () => {
 
           <div className="relative group">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/50 group-focus-within:text-primary transition-ui" />
-            <input
+            <Input
               type="text"
               placeholder="Search logs…"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="bg-surface-3/40 border border-white/5 rounded-xl pl-10 pr-4 py-1.5 text-sm font-bold w-40 focus:w-64 transition-ui outline-none text-white placeholder:text-muted-foreground/50 focus:border-primary/50"
+              className="pl-10 pr-4 w-40 focus:w-64"
             />
           </div>
         </div>

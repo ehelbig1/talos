@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Input } from "@/components/ui/input";
 import { useNavigate } from "react-router";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useMyModulesQuery } from "@/generated/graphql";
@@ -20,7 +21,6 @@ import {
   Zap,
   ExternalLink,
 } from "lucide-react";
-import { DarkInput } from "@/components/ui/DarkInput";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -325,7 +325,7 @@ export default function Modules() {
           {/* Search */}
           <div className="relative group/search flex-1 md:flex-none">
             <Search className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/60 pointer-events-none group-focus-within/search:text-primary transition-ui z-10" />
-            <DarkInput
+            <Input
               type="text"
               placeholder="Search modules…"
               value={search}

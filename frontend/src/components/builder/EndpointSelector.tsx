@@ -1,4 +1,6 @@
 import React, { useState } from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Input } from "@/components/ui/input";
 import {
   Link,
   Search,
@@ -398,7 +400,7 @@ export function EndpointSelector({
                         {prop.description}
                       </p>
                     )}
-                    <input
+                    <Input
                       type={
                         prop.type === "number" || prop.type === "integer"
                           ? "number"
@@ -411,14 +413,13 @@ export function EndpointSelector({
                       placeholder={String(
                         prop.example || prop.default || `Enter ${key}...`,
                       ).toUpperCase()}
-                      className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui"
                     />
                   </div>
                 ))}
               </div>
             ) : (
               <div className="relative group">
-                <textarea
+                <Textarea
                   value={JSON.stringify(bodyData, null, 2)}
                   onChange={(e) => {
                     try {
@@ -429,7 +430,7 @@ export function EndpointSelector({
                   }}
                   placeholder='{ "PAYLOAD": "METADATA" }'
                   rows={10}
-                  className="relative w-full p-6 bg-surface-4 border border-white/5 rounded-2xl text-xs font-mono text-primary placeholder-primary/20 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui outline-none custom-scrollbar"
+                  className="relative text-xs font-mono text-primary custom-scrollbar"
                 />
               </div>
             )}
@@ -495,7 +496,7 @@ function ParameterInput({
           {parameter.description}
         </p>
       )}
-      <input
+      <Input
         id={`param-${parameter.name}`}
         type={
           parameter.schema?.type === "number" ||
@@ -511,7 +512,6 @@ function ParameterInput({
             `IDENTIFIER VALUE...`,
         ).toUpperCase()}
         required={parameter.required}
-        className="w-full h-12 bg-surface-3 border border-white/5 rounded-xl px-4 text-sm font-semibold text-white placeholder-white/10 focus:border-primary/40 focus:ring-1 focus:ring-primary/20 transition-ui"
       />
     </div>
   );

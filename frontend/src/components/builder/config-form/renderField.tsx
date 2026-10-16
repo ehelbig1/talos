@@ -6,6 +6,9 @@
  */
 
 import React from "react";
+import { Textarea } from "@/components/ui/textarea";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -24,18 +27,16 @@ export function renderField(
   isValid?: boolean,
 ) {
   const baseClassName = cn(
-    "w-full px-4 h-12 bg-surface-2 border border-white/5 rounded-xl text-sm font-semibold text-white placeholder-white/10 outline-none transition-ui",
     isValid === false &&
       "border-destructive/40 ring-1 ring-destructive/20 bg-destructive/5 text-destructive",
     isValid === true && "border-success/40 ring-1 ring-success/20 bg-success/5",
-    "focus:border-primary/40 focus:ring-1 focus:ring-primary/20 focus:bg-surface-3",
   );
 
   switch (schema.type) {
     case "string":
       if (schema.enum) {
         return (
-          <select
+          <Select
             id={`field-${field}`}
             value={(value as string) || (schema.default as string) || ""}
             onChange={(e) => onChange(e.target.value)}
@@ -49,11 +50,11 @@ export function renderField(
                 {opt.toUpperCase()}
               </option>
             ))}
-          </select>
+          </Select>
         );
       }
       return (
-        <input
+        <Input
           id={`field-${field}`}
           type="text"
           value={(value as string) || ""}
@@ -68,7 +69,7 @@ export function renderField(
 
     case "number":
       return (
-        <input
+        <Input
           id={`field-${field}`}
           type="number"
           value={value !== undefined ? (value as number) : ""}
@@ -112,7 +113,7 @@ export function renderField(
             {arrayValue.map((item, index: number) => (
               <div key={index} className="flex gap-3 group/item">
                 {Object.keys(itemsSchema.properties || {}).map((key) => (
-                  <input
+                  <Input
                     key={key}
                     type="text"
                     placeholder={key.toUpperCase()}
@@ -207,7 +208,7 @@ export function renderField(
                 Edit as JSON
               </CollapsibleTrigger>
               <CollapsibleContent className="mt-3">
-                <textarea
+                <Textarea
                   value={JSON.stringify(arrayValue, null, 2)}
                   onChange={(e) => {
                     try {
@@ -219,7 +220,7 @@ export function renderField(
                   rows={4}
                   className={cn(
                     baseClassName,
-                    "h-auto py-4 font-mono text-xs normal-case tracking-normal",
+                    "h-auto font-mono text-xs normal-case tracking-normal",
                   )}
                 />
               </CollapsibleContent>
@@ -235,7 +236,7 @@ export function renderField(
           <div className="space-y-3">
             {arrayValue.map((item, index: number) => (
               <div key={index} className="flex gap-3">
-                <input
+                <Input
                   type="text"
                   value={item as string}
                   onChange={(e) => {

@@ -133,6 +133,14 @@
 /* The one transition for interactive UI: colour, opacity and transform only,
    150 ms. Layout properties never transition; a panel that needs its width
    or height to move says so with transition-[width] / transition-[height]. */
+/* The chevron of the one native select (ui/select.tsx): a background image,
+   so the element stays a single <select>. */
+@utility select-chevron {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23a1a1aa' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.75rem center;
+}
+
 @utility transition-ui {
   transition-property:
     color, background-color, border-color, outline-color, fill, stroke, opacity,

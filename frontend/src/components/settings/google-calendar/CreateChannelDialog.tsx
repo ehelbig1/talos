@@ -4,6 +4,7 @@
  */
 
 import React, { useEffect, useMemo, useState } from "react";
+import { Select } from "@/components/ui/select";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { Check } from "lucide-react";
@@ -182,21 +183,20 @@ export function CreateChannelDialog({
           <label className="block text-xs font-semibold text-muted-foreground mb-2">
             Google Calendar account
           </label>
-          <select
+          <Select
             value={integrationId}
             onChange={(e) => {
               setIntegrationId(e.target.value);
               setSelected(new Set());
             }}
             disabled={submitting || integrations.length === 0}
-            className="w-full h-10 px-3 text-sm bg-background border border-border/60 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/40"
           >
             {integrations.map((i) => (
               <option key={i.id} value={i.id}>
                 {i.email ?? i.id}
               </option>
             ))}
-          </select>
+          </Select>
         </div>
 
         <div>

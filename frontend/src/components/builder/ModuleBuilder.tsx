@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Dialog, Button, Badge, DarkInput } from "@/components/ui";
+import { Input } from "@/components/ui/input";
+import { Dialog, Button, Badge } from "@/components/ui";
 import { CopyField } from "@/components/ui/CopyField";
 import { lazy, Suspense } from "react";
 const TemplateLibrary = lazy(() =>
@@ -270,7 +271,7 @@ export function ModuleBuilder({
                   </label>
                 </div>
                 <div className="relative group">
-                  <DarkInput
+                  <Input
                     type="text"
                     value={moduleName}
                     onChange={(e) => setModuleName(e.target.value)}
@@ -335,7 +336,7 @@ export function ModuleBuilder({
                           Rate Limit Threshold
                         </label>
                         <div className="relative">
-                          <DarkInput
+                          <Input
                             type="number"
                             value={webhookSettings.maxRequestsPerMinute}
                             onChange={(e) =>
@@ -364,7 +365,7 @@ export function ModuleBuilder({
                           Ingress Restriction (IP)
                         </label>
                         <div className="flex gap-2">
-                          <DarkInput
+                          <Input
                             type="text"
                             value={ipInput}
                             onChange={(e) => setIpInput(e.target.value)}

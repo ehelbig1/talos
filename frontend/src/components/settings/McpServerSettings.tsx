@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from "react";
+import { Select } from "@/components/ui/select";
+import { Input } from "@/components/ui/input";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { CopyField } from "@/components/ui/CopyField";
 import { useCopyToClipboard } from "@/hooks/useCopyToClipboard";
@@ -38,7 +40,6 @@ import {
   Clock,
   Loader2,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 
 const AVAILABLE_ROLES = [
   { name: "System Administrator", desc: "Full access to all capabilities" },
@@ -134,11 +135,6 @@ export default function McpServerSettings() {
     }
   };
 
-  const inputBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white placeholder:text-muted-foreground/50 focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui";
-  const selectBase =
-    "w-full bg-black/40 border border-white/5 rounded-2xl px-5 py-4 text-sm font-semibold text-white focus:outline-none focus:border-primary/40 focus:ring-4 focus:ring-primary/10 transition-ui appearance-none cursor-pointer";
-
   return (
     <div className="space-y-10 max-w-7xl mx-auto">
       <ConfirmDialog
@@ -205,12 +201,12 @@ export default function McpServerSettings() {
                 </label>
                 <div className="relative group/input">
                   <Bot className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-ui" />
-                  <input
+                  <Input
                     type="text"
                     placeholder="e.g. Claude Desktop"
                     value={pluginName}
                     onChange={(e) => setPluginName(e.target.value)}
-                    className={cn(inputBase, "pl-14")}
+                    className="pl-14"
                   />
                 </div>
               </div>
@@ -221,10 +217,10 @@ export default function McpServerSettings() {
                 </label>
                 <div className="relative group/input">
                   <UserCheck className="absolute left-5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground/50 group-focus-within/input:text-primary transition-ui pointer-events-none" />
-                  <select
+                  <Select
                     value={selectedRole}
                     onChange={(e) => setSelectedRole(e.target.value)}
-                    className={cn(selectBase, "pl-14")}
+                    className="pl-14"
                   >
                     {AVAILABLE_ROLES.map((r) => (
                       <option
@@ -235,7 +231,7 @@ export default function McpServerSettings() {
                         {r.name.toUpperCase()}
                       </option>
                     ))}
-                  </select>
+                  </Select>
                 </div>
               </div>
 
