@@ -5,9 +5,9 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { Shield, Trash2, Info, RefreshCw } from "lucide-react";
 
 export function RevokeKeyDialog({
@@ -117,7 +117,7 @@ export function RotateKeyDialog({
           >
             {isPending ? (
               <div className="flex items-center gap-2">
-                <LoadingSpinner className="w-4 h-4" />
+                <Spinner className="w-4 h-4" />
                 <span>Rotating...</span>
               </div>
             ) : (

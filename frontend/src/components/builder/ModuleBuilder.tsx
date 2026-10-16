@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Dialog, Button, Badge } from "@/components/ui";
 import { CopyField } from "@/components/ui/CopyField";
@@ -22,7 +23,6 @@ import {
   Webhook,
   CheckCircle,
   X,
-  Loader2,
   Database,
   Shield,
   Zap,
@@ -180,7 +180,7 @@ export function ModuleBuilder({
             <Suspense
               fallback={
                 <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-                  <Loader2 className="w-10 h-10 animate-spin text-primary" />
+                  <Spinner className="w-10 h-10 text-primary" />
                   <p className="text-xs font-semibold">
                     Initializing Library...
                   </p>
@@ -196,7 +196,7 @@ export function ModuleBuilder({
           </div>
         ) : templateLoading ? (
           <div className="flex flex-col items-center justify-center py-24 gap-4 text-muted-foreground/50">
-            <Loader2 className="w-10 h-10 animate-spin text-primary" />
+            <Spinner className="w-10 h-10 text-primary" />
             <p className="text-xs font-semibold">Loading template…</p>
           </div>
         ) : templateError ? (
@@ -467,7 +467,7 @@ export function ModuleBuilder({
               >
                 {createModuleMutation.isPending ? (
                   <div className="flex items-center gap-3">
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                     <span>Deploying Unit...</span>
                   </div>
                 ) : (

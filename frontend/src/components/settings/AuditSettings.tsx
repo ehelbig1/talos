@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
@@ -19,7 +20,6 @@ import {
   Server,
   CloudUpload,
   Check,
-  Loader2,
 } from "lucide-react";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
@@ -233,7 +233,7 @@ export default function AuditSettings() {
             >
               {saving ? (
                 <div className="flex items-center gap-3">
-                  <Loader2 className="w-5 h-5 animate-spin" />
+                  <Spinner className="w-5 h-5" />
                   <span>Saving…</span>
                 </div>
               ) : isUpdated ? (

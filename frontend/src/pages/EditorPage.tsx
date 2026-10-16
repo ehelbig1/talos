@@ -1,4 +1,5 @@
 import React, { Suspense, lazy, useEffect } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { useParams, useSearchParams } from "react-router";
 import ErrorBoundary from "@/components/ErrorBoundary";
 import { loadWorkflowById } from "@/lib/workflowLoader";
@@ -73,14 +74,7 @@ function EditorPage() {
         }
       >
         <Suspense
-          fallback={
-            <div className="flex-1 flex items-center justify-center text-muted-foreground">
-              <div className="flex flex-col items-center gap-3">
-                <div className="w-8 h-8 border-2 border-primary/20 border-t-primary rounded-full animate-spin" />
-                <span className="text-sm font-medium">Loading editor…</span>
-              </div>
-            </div>
-          }
+          fallback={<LoadingState label="Loading editor…" className="flex-1" />}
         >
           <UnsavedChangesGuard />
           {moduleId && <ModulePreloader moduleId={moduleId} />}

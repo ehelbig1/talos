@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { Dialog } from "@/components/ui";
@@ -158,7 +159,7 @@ export function CreateSecretDialog({
             >
               {createMutation.isPending ? (
                 <div className="flex items-center gap-2">
-                  <div className="w-3.5 h-3.5 border-2 border-primary-foreground/20 border-t-primary-foreground rounded-full animate-spin" />
+                  <Spinner className="w-3.5 h-3.5" />
                   <span>Creating...</span>
                 </div>
               ) : (

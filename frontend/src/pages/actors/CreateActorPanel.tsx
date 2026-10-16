@@ -1,4 +1,5 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -611,7 +612,7 @@ export function CreateActorPanel({
             <Button size="lg" onClick={handleCreate} disabled={isPending}>
               {isPending ? (
                 <>
-                  <div className="w-4 h-4 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                  <Spinner />
                   Creating…
                 </>
               ) : (

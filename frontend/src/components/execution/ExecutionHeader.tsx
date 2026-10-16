@@ -1,7 +1,8 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Select } from "@/components/ui/select";
 import { Button } from "@/components/ui";
-import { Play, RefreshCw, Loader2, Activity } from "lucide-react";
+import { Play, RefreshCw, Activity } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ActorSummary } from "@/lib/graphqlApi";
 
@@ -134,7 +135,7 @@ export function ExecutionHeader({
 
         <Button onClick={onRun} disabled={!canRun} className="h-9 px-4 text-sm">
           {loading ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
+            <Spinner className="h-4 w-4" />
           ) : (
             <Play className="h-3.5 w-3.5 fill-current" />
           )}

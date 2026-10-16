@@ -1,10 +1,10 @@
 import * as React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button, Textarea, Dialog } from "@/components/ui";
 import { XCircle, CheckCircle2, Terminal, Code2, Play } from "lucide-react";
 import { testRhaiExpression } from "@/lib/graphqlApi";
 import { cn } from "@/lib/utils";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 
 const labelStyle: React.CSSProperties = {
   display: "block",
@@ -123,7 +123,7 @@ export const TestRhaiModal: React.FC<TestRhaiModalProps> = ({
             >
               {loading ? (
                 <div className="flex items-center gap-4">
-                  <LoadingSpinner className="w-5 h-5" />
+                  <Spinner className="w-5 h-5" />
                   <span className="font-semibold text-xs">Running…</span>
                 </div>
               ) : (

@@ -1,4 +1,5 @@
 import { config } from "@/config";
+import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import React, { useState } from "react";
@@ -9,7 +10,7 @@ import {
   verifyTwoFactor,
 } from "@/lib/auth";
 import { useAuth } from "@/contexts/AuthContext";
-import { Zap, Loader2, ShieldCheck } from "lucide-react";
+import { Zap, ShieldCheck } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const BACKEND_URL = config.apiUrl;
@@ -181,7 +182,7 @@ export function AuthForm() {
 
               <Button className="w-full" type="submit" disabled={isLoading}>
                 {isLoading ? (
-                  <Loader2 className="w-5 h-5 animate-spin mx-auto" />
+                  <Spinner className="w-5 h-5 mx-auto" />
                 ) : mode === "login" ? (
                   "Sign in"
                 ) : (

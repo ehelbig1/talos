@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { SectionHeader } from "@/components/ui/SectionHeader";
 import { useNavigate } from "react-router";
@@ -111,7 +112,7 @@ export function OAuthCallback() {
       <div className="bg-surface-3/60 border border-white/5 rounded-xl p-12 w-full max-w-md text-center">
         {status === "loading" && (
           <>
-            <div className="animate-spin w-14 h-14 mx-auto mb-6 rounded-full border-4 border-white/10 border-t-primary" />
+            <Spinner className="w-14 h-14 mx-auto mb-6 text-primary" />
             <SectionHeader
               level="h2"
               className="text-xl font-semibold text-white mb-2"

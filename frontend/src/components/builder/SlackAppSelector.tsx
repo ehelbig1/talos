@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { useQuery } from "@tanstack/react-query";
 import { Button } from "@/components/ui";
 import { SlackAppCreator } from "./SlackAppCreator";
@@ -11,7 +12,6 @@ import {
   Plus,
   MessageSquare,
   Check,
-  Loader2,
   AlertTriangle,
   Rocket,
   ArrowRight,
@@ -160,7 +160,7 @@ export function SlackAppSelector({
   if (loading) {
     return (
       <div className="p-8 bg-surface-1/40 border border-white/5 rounded-2xl flex items-center justify-center gap-4">
-        <Loader2 className="h-5 w-5 animate-spin text-[#4A154B]" />
+        <Spinner className="h-5 w-5 text-[#4A154B]" />
         <p className="m-0 text-xs font-semibold text-muted-foreground/70">
           Loading Slack workspaces…
         </p>
@@ -220,7 +220,7 @@ export function SlackAppSelector({
               className="h-9 px-4 bg-surface-3 hover:bg-surface-4 text-white text-2xs font-semibold rounded-xl border border-white/5 transition-ui"
             >
               {connecting ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin mr-2" />
+                <Spinner className="w-3.5 h-3.5 mr-2" />
               ) : (
                 <Plus className="w-3.5 h-3.5 mr-2" />
               )}
@@ -256,7 +256,7 @@ export function SlackAppSelector({
           >
             {connecting ? (
               <div className="flex items-center gap-3">
-                <Loader2 className="w-4 h-4 animate-spin" />
+                <Spinner className="w-4 h-4" />
                 <span>Connecting…</span>
               </div>
             ) : (

@@ -1,21 +1,12 @@
 import React, { Suspense, lazy, useState, useEffect } from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import { Button, PageContainer, PageHeader } from "@/components/ui";
 
 const Modules = lazy(() => import("./Modules"));
 const Catalog = lazy(() => import("./Catalog"));
 
 function TabLoading() {
-  return (
-    <div className="flex flex-col items-center justify-center py-40 space-y-8">
-      <div className="relative">
-        <div className="w-16 h-16 border-4 border-primary/10 rounded-full" />
-        <div className="w-16 h-16 border-4 border-t-primary border-transparent rounded-full animate-spin absolute inset-0" />
-      </div>
-      <div className="flex flex-col items-center gap-2">
-        <span className="text-xs font-semibold text-white/70">Loading…</span>
-      </div>
-    </div>
-  );
+  return <LoadingState />;
 }
 
 export default function Library() {

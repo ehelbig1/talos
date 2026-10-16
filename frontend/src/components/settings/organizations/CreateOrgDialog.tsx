@@ -1,9 +1,9 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Building2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 
 /** Create-organization dialog. Slug auto-derives from the name until
  *  the user edits it explicitly.
@@ -107,7 +107,7 @@ export function CreateOrgDialog({
             disabled={!name || !slug || isPending}
             onClick={onSubmit}
           >
-            {isPending ? <LoadingSpinner /> : "Create organization"}
+            {isPending ? <Spinner /> : "Create organization"}
           </Button>
         </div>
       </div>

@@ -1,4 +1,5 @@
 import React, { useState, useMemo } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
@@ -15,7 +16,6 @@ import {
   Globe,
   Key,
   Layers,
-  Loader2,
   Search,
   Shield,
   Webhook,
@@ -368,7 +368,7 @@ function InstallDialog({ template, onClose }: InstallDialogProps) {
           >
             {mutation.isPending ? (
               <>
-                <Loader2 className="w-4 h-4 animate-spin mr-3" />
+                <Spinner className="w-4 h-4 mr-3" />
                 Creating…
               </>
             ) : (

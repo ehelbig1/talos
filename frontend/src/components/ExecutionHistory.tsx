@@ -1,4 +1,5 @@
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { sanitizeErrorMessage } from "../lib/sanitize";
 import { gql } from "../lib/graphqlClient";
 import type {
@@ -13,7 +14,6 @@ import { formatDistanceToNow } from "date-fns";
 import {
   CheckCircle2,
   XCircle,
-  Loader2,
   Clock,
   ChevronRight,
   History as HistoryIcon,
@@ -75,7 +75,7 @@ function StatusIcon({ status }: { status: string }) {
     case "failed":
       return <XCircle className="w-4 h-4 text-destructive" />;
     case "running":
-      return <Loader2 className="w-4 h-4 text-primary animate-spin" />;
+      return <Spinner className="w-4 h-4 text-primary" />;
     case "awaiting_approval":
       return <Clock className="w-4 h-4 text-warning" />;
     case "timeout":
@@ -288,7 +288,7 @@ const ExecutionItem = React.memo(
               >
                 {loadingLogs ? (
                   <div className="flex items-center gap-4 text-muted-foreground/50 py-4">
-                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <Spinner className="w-4 h-4" />
                     <span className="text-xs font-semibold">
                       Synchronizing Logs...
                     </span>
@@ -411,7 +411,7 @@ export const ExecutionHistory = React.memo(function ExecutionHistory({
 
       {isLoading ? (
         <div className="flex flex-col items-center justify-center py-32 gap-6 opacity-20 grayscale">
-          <Loader2 className="w-12 h-12 animate-spin text-primary" />
+          <Spinner className="w-12 h-12 text-primary" />
           <p className="text-xs font-semibold">Loading…</p>
         </div>
       ) : history.length === 0 ? (

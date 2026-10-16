@@ -1,4 +1,5 @@
 import React from "react";
+import { LoadingState } from "@/components/ui/spinner";
 import {
   ArrowRightLeft,
   Building2,
@@ -10,7 +11,6 @@ import {
 } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import type { Org, OrgMember, Role } from "./graphql";
 import { MemberRow } from "./MemberRow";
 
@@ -89,7 +89,7 @@ export function OrgDetailsPanel({
           </div>
           {isLoadingMembers ? (
             <div className="py-12 flex justify-center">
-              <LoadingSpinner />
+              <LoadingState />
             </div>
           ) : (
             <div className="space-y-3">

@@ -7,9 +7,9 @@
  */
 
 import React from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import {
   Calendar,
   Shield,
@@ -40,7 +40,7 @@ export function KeysTable({
       <Card className="relative bg-surface-3/80 border-white/10 overflow-hidden rounded-[20px] border">
         {isLoading ? (
           <div className="p-24 flex flex-col items-center justify-center gap-4">
-            <LoadingSpinner className="w-8 h-8 text-primary" />
+            <Spinner className="w-8 h-8 text-primary" />
             <p className="text-xs text-muted-foreground font-bold">
               Loading Keys...
             </p>

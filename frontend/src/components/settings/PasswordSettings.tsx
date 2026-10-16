@@ -1,10 +1,10 @@
 import React, { useState } from "react";
+import { Spinner } from "@/components/ui/spinner";
 import { KeyRound } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { LoadingSpinner } from "@/components/LoadingSpinner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { gql } from "@/lib/graphqlClient";
 import { useChangePasswordMutation } from "@/generated/graphql";
@@ -135,7 +135,7 @@ export default function PasswordSettings() {
           )}
 
           <Button type="submit" disabled={mutation.isPending}>
-            {mutation.isPending ? <LoadingSpinner /> : "Change password"}
+            {mutation.isPending ? <Spinner /> : "Change password"}
           </Button>
         </form>
       </div>

@@ -19,6 +19,7 @@ export { Input } from "./input";
 export { Label } from "./label";
 export { RadioGroup, RadioGroupItem } from "./radio-group";
 export { Select } from "./select";
+export { Spinner, LoadingState } from "./spinner";
 export { Tabs, TabsList, TabsTrigger, TabsContent } from "./tabs";
 export { Textarea } from "./textarea";
 export {
@@ -32,7 +33,6 @@ export {
 export { ConfirmDialog } from "./ConfirmDialog";
 export { CopyField } from "./CopyField";
 export { DarkSurfaceDiv } from "./DarkSurfaceDiv";
-export { DialogWrapper } from "./DialogWrapper";
 export { ErrorBanner } from "./ErrorBanner";
 export { ErrorMessage } from "./error-message";
 export { FlexBetween } from "./FlexBetween";
@@ -42,8 +42,6 @@ export { FormField } from "./FormField";
 export { IconButton } from "./IconButton";
 export { InfoBanner } from "./InfoBanner";
 export { InfoTip } from "./InfoTip";
-export { Modal } from "./Modal";
-export { ModalHeader } from "./ModalHeader";
 export { NoteBox } from "./NoteBox";
 export { PageContainer } from "./PageContainer";
 export { PageHeader } from "./PageHeader";
