@@ -7,7 +7,7 @@ export interface ConfirmDialogProps {
   /** Dialog heading */
   title?: string;
   /** Body message shown to the user */
-  message: string;
+  message: React.ReactNode;
   /** Label for the confirm button (default: "Confirm") */
   confirmLabel?: string;
   /** Label for the cancel button (default: "Cancel") */

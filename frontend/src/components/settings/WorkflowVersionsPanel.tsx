@@ -31,6 +31,7 @@ import {
   useSetConcurrencyLimitMutation,
 } from "@/generated/graphql";
 import { Dialog } from "@/components/ui/dialog";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 
 type PanelTab = "versions" | "diff" | "changelog" | "config";
 
@@ -511,47 +512,15 @@ export default function WorkflowVersionsPanel({
       </div>
 
       {rollbackTargetId && (
-        <Dialog
-          open={true}
-          onClose={() => setRollbackTargetId(null)}
-          title="Confirm Rollback"
-          className="max-w-sm"
-        >
-          <div className="p-2 text-center space-y-6">
-            <div className="w-14 h-14 bg-warning/10 border border-warning/20 rounded-2xl flex items-center justify-center text-warning mx-auto">
-              <RotateCcw size={28} />
-            </div>
-            <div>
-              <p className="text-sm text-muted-foreground/60 leading-relaxed px-4">
-                The selected version will become the live graph. Existing run
-                history is kept.
-              </p>
-            </div>
-            <div className="flex items-center gap-4 pt-4">
-              <Button
-                variant="ghost"
-                onClick={() => setRollbackTargetId(null)}
-                className="flex-1 text-sm font-semibold h-12 rounded-2xl"
-              >
-                Cancel
-              </Button>
-              <Button
-                onClick={handleRollback}
-                disabled={rollbackMutation.isPending}
-                className="flex-1 bg-warning hover:bg-warning/90 text-background font-semibold h-12 rounded-2xl transition-ui border border-white/10 text-sm"
-              >
-                {rollbackMutation.isPending ? (
-                  <div className="flex items-center gap-2">
-                    <Spinner className="w-4 h-4" />
-                    <span>Rolling back…</span>
-                  </div>
-                ) : (
-                  "Roll back"
-                )}
-              </Button>
-            </div>
-          </div>
-        </Dialog>
+        <ConfirmDialog
+          open
+          title="Roll back to this version?"
+          message="The selected version becomes the live graph. Existing run history is kept."
+          confirmLabel="Roll back"
+          isLoading={rollbackMutation.isPending}
+          onCancel={() => setRollbackTargetId(null)}
+          onConfirm={handleRollback}
+        />
       )}
     </Dialog>
   );
