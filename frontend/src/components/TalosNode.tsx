@@ -85,6 +85,8 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
       [data.systemNodeKind],
     );
 
+    const TileIcon = systemStyle ? systemStyle.icon : CategoryIcon;
+
     const hasResults = nodeResult != null || status !== "idle";
 
     const handleDoubleClick = React.useCallback(
@@ -188,12 +190,14 @@ export const TalosNode: React.FC<NodeProps<TalosNodeType>> = React.memo(
           {/* Status dot + name */}
           <div className="flex items-center gap-3 relative z-10">
             <StatusDot status={status} />
-            {data.category && (
+            {(systemStyle || data.category) && (
               <div className="p-1.5 bg-white/5 rounded-lg border border-white/5 group-hover:bg-white/10 transition-ui">
-                <CategoryIcon
+                {/* A control-flow node shows its kind's icon, not the
+                    category's generic box. */}
+                <TileIcon
                   className={cn(
                     "w-3.5 h-3.5 shrink-0 transition-transform",
-                    categoryColor,
+                    systemStyle ? systemStyle.color : categoryColor,
                   )}
                 />
               </div>

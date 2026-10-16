@@ -94,7 +94,7 @@ describe("ApiKeysManager", () => {
       ).toBeInTheDocument(),
     );
 
-    const generate = screen.getByText("Generate Key").closest("button")!;
+    const generate = screen.getByText("Create key").closest("button")!;
     // No name / no scope yet → submit is disabled.
     expect(generate).toBeDisabled();
   });
@@ -133,13 +133,13 @@ describe("ApiKeysManager", () => {
     );
     // Select a scope so submit becomes enabled.
     fireEvent.click(screen.getByText("Read Workflows"));
-    fireEvent.click(screen.getByText("Generate Key"));
+    fireEvent.click(screen.getByText("Create key"));
 
     await waitFor(() => {
-      expect(screen.getByText("Key Generated")).toBeInTheDocument();
+      expect(screen.getByText("Your new key")).toBeInTheDocument();
     });
     expect(screen.getByText("tk_live_SECRETVALUE")).toBeInTheDocument();
-    expect(screen.getByText("I've Saved It")).toBeInTheDocument();
+    expect(screen.getByText("I've saved it")).toBeInTheDocument();
   });
 
   it("shows a confirmation gate before revoking a key", async () => {
