@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@/components/ui/button";
 import { Plus, Info } from "lucide-react";
 import { toast } from "sonner";
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 import {
   useListApiKeysQuery,
   useCreateApiKeyMutation,
@@ -46,10 +46,8 @@ export default function ApiKeysManager() {
       setShowCreate(false);
       toast.success("API key created successfully");
     },
-    onError: (err: Error) => {
-      toast.error(
-        sanitizeErrorMessage(`Failed to create API key: ${err.message}`),
-      );
+    onError: (err: unknown) => {
+      toast.error(userFacingErrorMessage(err, "Could not create the key."));
     },
   });
 
@@ -70,10 +68,8 @@ export default function ApiKeysManager() {
       setRevokingId(null);
       toast.success("API key revoked");
     },
-    onError: (err: Error) => {
-      toast.error(
-        sanitizeErrorMessage(`Failed to revoke API key: ${err.message}`),
-      );
+    onError: (err: unknown) => {
+      toast.error(userFacingErrorMessage(err, "Could not revoke the key."));
     },
   });
 
@@ -89,10 +85,8 @@ export default function ApiKeysManager() {
       queryClient.invalidateQueries({ queryKey: ["ListApiKeys"] });
       toast.success("API key rotated — save your new key");
     },
-    onError: (err: Error) => {
-      toast.error(
-        sanitizeErrorMessage(`Failed to rotate API key: ${err.message}`),
-      );
+    onError: (err: unknown) => {
+      toast.error(userFacingErrorMessage(err, "Could not rotate the key."));
     },
   });
 
@@ -107,10 +101,8 @@ export default function ApiKeysManager() {
       setDeletingId(null);
       toast.success("API key deleted");
     },
-    onError: (err: Error) => {
-      toast.error(
-        sanitizeErrorMessage(`Failed to delete API key: ${err.message}`),
-      );
+    onError: (err: unknown) => {
+      toast.error(userFacingErrorMessage(err, "Could not delete the key."));
     },
   });
 

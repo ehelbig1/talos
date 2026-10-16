@@ -1,7 +1,6 @@
 /**
- * Create-key dialog for ApiKeysManager: name + expiry inputs and the
- * scope-picker grid. Strictly presentational — the parent owns the form
- * state and the create mutation.
+ * The new-key form for ApiKeysManager: name, lifetime and the scope picker.
+ * Presentational — the parent owns the form state and the create mutation.
  */
 
 import React from "react";
@@ -9,7 +8,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
-import { Plus, Calendar, X, Key, Fingerprint } from "lucide-react";
+import { Plus } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const availableScopes = [
@@ -67,151 +66,115 @@ export function CreateKeyDialog({
   onCreate: () => void;
 }) {
   return (
-    <Dialog open={true} onClose={onClose}>
-      <div
-        className="bg-surface-3/90 border border-white/5 rounded-2xl overflow-hidden w-[520px]"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-8 py-6 border-b border-white/5 flex items-center justify-between bg-white/[0.02]">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-primary/10 rounded-xl flex items-center justify-center border border-primary/20 text-primary">
-              <Key size={20} />
-            </div>
-            <div>
-              <h3 className="text-lg font-bold text-foreground tracking-tight">
-                Create API Key
-              </h3>
-              <p className="text-xs text-muted-foreground font-medium leading-none mt-1">
-                New access credential
-              </p>
-            </div>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="w-8 h-8 flex items-center justify-center rounded-lg hover:bg-white/5 text-muted-foreground hover:text-white transition-ui"
+    <Dialog open onClose={onClose} title="New key" className="max-w-lg">
+      <div className="space-y-6">
+        <div className="space-y-2">
+          <label
+            htmlFor="api-key-name"
+            className="text-xs font-semibold text-muted-foreground"
           >
-            <X size={20} />
-          </button>
+            Key name
+          </label>
+          <Input
+            id="api-key-name"
+            placeholder="e.g. GitHub Actions Runner"
+            value={name}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+              onNameChange(e.target.value)
+            }
+          />
         </div>
 
-        <div className="p-8 space-y-8">
-          <div className="space-y-3">
-            <label className="text-xs font-bold text-muted-foreground ml-1">
-              Key name
-            </label>
-            <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-primary transition-ui">
-                <Fingerprint size={18} />
-              </div>
-              <Input
-                placeholder="e.g. GitHub Actions Runner"
-                value={name}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                  onNameChange(e.target.value)
-                }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-primary focus:ring-primary/10 transition-ui h-12 text-sm font-medium rounded-xl"
-              />
-            </div>
-          </div>
+        <div className="space-y-2">
+          <label
+            htmlFor="api-key-expires"
+            className="text-xs font-semibold text-muted-foreground"
+          >
+            Expires after (days)
+          </label>
+          <Input
+            id="api-key-expires"
+            type="number"
+            min={1}
+            placeholder="Leave empty for no expiry"
+            value={expiresIn}
+            onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
+              onExpiresInChange(e.target.value)
+            }
+          />
+        </div>
 
-          <div className="space-y-3">
-            <label className="text-xs font-bold text-muted-foreground ml-1">
-              Expiration Policy
-            </label>
-            <div className="relative group">
-              <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-muted-foreground group-focus-within:text-primary transition-ui">
-                <Calendar size={18} />
-              </div>
-              <Input
-                type="number"
-                placeholder="Lifetime in days (optional)"
-                value={expiresIn}
-                onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                  onExpiresInChange(e.target.value)
-                }
-                className="pl-12 bg-surface-4/60 border-white/5 focus:border-primary focus:ring-primary/10 transition-ui h-12 text-sm font-medium rounded-xl"
-              />
-            </div>
-          </div>
-
-          <div className="space-y-4">
-            <label className="text-xs font-bold text-muted-foreground ml-1">
-              Scope configuration
-            </label>
-            <div className="grid grid-cols-2 gap-3">
-              {availableScopes.map((s) => (
+        <div className="space-y-3">
+          <p className="text-xs font-semibold text-muted-foreground">Scopes</p>
+          <div className="grid grid-cols-2 gap-3">
+            {availableScopes.map((s) => {
+              const selected = selectedScopes.includes(s.value);
+              return (
                 <button
                   key={s.value}
+                  type="button"
+                  aria-pressed={selected}
                   onClick={() => onToggleScope(s.value)}
                   className={cn(
-                    "flex flex-col items-start p-4 rounded-xl border transition-ui text-left group/scope",
-                    selectedScopes.includes(s.value)
+                    "flex flex-col items-start p-4 rounded-xl border transition-ui text-left",
+                    selected
                       ? "bg-primary/10 border-primary/40 text-primary"
-                      : "bg-surface-4/60 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]",
+                      : "bg-surface-3/40 border-white/5 text-muted-foreground hover:border-white/10 hover:bg-white/[0.02]",
                   )}
                 >
                   <div className="flex items-center justify-between w-full mb-1.5">
-                    <span
-                      className={cn(
-                        "text-xs font-medium",
-                        selectedScopes.includes(s.value)
-                          ? "text-primary"
-                          : "text-muted-foreground",
-                      )}
-                    >
+                    <span className="text-2xs font-medium text-muted-foreground">
                       {s.value.split(":")[0]}
                     </span>
-                    <div
+                    <span
+                      aria-hidden
                       className={cn(
                         "w-4 h-4 rounded-full border transition-ui flex items-center justify-center",
-                        selectedScopes.includes(s.value)
+                        selected
                           ? "bg-primary border-primary"
-                          : "bg-surface-3/60 border-white/5",
+                          : "bg-surface-3/60 border-white/10",
                       )}
                     >
                       <Plus
                         className={cn(
                           "w-2.5 h-2.5 text-white transition-transform",
-                          selectedScopes.includes(s.value) && "rotate-45",
+                          selected && "rotate-45",
                         )}
                       />
-                    </div>
+                    </span>
                   </div>
-                  <div className="text-xs font-bold leading-tight mb-1">
+                  <div
+                    className={cn(
+                      "text-xs font-semibold leading-tight mb-1",
+                      selected ? "text-primary" : "text-foreground",
+                    )}
+                  >
                     {s.label}
                   </div>
-                  <div className="text-xs text-muted-foreground font-medium leading-tight group-hover/scope:text-muted-foreground transition-ui">
+                  <div className="text-xs text-muted-foreground leading-tight">
                     {s.desc}
                   </div>
                 </button>
-              ))}
-            </div>
+              );
+            })}
           </div>
         </div>
 
-        <div className="px-8 py-6 bg-white/[0.02] border-t border-white/5 flex justify-end gap-3">
-          <Button
-            variant="ghost"
-            onClick={onClose}
-            disabled={isPending}
-            className="text-muted-foreground hover:text-white hover:bg-white/5 font-bold"
-          >
-            Discard
+        <div className="flex justify-end gap-3 pt-2">
+          <Button variant="outline" onClick={onClose} disabled={isPending}>
+            Cancel
           </Button>
           <Button
             onClick={onCreate}
-            disabled={isPending || !name || selectedScopes.length === 0}
-            className="bg-primary hover:bg-primary/90 text-white shadow-primary/20 px-8 h-11 rounded-xl font-bold transition-ui"
+            disabled={isPending || !name.trim() || selectedScopes.length === 0}
           >
             {isPending ? (
-              <div className="flex items-center gap-2">
+              <>
                 <Spinner className="w-4 h-4" />
-                <span>Processing...</span>
-              </div>
+                Creating…
+              </>
             ) : (
-              "Generate Key"
+              "Create key"
             )}
           </Button>
         </div>
