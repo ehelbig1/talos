@@ -125,6 +125,11 @@ would also have flagged nothing on the edge rule today.
   literals on 2026-10-15 (#1329), so on 2026-10-16 the message-chain rule
   recognises no live sender; it starts to the moment the copies are
   reinstalled from the catalog. An installed copy does not refresh itself.
+  The `Notify: ntfy` copy was reinstalled at 18:07 UTC the same day
+  (`bytes_changed: true`, grants and fuel kept): over the 43 workflows that
+  use it the rule then recognised the sender and flagged nothing, since every
+  `send → part` edge carries `!is_error` and no sender retries a list.
+  `notify-home-assistant` has no installed copy on this fleet.
 
 - The fuel reading sees completed runs only; a fuel-exhausted attempt is
   invisible here by construction and is `failure-history`'s.
