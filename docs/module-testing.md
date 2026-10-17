@@ -131,6 +131,10 @@ mirrored (`model`, `database`, `messaging`, `cache`, `files`, `governance`,
 module that uses them can be tested this way.
 
 What a module COSTS is checked separately, for a template that carries a
-recorded run: `make check-catalog-fuel` builds it for the sandbox, runs it
-against `fixtures/http.json` and holds the fuel it used to the limit its
-manifest declares. See `docs/module-promotion.md`.
+recorded run. A recorded run is `fixtures/http.json` (the requests the
+recording test answered) and, where that test's envelope held them,
+`config.json`, `input.json` and `trigger.json` (its `config`, `input` and
+`__trigger_input__`). `make check-catalog-fuel` builds the template for the
+sandbox, runs it against `http.json` with the recorded config and input, and
+holds the fuel it used to the limit its manifest declares; an authoring lane's
+rehearsal replays the trigger file too. See `docs/module-promotion.md`.

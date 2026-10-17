@@ -89,10 +89,12 @@ make record-template TEMPLATE=<slug>
 
 One test ends with
 `talos_module_testkit::recorded_run::keep("<slug>", &envelope())`. Recording
-writes `fixtures/` from what that test served: the requests and answers, and
-the config and input it ran with. After that, an ordinary `cargo test` fails
-if the module or the test changes what is served, so the recording cannot
-drift. Read the diff before you commit it.
+writes `fixtures/` from what that test served: the requests and answers
+(`http.json`), and the config, input and trigger input it ran with
+(`config.json`, `input.json`, `trigger.json`, each only when the envelope's
+`config`, `input` or `__trigger_input__` is a non-empty object). After that,
+an ordinary `cargo test` fails if the module or the test changes what is
+served, so the recording cannot drift. Read the diff before you commit it.
 
 A keeper has no recorded run (the rehearsal has no memory to read).
 

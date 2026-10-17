@@ -19,7 +19,8 @@
 //!   (or are missing), naming the command that rewrites them;
 //! * with `TALOS_RECORD_RUNS=1` (`make record-template TEMPLATE=<slug>`) it
 //!   WRITES them: `http.json` (each answered request, in order), and
-//!   `config.json` / `input.json` from the envelope when they are not empty.
+//!   `config.json` / `input.json` / `trigger.json` from the envelope's
+//!   `config` / `input` / `__trigger_input__` when they are not empty.
 //!
 //! A module that makes no request (a decider) is recorded as `http.json` =
 //! `[]` with the input it was given; the fuel check measures it on that.
@@ -34,7 +35,7 @@
 use crate::host;
 use crate::talos::core::http::Method;
 use serde_json::{json, Map, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The environment variable that turns comparing into writing.
 pub const RECORD_ENV: &str = "TALOS_RECORD_RUNS";
@@ -165,12 +166,22 @@ fn fixtures_dir(slug: &str) -> PathBuf {
     module_dir(slug).join("fixtures")
 }
 
+/// The envelope keys a recorded run keeps, and the file each is kept as. A
+/// replay gives them back the same way: `config.json` as the config,
+/// `input.json` as the input and `trigger.json` as the trigger input (the
+/// module's `__trigger_input__`).
+const ENVELOPE_FILES: &[(&str, &str)] = &[
+    ("config", "config.json"),
+    ("input", "input.json"),
+    ("__trigger_input__", "trigger.json"),
+];
+
 /// The files a recorded run consists of, for this test: name → contents.
 fn files(envelope: &str) -> Vec<(&'static str, Value)> {
     let envelope: Value =
         serde_json::from_str(envelope).unwrap_or_else(|e| panic!("the envelope is not JSON: {e}"));
     let mut out = vec![("http.json", http_fixtures())];
-    for (key, file) in [("config", "config.json"), ("input", "input.json")] {
+    for &(key, file) in ENVELOPE_FILES {
         match envelope.get(key) {
             None | Some(Value::Null) => {}
             Some(Value::Object(o)) if o.is_empty() => {}
@@ -190,26 +201,34 @@ fn text(value: &Value) -> String {
 }
 
 /// Hold the module's `fixtures/` to the run this test just made with
-/// `envelope` (the JSON it passed to `run`). See the module docs.
+/// `envelope` (the JSON it passed to `run`): `http.json` always, and
+/// `config.json`, `input.json` and `trigger.json` for the envelope's
+/// `config`, `input` and `__trigger_input__` when each is a non-empty object
+/// (absent, null or `{}` keeps no file; anything else is not a recorded
+/// run's file, and panics). See the module docs.
 pub fn keep(slug: &str, envelope: &str) {
-    let dir = fixtures_dir(slug);
-    let wanted = files(envelope);
     let recording = std::env::var(RECORD_ENV).is_ok_and(|v| v == "1");
+    // The catalog has a target for it; a lane sets the variable on its test.
+    let again = format!(
+        "make record-template TEMPLATE={slug}` in the Talos workspace, or `{RECORD_ENV}=1 cargo test {}",
+        slug.replace('-', "_")
+    );
+    hold(&fixtures_dir(slug), &files(envelope), recording, &again);
+}
+
+/// Write `wanted` into `dir` when `recording`, else hold `dir` to it, naming
+/// `again` (the command that rewrites the files) in each refusal.
+fn hold(dir: &Path, wanted: &[(&'static str, Value)], recording: bool, again: &str) {
     if recording {
-        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        for (name, value) in &wanted {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for (name, value) in wanted {
             let path = dir.join(name);
             std::fs::write(&path, text(value))
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         }
         return;
     }
-    // The catalog has a target for it; a lane sets the variable on its test.
-    let again = format!(
-        "make record-template TEMPLATE={slug}` in the Talos workspace, or `{RECORD_ENV}=1 cargo test {}",
-        slug.replace('-', "_")
-    );
-    for (name, value) in &wanted {
+    for (name, value) in wanted {
         let path = dir.join(name);
         let Ok(kept) = std::fs::read_to_string(&path) else {
             panic!(
@@ -275,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn the_envelope_gives_the_config_and_input_files_only_when_they_hold_something() {
+    fn the_envelope_gives_the_config_input_and_trigger_files_only_when_they_hold_something() {
         let names = |e: &str| files(e).into_iter().map(|(n, _)| n).collect::<Vec<_>>();
         assert_eq!(
             names(r#"{"config": {"A": 1}}"#),
@@ -287,6 +306,67 @@ mod tests {
         );
         assert_eq!(names(r#"{"input": null}"#), ["http.json"]);
         assert!(std::panic::catch_unwind(|| files(r#"{"input": [1]}"#)).is_err());
+        // The trigger input is a file of its own, held like the other two.
+        let kept =
+            files(r#"{"config": {"A": 1}, "__trigger_input__": {"ticket": {"key": "EX-1"}}}"#);
+        assert_eq!(
+            kept.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            ["http.json", "config.json", "trigger.json"]
+        );
+        assert_eq!(kept[2].1, json!({"ticket": {"key": "EX-1"}}));
+        assert_eq!(names(r#"{"__trigger_input__": {}}"#), ["http.json"]);
+        assert_eq!(names(r#"{"__trigger_input__": null}"#), ["http.json"]);
+        let err = std::panic::catch_unwind(|| files(r#"{"__trigger_input__": "EX-1"}"#))
+            .expect_err("a string is not a recorded run's trigger.json");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            msg.contains("the envelope's __trigger_input__ is not an object, so it cannot be a recorded run's trigger.json"),
+            "{msg}"
+        );
+    }
+
+    /// Recording writes the trigger file and an ordinary run holds it, exactly
+    /// as `config.json`: this is what lets an authoring lane regenerate a
+    /// hand-written `trigger.json` with `TALOS_RECORD_RUNS=1`.
+    #[test]
+    fn a_recorded_trigger_is_written_and_then_held() {
+        let dir = std::env::temp_dir().join(format!(
+            "talos-recorded-run-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let again = "AGAIN";
+        let envelope = r#"{"config": {"A": 1}, "__trigger_input__": {"ticket": {"key": "EX-1"}}}"#;
+
+        hold(&dir, &files(envelope), true, again);
+        let written: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("trigger.json")).unwrap())
+                .unwrap();
+        assert_eq!(written, json!({"ticket": {"key": "EX-1"}}));
+        assert!(dir.join("config.json").is_file() && dir.join("http.json").is_file());
+        assert!(!dir.join("input.json").exists());
+
+        // Held: the same envelope passes, a changed trigger does not, and a
+        // missing file names the command that writes it.
+        hold(&dir, &files(envelope), false, again);
+        let changed = r#"{"config": {"A": 1}, "__trigger_input__": {"ticket": {"key": "EX-2"}}}"#;
+        let err = std::panic::catch_unwind(|| hold(&dir, &files(changed), false, again))
+            .expect_err("a changed trigger is not what the test serves any more");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(
+            msg.contains("trigger.json is not what this test serves any more")
+                && msg.contains("Rewrite it with `AGAIN`"),
+            "{msg}"
+        );
+        std::fs::remove_file(dir.join("trigger.json")).unwrap();
+        let err = std::panic::catch_unwind(|| hold(&dir, &files(envelope), false, again))
+            .expect_err("a missing trigger.json is reported");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("trigger.json is missing"), "{msg}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
