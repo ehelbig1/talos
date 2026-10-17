@@ -134,6 +134,7 @@ promotion instead (`docs/module-promotion.md`); the checks are the same.
 | one role, and the grants it allows | `talos-catalog-tests/tests/block_roles.rs` |
 | hosts used = hosts granted | `talos-catalog-tests/tests/hosts_match_source.rs` |
 | config read = config declared | `talos-catalog-tests/tests/config_schema_matches_source.rs` |
+| the time comes from the host clock | `talos-catalog-tests/tests/clock_from_host.rs` |
 | a failed request keeps its kind | `talos-catalog-tests/tests/http_failure_kind.rs` |
 | a secret grant the catalog reads | `talos-catalog-tests/tests/manifest_keys.rs` |
 | every rule finds its planted fault | `talos-catalog-tests/tests/planted_faults.rs` |
@@ -141,7 +142,13 @@ promotion instead (`docs/module-promotion.md`); the checks are the same.
 | it compiles for the sandbox | `scripts/check-catalog.sh` (`make check-catalog`) |
 
 Each gate also runs over the skeletons, so a new template never starts from
-one that fails. The hosts and config rules and the compile lint are functions
-of `talos-module-source`; the files above hold the catalog's population and
-its `PREDATING` lists, and an authoring lane runs the same functions over its
-own modules.
+one that fails. The hosts, config and clock rules and the compile lint are
+functions of `talos-module-source`; the files above hold the catalog's
+population and its `PREDATING` lists, and an authoring lane runs the same
+functions over its own modules.
+
+A template takes the time from the host (`datetime::now_unix()`), never from
+`chrono::Utc::now()`, `chrono::Local::now()` or `std::time::SystemTime::now()`:
+a test sets the host clock with `talos_module_testkit::host::clock::set_unix`,
+and a date the process reads for itself cannot be pinned, so a test built on a
+fixture's due date passes until the calendar passes it.

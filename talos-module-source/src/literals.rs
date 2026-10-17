@@ -104,6 +104,8 @@ pub fn literals(src: &str) -> Vec<(usize, String)> {
 }
 
 /// The source with `//` and `/* */` comments blanked, string literals kept.
+/// A blanked block comment keeps its line breaks, so a line of the result is
+/// the same line of the source.
 #[must_use]
 pub fn without_comments(src: &str) -> String {
     let b = src.as_bytes();
@@ -124,6 +126,7 @@ pub fn without_comments(src: &str) -> String {
             }
         } else if src[i..].starts_with("/*") {
             let end = src[i + 2..].find("*/").map_or(b.len(), |e| i + 2 + e + 2);
+            out.extend(src[i..end].chars().filter(|&c| c == '\n'));
             i = end;
         } else {
             let ch = src[i..].chars().next().unwrap_or(' ');
@@ -154,6 +157,12 @@ mod tests {
             literals(src),
             vec![(1, "one".to_string()), (4, "two".to_string())]
         );
+    }
+
+    #[test]
+    fn a_blanked_block_comment_keeps_its_line_breaks() {
+        let src = "a /* one\n two\n three */ b\n// four\nc";
+        assert_eq!(without_comments(src), "a \n\n b\n\nc");
     }
 
     #[test]

@@ -195,7 +195,18 @@ fn is_envelope_parse(line: &str) -> bool {
 /// occurrence of `keyword` that is NOT inside a `"..."` string literal, or
 /// `None`. Treats `\"` as an escaped quote.
 fn find_keyword_outside_string(line: &str, keyword: &str) -> Option<usize> {
+    find_outside_string(line, keyword, false)
+}
+
+/// Like [`find_keyword_outside_string`], with a word boundary on BOTH sides:
+/// `Utc::now` is found in `Utc::now()` and not in `Utc::nowish`.
+pub(crate) fn find_word_outside_string(line: &str, word: &str) -> Option<usize> {
+    find_outside_string(line, word, true)
+}
+
+fn find_outside_string(line: &str, keyword: &str, whole_word: bool) -> Option<usize> {
     let bytes = line.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let kbytes = keyword.as_bytes();
     let mut in_str = false;
     let mut i = 0;
@@ -220,9 +231,10 @@ fn find_keyword_outside_string(line: &str, keyword: &str) -> Option<usize> {
         if &bytes[i..i + kbytes.len()] == kbytes {
             // A word boundary on the LEFT (so `is_unsafe` does not fire);
             // the right-hand context is the caller's.
-            let left_is_word =
-                i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_');
-            if !left_is_word {
+            let left_is_word = i > 0 && is_word(bytes[i - 1]);
+            let right_is_word =
+                whole_word && bytes.get(i + kbytes.len()).is_some_and(|&b| is_word(b));
+            if !left_is_word && !right_is_word {
                 return Some(i);
             }
         }
